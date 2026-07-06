@@ -2,7 +2,7 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.lamb;
-  lambPkg = pkgs.lamb or (pkgs.callPackage ../../default.nix { });
+  lambPkg = cfg.package;
   userHome = config.users.users.${cfg.user}.home;
   userUid = config.users.users.${cfg.user}.uid;
   configPath = lib.replaceStrings [ "%h" ] [ userHome ] cfg.configPath;
@@ -25,6 +25,33 @@ let
   '';
 in
 {
+  options.services.lamb = {
+    enable = lib.mkEnableOption "LAMB rolling audio daemon";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.lamb or (pkgs.callPackage ../default.nix { });
+      description = "LAMB package to run.";
+    };
+
+    user = lib.mkOption {
+      type = lib.types.str;
+      description = "User account that runs the LAMB daemon.";
+    };
+
+    configPath = lib.mkOption {
+      type = lib.types.str;
+      default = "%h/.config/lamb/lamb.toml";
+      description = "Path to the LAMB config file. Supports systemd %h expansion.";
+    };
+
+    control.socketPath = lib.mkOption {
+      type = lib.types.str;
+      default = "%t/lamb/control.sock";
+      description = "Path to the LAMB control socket. Supports systemd %t expansion.";
+    };
+  };
+
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [
       lambPkg
