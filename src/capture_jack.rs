@@ -1,8 +1,7 @@
+use crate::capture_arena::CaptureIngress;
+use crate::capture_runtime::{CaptureRuntime, CaptureRuntimeParams};
 use crate::error::{LambError, Result};
-use crate::math::derive_chunk_frames;
 use crate::profile::ResolvedProfile;
-use crate::sample_ring::{RingConfig, SampleFormat, SampleRing};
-use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JackCaptureConfig {
@@ -14,14 +13,13 @@ pub struct JackCaptureConfig {
 
 pub struct JackCapture {
     active: Option<jack::AsyncClient<(), JackProcessHandler>>,
-    pub ring: Arc<SampleRing>,
     pub sample_rate: u32,
     pub channel_count: u32,
 }
 
 struct JackProcessHandler {
     ports: Vec<jack::Port<jack::AudioIn>>,
-    ring: Arc<SampleRing>,
+    ingress: CaptureIngress,
     scratch: Vec<f32>,
 }
 
@@ -41,7 +39,10 @@ impl JackCaptureConfig {
 }
 
 impl JackCapture {
-    pub fn start(cfg: JackCaptureConfig, buffer_seconds: u32) -> Result<Self> {
+    pub fn start(
+        cfg: JackCaptureConfig,
+        params: CaptureRuntimeParams,
+    ) -> Result<(Self, CaptureRuntime)> {
         if cfg.channels == 0 {
             return Err(LambError::Capture(
                 "JACK capture requires at least one input port".to_string(),
@@ -60,7 +61,7 @@ impl JackCapture {
         }
 
         let sample_rate = client.sample_rate();
-        let ring = make_jack_ring(buffer_seconds, sample_rate, cfg.channels)?;
+        let (runtime, ingress) = CaptureRuntime::build(params, sample_rate, cfg.channels)?;
         let mut ports = Vec::with_capacity(cfg.channel_names.len());
         for name in &cfg.channel_names {
             ports.push(
@@ -78,7 +79,7 @@ impl JackCapture {
             .collect::<Result<Vec<_>>>()?;
         let handler = JackProcessHandler {
             ports,
-            ring: Arc::clone(&ring),
+            ingress,
             scratch: Vec::new(),
         };
         let active = client
@@ -94,12 +95,14 @@ impl JackCapture {
                     ))
                 })?;
         }
-        Ok(Self {
-            active: Some(active),
-            ring,
-            sample_rate,
-            channel_count: cfg.channels,
-        })
+        Ok((
+            Self {
+                active: Some(active),
+                sample_rate,
+                channel_count: cfg.channels,
+            },
+            runtime,
+        ))
     }
 
     pub fn stop(mut self) {
@@ -136,10 +139,10 @@ impl jack::ProcessHandler for JackProcessHandler {
             }
         }
         match self
-            .ring
-            .write_interleaved(&self.scratch, channel_count as u32)
+            .ingress
+            .try_push_interleaved(&self.scratch, channel_count as u32)
         {
-            Ok(()) => jack::Control::Continue,
+            Ok(_) => jack::Control::Continue,
             Err(_) => jack::Control::Quit,
         }
     }
@@ -171,23 +174,6 @@ pub fn interleave_input_buffers(inputs: &[&[f32]]) -> Result<Vec<f32>> {
         }
     }
     Ok(interleaved)
-}
-
-fn make_jack_ring(seconds: u32, sample_rate: u32, channels: u32) -> Result<Arc<SampleRing>> {
-    let chunk_frames = derive_chunk_frames(sample_rate, None)?;
-    let total_frames = u64::from(seconds)
-        .checked_mul(u64::from(sample_rate))
-        .ok_or_else(|| LambError::Validation("ring frame count overflow".to_string()))?;
-    let chunk_count = total_frames.div_ceil(u64::from(chunk_frames)).max(1);
-    Ok(Arc::new(SampleRing::new(RingConfig {
-        channels,
-        sample_rate,
-        format: SampleFormat::F32Le,
-        chunk_frames,
-        chunk_count: u32::try_from(chunk_count)
-            .map_err(|_| LambError::Validation("chunk count exceeds u32".to_string()))?,
-        max_active_snapshots: 1,
-    })?))
 }
 
 fn jack_error(action: &str, err: jack::Error) -> LambError {

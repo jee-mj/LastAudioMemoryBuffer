@@ -1,11 +1,14 @@
+use lamb::capture_arena::{CaptureArena, CaptureRuntimeConfig};
 use lamb::capture_pipewire::{
     process_interleaved_f32_chunk, resolve_target, resolve_target_from_nodes, AvailableNode,
     PipeWireCapture, PipeWireCaptureConfig, ResolvedTarget,
 };
+use lamb::capture_runtime::CaptureRuntimeParams;
 use lamb::config::{ExportConfig, LambConfig, MemoryConfig};
-use lamb::sample_ring::{RingConfig, SampleFormat, SampleRing};
+use lamb::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
+use lamb::sample_ring::{RingConfig, SampleFormat};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn cfg(target: Option<&str>) -> PipeWireCaptureConfig {
     PipeWireCaptureConfig {
@@ -91,18 +94,49 @@ fn default_target_selects_first_available_input_source() {
     assert_eq!(resolved.name, "studio-input");
 }
 
-#[test]
-fn process_chunk_respects_pipewire_offset_size_and_stride() {
-    let ring = SampleRing::new(RingConfig {
+fn test_runtime() -> (CaptureArena, lamb::capture_arena::CaptureIngress) {
+    let plan = SessionMemoryPlan::calculate(SessionMemoryInputs {
+        retention_frames: 64,
         channels: 2,
         sample_rate: 48_000,
-        format: SampleFormat::F32Le,
+        sample_format: SampleFormat::F32Le,
         chunk_frames: 8,
-        chunk_count: 1,
         max_active_snapshots: 1,
+        sample_bytes: 4,
+        split_when_over_bytes: 3_900_000_000,
+        control_queue_capacity: 2,
+        worker_stack_bytes: 64 * 1024,
+        capture_queue_slots: 8,
+        capture_slot_frames: 8,
+        capture_worker_stack_bytes: 64 * 1024,
+        io_buffer_bytes_per_channel: 4096,
+        maximum_path_bytes: 512,
+        headroom: 1.0,
     })
     .unwrap();
+    CaptureArena::new(
+        &plan,
+        CaptureRuntimeConfig {
+            ring: RingConfig {
+                channels: 2,
+                sample_rate: 48_000,
+                format: SampleFormat::F32Le,
+                chunk_frames: 8,
+                chunk_count: 8,
+                max_active_snapshots: 1,
+            },
+            queue_slots: 8,
+            slot_frames: 8,
+            sample_bytes: 4,
+            worker_stack_bytes: 64 * 1024,
+        },
+    )
+    .unwrap()
+}
 
+#[test]
+fn process_chunk_respects_pipewire_offset_size_and_stride() {
+    let (arena, ingress) = test_runtime();
     let samples = [99.0_f32, 99.0, 1.0, 2.0, 3.0, 4.0, 88.0, 88.0];
     let bytes = unsafe {
         std::slice::from_raw_parts(
@@ -111,11 +145,30 @@ fn process_chunk_respects_pipewire_offset_size_and_stride() {
         )
     };
 
-    process_interleaved_f32_chunk(bytes, 8, 16, 8, 2, &ring).unwrap();
+    process_interleaved_f32_chunk(bytes, 8, 16, 8, 2, &ingress).unwrap();
 
-    let snapshot = ring.snapshot_last_frames(2).unwrap();
-    assert_eq!(snapshot.read_channel_samples(0).unwrap(), vec![1.0, 3.0]);
-    assert_eq!(snapshot.read_channel_samples(1).unwrap(), vec![2.0, 4.0]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = arena.status(Duration::from_secs(1)).unwrap();
+        if status.worker_written_frames >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture worker did not drain the ingress"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let frozen = arena
+        .freeze_since(None, Duration::from_secs(1))
+        .unwrap()
+        .expect("two frames were written");
+    let mut interleaved = vec![0.0; 4];
+    frozen
+        .copy_interleaved_range_into(frozen.absolute_range(), &mut interleaved)
+        .unwrap();
+    assert_eq!(interleaved, vec![1.0, 2.0, 3.0, 4.0]);
 }
 
 #[test]
@@ -126,8 +179,13 @@ fn live_resolver_uses_the_public_capture_config_contract() {
 
 #[test]
 fn pipewire_capture_exposes_start_stop_and_resolved_target_api() {
-    let _start: fn(PipeWireCaptureConfig, Arc<SampleRing>) -> lamb::error::Result<PipeWireCapture> =
-        PipeWireCapture::start;
+    let _start: fn(
+        PipeWireCaptureConfig,
+        CaptureRuntimeParams,
+    ) -> lamb::error::Result<(
+        PipeWireCapture,
+        lamb::capture_runtime::CaptureRuntime,
+    )> = PipeWireCapture::start;
     let _resolved_target: for<'a> fn(&'a PipeWireCapture) -> &'a ResolvedTarget =
         PipeWireCapture::resolved_target;
     let _stop: fn(PipeWireCapture) = PipeWireCapture::stop;

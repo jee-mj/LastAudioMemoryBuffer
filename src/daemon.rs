@@ -1,15 +1,19 @@
 use crate::app_config::{self, ConfigLoadState};
+use crate::capture_arena::CaptureArenaStatus;
 use crate::capture_fake::FakeCapture;
 use crate::capture_jack::{JackCapture, JackCaptureConfig};
 use crate::capture_pipewire::{PipeWireCapture, PipeWireCaptureConfig, ResolvedTarget};
+use crate::capture_runtime::{
+    CaptureRuntime, CaptureRuntimeParams, DEFAULT_CAPTURE_QUEUE_SLOTS,
+    DEFAULT_CAPTURE_WORKER_STACK_BYTES, DEFAULT_CONTROL_QUEUE_CAPACITY,
+    DEFAULT_IO_BUFFER_BYTES_PER_CHANNEL, DEFAULT_MAXIMUM_PATH_BYTES, DEFAULT_WORKER_STACK_BYTES,
+};
 use crate::config::{self, LambConfig};
 use crate::control::{ControlRequest, ControlResponse, DaemonStatus, PersistenceOutcomeResponse};
 use crate::dump::{DumpCoordinator, DumpOutcome};
 use crate::error::{io_error, LambError, Result};
-use crate::export_wav::{publish_dump, publish_recall, DumpPublishRequest, RecallPublishRequest};
-use crate::math::{derive_chunk_frames, estimate_ring_bytes};
+use crate::persistence_workspace::{PersistenceWorkspace, PrepareRequest};
 use crate::profile;
-use crate::sample_ring::{RingConfig, SampleFormat, SampleRing};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -17,7 +21,74 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const PERSIST_TIMEOUT: Duration = Duration::from_secs(60);
+const APP_STAGING_ROOT: &str = "/tmp/LAMB/staging";
+
+/// The preallocated persistence runtime shared by one capture session. The
+/// arena is `Arc`-shared so `status` stays responsive while `persist` serializes
+/// on the workspace mutex; capture never touches either.
+struct CaptureSession {
+    arena: Arc<crate::capture_arena::CaptureArena>,
+    workspace: Mutex<PersistenceWorkspace>,
+    coordinator: Arc<DumpCoordinator>,
+    sample_rate: u32,
+    channel_names: Vec<String>,
+    output_dir: PathBuf,
+}
+
+impl CaptureSession {
+    fn persist(&self, request: PrepareRequest<'_>) -> Result<DumpOutcome> {
+        let mut workspace = self
+            .workspace
+            .lock()
+            .map_err(|_| LambError::Control("persistence workspace lock poisoned".to_string()))?;
+        self.coordinator
+            .persist(&self.arena, &mut workspace, request, PERSIST_TIMEOUT)
+    }
+
+    fn clear(&self) -> Result<()> {
+        self.coordinator
+            .clear_in_order(&self.arena, PERSIST_TIMEOUT)
+    }
+
+    fn status(&self) -> Result<CaptureArenaStatus> {
+        self.arena.status(PERSIST_TIMEOUT)
+    }
+}
+
+fn legacy_runtime_params(cfg: &LambConfig) -> CaptureRuntimeParams {
+    CaptureRuntimeParams {
+        seconds: cfg.seconds,
+        chunk_frames_override: cfg.chunk_frames,
+        memory_max: cfg.memory.max,
+        headroom: cfg.memory.headroom,
+        split_when_over_bytes: cfg.export.split_when_over_bytes,
+        io_buffer_bytes_per_channel: DEFAULT_IO_BUFFER_BYTES_PER_CHANNEL,
+        maximum_path_bytes: DEFAULT_MAXIMUM_PATH_BYTES,
+        capture_queue_slots: DEFAULT_CAPTURE_QUEUE_SLOTS,
+        capture_worker_stack_bytes: DEFAULT_CAPTURE_WORKER_STACK_BYTES,
+        control_queue_capacity: DEFAULT_CONTROL_QUEUE_CAPACITY,
+        worker_stack_bytes: DEFAULT_WORKER_STACK_BYTES,
+    }
+}
+
+fn app_runtime_params(profile: &profile::ResolvedProfile) -> CaptureRuntimeParams {
+    CaptureRuntimeParams {
+        seconds: profile.buffer_seconds,
+        chunk_frames_override: None,
+        memory_max: None,
+        headroom: 1.2,
+        split_when_over_bytes: crate::math::WAV_SPLIT_DEFAULT_BYTES,
+        io_buffer_bytes_per_channel: DEFAULT_IO_BUFFER_BYTES_PER_CHANNEL,
+        maximum_path_bytes: DEFAULT_MAXIMUM_PATH_BYTES,
+        capture_queue_slots: DEFAULT_CAPTURE_QUEUE_SLOTS,
+        capture_worker_stack_bytes: DEFAULT_CAPTURE_WORKER_STACK_BYTES,
+        control_queue_capacity: DEFAULT_CONTROL_QUEUE_CAPACITY,
+        worker_stack_bytes: DEFAULT_WORKER_STACK_BYTES,
+    }
+}
 
 pub fn run_from_config_path(path: &Path) -> Result<()> {
     match fs::read_to_string(path) {
@@ -62,7 +133,7 @@ fn run_idle_fallback(path: &Path, socket_template: String, reason: String) -> Re
             last_error: Some(reason),
             active_profile: None,
             capture: None,
-            dump_coordinator: None,
+            session: None,
         }),
         stop: AtomicBool::new(false),
     };
@@ -103,43 +174,37 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
     if std::env::var_os("LAMB_SKIP_RUNTIME_VALIDATION").is_none() {
         validate_runtime_environment(&cfg)?;
     }
+    let params = legacy_runtime_params(&cfg);
 
     let mut resolved_target = None;
     let mut fake_capture = None;
     let mut pipewire_capture = None;
-    let channels = if cfg.backend == "pipewire" {
-        let pipewire_cfg = PipeWireCaptureConfig::from_lamb_config(&cfg);
-        let resolved = crate::capture_pipewire::resolve_target(&pipewire_cfg)?;
-        eprintln!("lamb: {}", resolved.log_message());
-        cfg.channels = Some(resolved.channels);
-        cfg.sample_rate = resolved.sample_rate;
-        resolved_target = Some(resolved);
-        cfg.channels.unwrap()
-    } else {
-        cfg.channels.unwrap_or(2)
-    };
-    let ring = make_ring(&cfg, channels)?;
-    match cfg.backend.as_str() {
+    let (sample_rate, channel_names, runtime) = match cfg.backend.as_str() {
         "fake" => {
+            let channels = cfg.channels.unwrap_or(2);
+            let (runtime, ingress) = CaptureRuntime::build(params, cfg.sample_rate, channels)?;
             fake_capture = Some(FakeCapture::start(
-                Arc::clone(&ring),
+                ingress,
                 channels,
                 cfg.chunk_frames.unwrap_or(25),
             )?);
+            (cfg.sample_rate, cfg.channel_map.clone(), runtime)
         }
         "pipewire" => {
-            let resolved = resolved_target.clone().ok_or_else(|| {
-                LambError::Capture("PipeWire target was not resolved".to_string())
-            })?;
             let pipewire_cfg = PipeWireCaptureConfig::from_lamb_config(&cfg);
-            pipewire_capture = Some(PipeWireCapture::start_with_resolved(
-                pipewire_cfg,
-                resolved,
-                Arc::clone(&ring),
-            )?);
+            let resolved = crate::capture_pipewire::resolve_target(&pipewire_cfg)?;
+            eprintln!("lamb: {}", resolved.log_message());
+            cfg.channels = Some(resolved.channels);
+            cfg.sample_rate = resolved.sample_rate;
+            resolved_target = Some(resolved.clone());
+            let channel_names = cfg.channel_map.clone();
+            let (capture, runtime) =
+                PipeWireCapture::start_with_resolved(pipewire_cfg, resolved, params)?;
+            pipewire_capture = Some(capture);
+            (cfg.sample_rate, channel_names, runtime)
         }
         other => return Err(LambError::Capture(format!("unsupported backend {other}"))),
-    }
+    };
 
     let parent = cfg
         .control_socket_path
@@ -155,10 +220,17 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
     fs::set_permissions(&cfg.control_socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|source| io_error(&cfg.control_socket_path, source))?;
 
+    let session = CaptureSession {
+        arena: Arc::new(runtime.arena),
+        workspace: Mutex::new(runtime.workspace),
+        coordinator: Arc::new(DumpCoordinator::new()),
+        sample_rate,
+        channel_names,
+        output_dir: cfg.output_dir.clone(),
+    };
     let ctx = DaemonContext {
         cfg,
-        ring,
-        dump_coordinator: DumpCoordinator::new(),
+        session,
         resolved_target,
         stop: AtomicBool::new(false),
         last_error: Mutex::new(None),
@@ -206,8 +278,7 @@ fn expand_runtime_paths(mut cfg: LambConfig) -> Result<LambConfig> {
 
 struct DaemonContext {
     cfg: LambConfig,
-    ring: Arc<SampleRing>,
-    dump_coordinator: DumpCoordinator,
+    session: CaptureSession,
     resolved_target: Option<ResolvedTarget>,
     stop: AtomicBool,
     last_error: Mutex<Option<String>>,
@@ -226,7 +297,7 @@ struct AppRuntimeState {
     last_error: Option<String>,
     active_profile: Option<profile::ResolvedProfile>,
     capture: Option<CaptureBackend>,
-    dump_coordinator: Option<Arc<DumpCoordinator>>,
+    session: Option<Arc<CaptureSession>>,
 }
 
 enum CaptureBackend {
@@ -235,13 +306,6 @@ enum CaptureBackend {
 }
 
 impl CaptureBackend {
-    fn ring(&self) -> &Arc<SampleRing> {
-        match self {
-            CaptureBackend::Jack(c, _) => &c.ring,
-            CaptureBackend::PipeWire(c, _) => &c.ring,
-        }
-    }
-
     fn sample_rate(&self) -> u32 {
         match self {
             CaptureBackend::Jack(c, _) => c.sample_rate,
@@ -274,7 +338,7 @@ fn run_app_config_daemon(path: &Path, config: app_config::AppConfig) -> Result<(
         last_error: None,
         active_profile: None,
         capture: None,
-        dump_coordinator: None,
+        session: None,
     };
 
     match reload_app_config_inner(&mut state, path) {
@@ -451,10 +515,18 @@ fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
             runtime.state.clone()
         };
         let last_error = runtime.last_error.clone();
-        if let Some(backend) = runtime.capture.as_ref() {
-            let ring_status = backend.ring().status();
-            let capacity = ring_status.capacity_frames as f64 / f64::from(backend.sample_rate());
-            let retained = ring_status.retained_frames as f64 / f64::from(backend.sample_rate());
+        if let (Some(session), Some(backend)) = (runtime.session.as_ref(), runtime.capture.as_ref())
+        {
+            let (capacity, retained, dropped) = match session.status() {
+                Ok(status) => (
+                    status.capacity_frames,
+                    status.retained_frames,
+                    status.dropped_frames,
+                ),
+                Err(_) => (0, 0, 0),
+            };
+            let capacity = capacity as f64 / f64::from(backend.sample_rate());
+            let retained = retained as f64 / f64::from(backend.sample_rate());
             let resolved = runtime.active_profile.as_ref().map(|p| p.name.clone());
             (
                 state,
@@ -465,7 +537,7 @@ fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
                 "F32LE".to_string(),
                 capacity,
                 retained,
-                ring_status.dropped_frames,
+                dropped,
             )
         } else {
             let resolved = runtime.active_profile.as_ref().map(|p| p.name.clone());
@@ -531,41 +603,10 @@ fn validate_runtime_environment(cfg: &LambConfig) -> Result<()> {
     Ok(())
 }
 
-fn make_ring(cfg: &LambConfig, channels: u32) -> Result<Arc<SampleRing>> {
-    let chunk_frames = derive_chunk_frames(cfg.sample_rate, cfg.chunk_frames)?;
-    let total_frames = u64::from(cfg.seconds)
-        .checked_mul(u64::from(cfg.sample_rate))
-        .ok_or_else(|| LambError::Validation("ring frame count overflow".to_string()))?;
-    let chunk_count = total_frames.div_ceil(u64::from(chunk_frames)).max(1);
-    let required = estimate_ring_bytes(
-        cfg.seconds,
-        cfg.sample_rate,
-        channels,
-        4,
-        cfg.memory.headroom,
-    )?;
-    if let Some(max) = cfg.memory.max {
-        if required > max {
-            return Err(LambError::Validation(format!(
-                "required memory {required} exceeds configured memory.max {max}"
-            )));
-        }
-    }
-    Ok(Arc::new(SampleRing::new(RingConfig {
-        channels,
-        sample_rate: cfg.sample_rate,
-        format: SampleFormat::F32Le,
-        chunk_frames,
-        chunk_count: u32::try_from(chunk_count)
-            .map_err(|_| LambError::Validation("chunk count exceeds u32".to_string()))?,
-        max_active_snapshots: cfg.max_active_snapshots,
-    })?))
-}
-
 fn handle_request(ctx: &DaemonContext, request: ControlRequest) -> ControlResponse {
     match request {
         ControlRequest::Recall => handle_recall(ctx),
-        ControlRequest::Clear => match ctx.ring.clear() {
+        ControlRequest::Clear => match ctx.session.clear() {
             Ok(()) => ControlResponse {
                 ok: true,
                 message: "cleared".to_string(),
@@ -610,22 +651,30 @@ fn handle_request(ctx: &DaemonContext, request: ControlRequest) -> ControlRespon
 }
 
 fn status_response(ctx: &DaemonContext) -> DaemonStatus {
-    let ring_status = ctx.ring.status();
+    let (capacity, retained, dropped, frozen_pending) = match ctx.session.status() {
+        Ok(status) => (
+            status.capacity_frames,
+            status.retained_frames,
+            status.dropped_frames,
+            status.frozen_pending,
+        ),
+        Err(_) => (0, 0, 0, false),
+    };
+    let sample_rate = ctx.session.sample_rate;
     DaemonStatus {
         state: if ctx.stop.load(Ordering::Acquire) {
             "stopping".to_string()
         } else {
             "capturing".to_string()
         },
-        active_export_count: ring_status.active_snapshots,
+        active_export_count: u32::from(frozen_pending),
         pending_recall_count: 0,
-        buffer_capacity_seconds: ring_status.capacity_frames as f64
-            / f64::from(ctx.cfg.sample_rate),
-        retained_seconds: ring_status.retained_frames as f64 / f64::from(ctx.cfg.sample_rate),
-        dropped_frames: ring_status.dropped_frames,
+        buffer_capacity_seconds: capacity as f64 / f64::from(sample_rate),
+        retained_seconds: retained as f64 / f64::from(sample_rate),
+        dropped_frames: dropped,
         target: ctx.cfg.target.clone(),
         resolved_target: status_resolved_target(ctx),
-        sample_rate: ctx.cfg.sample_rate,
+        sample_rate,
         channel_count: ctx.cfg.channels.unwrap_or_else(|| {
             ctx.resolved_target
                 .as_ref()
@@ -655,29 +704,21 @@ fn set_last_error(ctx: &DaemonContext, message: String) {
 
 fn handle_dump(ctx: &DaemonContext) -> ControlResponse {
     let timestamp = iso8601_compact_label();
-    let result = ctx.dump_coordinator.dump(&ctx.ring, |snapshot| {
-        publish_dump(DumpPublishRequest {
-            snapshot,
-            output_parent: &ctx.cfg.output_dir,
-            timestamp: &timestamp,
-            split_when_over_bytes: ctx.cfg.export.split_when_over_bytes,
-            channel_names: &ctx.cfg.channel_map,
-        })
+    let result = ctx.session.persist(PrepareRequest::Dump {
+        output_parent: &ctx.cfg.output_dir,
+        timestamp: &timestamp,
+        channel_names: &ctx.session.channel_names,
     });
     legacy_persistence_response(ctx, result)
 }
 
 fn handle_recall(ctx: &DaemonContext) -> ControlResponse {
     let timestamp = iso8601_compact_label();
-    let result = ctx.dump_coordinator.dump(&ctx.ring, |snapshot| {
-        publish_recall(RecallPublishRequest {
-            snapshot,
-            output_dir: &ctx.cfg.output_dir,
-            staging_root: Path::new("/tmp/LAMB/staging"),
-            timestamp: &timestamp,
-            split_when_over_bytes: ctx.cfg.export.split_when_over_bytes,
-            channel_names: &ctx.cfg.channel_map,
-        })
+    let result = ctx.session.persist(PrepareRequest::Recall {
+        staging_root: Path::new(APP_STAGING_ROOT),
+        output_dir: &ctx.cfg.output_dir,
+        timestamp: &timestamp,
+        channel_names: &ctx.session.channel_names,
     });
     legacy_persistence_response(ctx, result)
 }
@@ -687,7 +728,7 @@ fn legacy_persistence_response(
     result: Result<DumpOutcome>,
 ) -> ControlResponse {
     match result {
-        Ok(outcome) => persistence_response(outcome, ctx.cfg.sample_rate, status_response(ctx)),
+        Ok(outcome) => persistence_response(outcome, ctx.session.sample_rate, status_response(ctx)),
         Err(err) => {
             set_last_error(ctx, err.to_string());
             ControlResponse {
@@ -728,22 +769,21 @@ fn start_app_capture(
             .runtime
             .lock()
             .map_err(|_| LambError::Control("runtime state lock poisoned".to_string()))?;
-        runtime.dump_coordinator = None;
         runtime.capture.take()
     };
     drop(old_capture);
 
     let channel_names: Vec<String> = resolved.ports.iter().map(|p| p.name.clone()).collect();
     let resolved_for_runtime = resolved.clone();
+    let params = app_runtime_params(&resolved);
 
-    let backend: CaptureBackend = match resolved.backend.as_str() {
+    let (backend, runtime_session) = match resolved.backend.as_str() {
         "jack" => {
             let jack_cfg = JackCaptureConfig::from_profile(&resolved);
-            let capture =
-                JackCapture::start(jack_cfg, resolved.buffer_seconds).inspect_err(|err| {
-                    set_app_fault(ctx, &cfg, Some(resolved), err.to_string());
-                })?;
-            CaptureBackend::Jack(capture, channel_names)
+            let (capture, runtime) = JackCapture::start(jack_cfg, params).inspect_err(|err| {
+                set_app_fault(ctx, &cfg, Some(resolved.clone()), err.to_string());
+            })?;
+            (CaptureBackend::Jack(capture, channel_names), runtime)
         }
         "pipewire" => {
             let pw_cfg = resolved.pipewire_config.clone().ok_or_else(|| {
@@ -757,23 +797,25 @@ fn start_app_capture(
                     set_app_fault(ctx, &cfg, Some(resolved.clone()), err.to_string());
                 })?;
             eprintln!("lamb: {}", resolved_target.log_message());
-            let ring = crate::capture_pipewire::make_pipewire_ring(
-                resolved.buffer_seconds,
-                resolved_target.sample_rate,
-                resolved_target.channels,
-                1, // conservative: app-config profiles don't expose max_active_snapshots yet
-            )
-            .inspect_err(|err| {
-                set_app_fault(ctx, &cfg, Some(resolved.clone()), err.to_string());
-            })?;
-            let capture = PipeWireCapture::start_with_resolved(pw_cfg, resolved_target, ring)
-                .inspect_err(|err| {
-                    set_app_fault(ctx, &cfg, Some(resolved.clone()), err.to_string());
-                })?;
-            CaptureBackend::PipeWire(capture, channel_names)
+            let (capture, runtime) =
+                PipeWireCapture::start_with_resolved(pw_cfg, resolved_target, params).inspect_err(
+                    |err| {
+                        set_app_fault(ctx, &cfg, Some(resolved.clone()), err.to_string());
+                    },
+                )?;
+            (CaptureBackend::PipeWire(capture, channel_names), runtime)
         }
         other => unreachable!("backend validated as jack or pipewire, got {other}"),
     };
+
+    let session = Arc::new(CaptureSession {
+        arena: Arc::new(runtime_session.arena),
+        workspace: Mutex::new(runtime_session.workspace),
+        coordinator: Arc::new(DumpCoordinator::new()),
+        sample_rate: backend.sample_rate(),
+        channel_names: backend.channel_names().to_vec(),
+        output_dir: resolved_for_runtime.export_output_dir.clone(),
+    });
 
     let mut runtime = ctx
         .runtime
@@ -784,14 +826,14 @@ fn start_app_capture(
     runtime.last_error = None;
     runtime.active_profile = Some(resolved_for_runtime);
     runtime.capture = Some(backend);
-    runtime.dump_coordinator = Some(Arc::new(DumpCoordinator::new()));
+    runtime.session = Some(session);
     Ok(format!("capturing {profile_name}"))
 }
 
 fn stop_app_capture(ctx: &IdleDaemonContext) {
     if let Ok(mut runtime) = ctx.runtime.lock() {
         let capture = runtime.capture.take();
-        runtime.dump_coordinator = None;
+        runtime.session = None;
         runtime.state = if runtime.active_profile.is_some() {
             "idle".to_string()
         } else {
@@ -802,29 +844,24 @@ fn stop_app_capture(ctx: &IdleDaemonContext) {
     }
 }
 
+fn app_lock_error_response(ctx: &IdleDaemonContext) -> ControlResponse {
+    ControlResponse {
+        ok: false,
+        message: "runtime state lock poisoned".to_string(),
+        status: Some(idle_status_response(ctx)),
+        persistence_outcome: None,
+    }
+}
+
 fn handle_app_recall(ctx: &IdleDaemonContext) -> ControlResponse {
-    let capture = {
-        let runtime = match ctx.runtime.lock() {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                drop(error.into_inner());
-                return app_runtime_lock_error_response(ctx);
-            }
-        };
-        (|| {
-            let backend = runtime.capture.as_ref()?;
-            let profile = runtime.active_profile.clone()?;
-            let coordinator = Arc::clone(runtime.dump_coordinator.as_ref()?);
-            Some((
-                Arc::clone(backend.ring()),
-                coordinator,
-                backend.sample_rate(),
-                profile.export_output_dir,
-                backend.channel_names().to_vec(),
-            ))
-        })()
+    let session = match ctx.runtime.lock() {
+        Ok(runtime) => runtime.session.clone(),
+        Err(error) => {
+            drop(error.into_inner());
+            return app_lock_error_response(ctx);
+        }
     };
-    let Some((ring, coordinator, sample_rate, output_dir, channel_names)) = capture else {
+    let Some(session) = session else {
         return ControlResponse {
             ok: false,
             message: "capture is not running".to_string(),
@@ -834,27 +871,24 @@ fn handle_app_recall(ctx: &IdleDaemonContext) -> ControlResponse {
     };
 
     let timestamp = iso8601_compact_label();
-    let result = coordinator.dump(&ring, |snapshot| {
-        publish_recall(RecallPublishRequest {
-            snapshot,
-            output_dir: &output_dir,
-            staging_root: Path::new("/tmp/LAMB/staging"),
-            timestamp: &timestamp,
-            split_when_over_bytes: crate::math::WAV_SPLIT_DEFAULT_BYTES,
-            channel_names: &channel_names,
-        })
+    let result = session.persist(PrepareRequest::Recall {
+        staging_root: Path::new(APP_STAGING_ROOT),
+        output_dir: &session.output_dir,
+        timestamp: &timestamp,
+        channel_names: &session.channel_names,
     });
-    app_persistence_response(ctx, result, sample_rate)
+    app_persistence_response(ctx, result, session.sample_rate)
 }
 
 fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
-    let ring = ctx.runtime.lock().ok().and_then(|runtime| {
-        runtime
-            .capture
-            .as_ref()
-            .map(|backend| Arc::clone(backend.ring()))
-    });
-    let Some(ring) = ring else {
+    let session = match ctx.runtime.lock() {
+        Ok(runtime) => runtime.session.clone(),
+        Err(error) => {
+            drop(error.into_inner());
+            return app_lock_error_response(ctx);
+        }
+    };
+    let Some(session) = session else {
         return ControlResponse {
             ok: false,
             message: "capture is not running".to_string(),
@@ -862,7 +896,7 @@ fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
             persistence_outcome: None,
         };
     };
-    match ring.clear() {
+    match session.clear() {
         Ok(()) => ControlResponse {
             ok: true,
             message: "cleared".to_string(),
@@ -882,26 +916,14 @@ fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
 }
 
 fn handle_app_dump(ctx: &IdleDaemonContext) -> ControlResponse {
-    let capture = {
-        let runtime = match ctx.runtime.lock() {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                drop(error.into_inner());
-                return app_runtime_lock_error_response(ctx);
-            }
-        };
-        (|| {
-            let backend = runtime.capture.as_ref()?;
-            let coordinator = Arc::clone(runtime.dump_coordinator.as_ref()?);
-            Some((
-                Arc::clone(backend.ring()),
-                coordinator,
-                backend.sample_rate(),
-                backend.channel_names().to_vec(),
-            ))
-        })()
+    let session = match ctx.runtime.lock() {
+        Ok(runtime) => runtime.session.clone(),
+        Err(error) => {
+            drop(error.into_inner());
+            return app_lock_error_response(ctx);
+        }
     };
-    let Some((ring, coordinator, sample_rate, channel_names)) = capture else {
+    let Some(session) = session else {
         return ControlResponse {
             ok: false,
             message: "capture is not running".to_string(),
@@ -924,16 +946,12 @@ fn handle_app_dump(ctx: &IdleDaemonContext) -> ControlResponse {
     let dump_dir = PathBuf::from(home).join(".cache/lamb/out");
 
     let timestamp = iso8601_compact_label();
-    let result = coordinator.dump(&ring, |snapshot| {
-        publish_dump(DumpPublishRequest {
-            snapshot,
-            output_parent: &dump_dir,
-            timestamp: &timestamp,
-            split_when_over_bytes: crate::math::WAV_SPLIT_DEFAULT_BYTES,
-            channel_names: &channel_names,
-        })
+    let result = session.persist(PrepareRequest::Dump {
+        output_parent: &dump_dir,
+        timestamp: &timestamp,
+        channel_names: &session.channel_names,
     });
-    app_persistence_response(ctx, result, sample_rate)
+    app_persistence_response(ctx, result, session.sample_rate)
 }
 
 fn app_persistence_response(
@@ -952,15 +970,6 @@ fn app_persistence_response(
                 persistence_outcome: None,
             }
         }
-    }
-}
-
-fn app_runtime_lock_error_response(ctx: &IdleDaemonContext) -> ControlResponse {
-    ControlResponse {
-        ok: false,
-        message: "runtime state lock poisoned".to_string(),
-        status: Some(idle_status_response(ctx)),
-        persistence_outcome: None,
     }
 }
 
@@ -1062,7 +1071,7 @@ fn set_app_fault(
         runtime.last_error = Some(error);
         runtime.active_profile = resolved;
         runtime.capture = None;
-        runtime.dump_coordinator = None;
+        runtime.session = None;
     }
 }
 
@@ -1090,96 +1099,83 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                 state.active_profile = Some(profile.clone());
                 if state.config.daemon.start_mode == "auto" {
                     state.capture.take();
-                    state.dump_coordinator = None;
+                    state.session = None;
                     let channel_names: Vec<String> =
                         profile.ports.iter().map(|p| p.name.clone()).collect();
-                    match profile.backend.as_str() {
+                    let params = app_runtime_params(&profile);
+                    let build = match profile.backend.as_str() {
                         "jack" => {
-                            match JackCapture::start(
-                                JackCaptureConfig::from_profile(&profile),
-                                profile.buffer_seconds,
-                            ) {
-                                Ok(capture) => {
-                                    state.state = "capturing".to_string();
-                                    state.last_error = None;
-                                    state.capture =
-                                        Some(CaptureBackend::Jack(capture, channel_names));
-                                    state.dump_coordinator = Some(Arc::new(DumpCoordinator::new()));
-                                }
-                                Err(err) => {
-                                    state.state = "faulted".to_string();
-                                    state.last_error = Some(err.to_string());
-                                }
-                            }
+                            JackCapture::start(JackCaptureConfig::from_profile(&profile), params)
+                                .map(|(capture, runtime)| {
+                                    (CaptureBackend::Jack(capture, channel_names), runtime)
+                                })
                         }
                         "pipewire" => {
                             if let Some(pw_cfg) = profile.pipewire_config.clone() {
                                 match crate::capture_pipewire::resolve_target(&pw_cfg) {
                                     Ok(resolved_target) => {
                                         eprintln!("lamb: {}", resolved_target.log_message());
-                                        match crate::capture_pipewire::make_pipewire_ring(
-                                            profile.buffer_seconds,
-                                            resolved_target.sample_rate,
-                                            resolved_target.channels,
-                                            1, // conservative default for app-config path
-                                        ) {
-                                            Ok(ring) => {
-                                                match PipeWireCapture::start_with_resolved(
-                                                    pw_cfg,
-                                                    resolved_target,
-                                                    ring,
-                                                ) {
-                                                    Ok(capture) => {
-                                                        state.state = "capturing".to_string();
-                                                        state.last_error = None;
-                                                        state.capture =
-                                                            Some(CaptureBackend::PipeWire(
-                                                                capture,
-                                                                channel_names,
-                                                            ));
-                                                        state.dump_coordinator =
-                                                            Some(Arc::new(DumpCoordinator::new()));
-                                                    }
-                                                    Err(err) => {
-                                                        state.state = "faulted".to_string();
-                                                        state.last_error = Some(err.to_string());
-                                                    }
-                                                }
-                                            }
-                                            Err(err) => {
-                                                state.state = "faulted".to_string();
-                                                state.last_error = Some(err.to_string());
-                                            }
-                                        }
+                                        PipeWireCapture::start_with_resolved(
+                                            pw_cfg,
+                                            resolved_target,
+                                            params,
+                                        )
+                                        .map(
+                                            |(capture, runtime)| {
+                                                (
+                                                    CaptureBackend::PipeWire(
+                                                        capture,
+                                                        channel_names,
+                                                    ),
+                                                    runtime,
+                                                )
+                                            },
+                                        )
                                     }
-                                    Err(err) => {
-                                        state.state = "faulted".to_string();
-                                        state.last_error = Some(err.to_string());
-                                    }
+                                    Err(err) => Err(err),
                                 }
                             } else {
-                                state.state = "faulted".to_string();
-                                state.last_error =
-                                    Some("pipewire profile has no pipewire config".to_string());
+                                Err(LambError::Validation(
+                                    "pipewire profile has no pipewire config".to_string(),
+                                ))
                             }
                         }
-                        other => {
+                        other => Err(LambError::Validation(format!("unknown backend: {other}"))),
+                    };
+                    match build {
+                        Ok((backend, runtime)) => {
+                            let sample_rate = backend.sample_rate();
+                            let names = backend.channel_names().to_vec();
+                            let output_dir = profile.export_output_dir.clone();
+                            state.session = Some(Arc::new(CaptureSession {
+                                arena: Arc::new(runtime.arena),
+                                workspace: Mutex::new(runtime.workspace),
+                                coordinator: Arc::new(DumpCoordinator::new()),
+                                sample_rate,
+                                channel_names: names,
+                                output_dir,
+                            }));
+                            state.state = "capturing".to_string();
+                            state.last_error = None;
+                            state.capture = Some(backend);
+                        }
+                        Err(err) => {
                             state.state = "faulted".to_string();
-                            state.last_error = Some(format!("unknown backend: {other}"));
+                            state.last_error = Some(err.to_string());
                         }
                     }
                 } else {
                     state.state = "idle".to_string();
                     state.last_error = None;
                     state.capture = None;
-                    state.dump_coordinator = None;
+                    state.session = None;
                 }
             } else {
                 state.state = "unconfigured".to_string();
                 state.last_error = Some("no active profile configured".to_string());
                 state.active_profile = None;
                 state.capture = None;
-                state.dump_coordinator = None;
+                state.session = None;
             }
             Ok(())
         }
@@ -1189,7 +1185,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
             state.last_error = Some(format!("config file not found: {}", path.display()));
             state.active_profile = None;
             state.capture = None;
-            state.dump_coordinator = None;
+            state.session = None;
             Ok(())
         }
         ConfigLoadState::Invalid => {
@@ -1198,7 +1194,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
             state.last_error = loaded.error;
             state.active_profile = None;
             state.capture = None;
-            state.dump_coordinator = None;
+            state.session = None;
             Ok(())
         }
     }
@@ -1265,7 +1261,7 @@ mod tests {
                 last_error: None,
                 active_profile: None,
                 capture: None,
-                dump_coordinator: None,
+                session: None,
             }),
             stop: AtomicBool::new(false),
         };

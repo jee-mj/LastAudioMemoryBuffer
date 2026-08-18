@@ -1,9 +1,10 @@
+use crate::capture_arena::CaptureIngress;
+use crate::capture_runtime::{CaptureRuntime, CaptureRuntimeParams};
 use crate::config::LambConfig;
 use crate::error::{LambError, Result};
-use crate::sample_ring::{RingConfig, SampleFormat, SampleRing};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,28 +53,6 @@ impl PipeWireCaptureConfig {
     }
 }
 
-pub fn make_pipewire_ring(
-    seconds: u32,
-    sample_rate: u32,
-    channels: u32,
-    max_active_snapshots: u32,
-) -> Result<Arc<SampleRing>> {
-    let chunk_frames = crate::math::derive_chunk_frames(sample_rate, None)?;
-    let total_frames = u64::from(seconds)
-        .checked_mul(u64::from(sample_rate))
-        .ok_or_else(|| LambError::Validation("ring frame count overflow".to_string()))?;
-    let chunk_count = total_frames.div_ceil(u64::from(chunk_frames)).max(1);
-    Ok(Arc::new(SampleRing::new(RingConfig {
-        channels,
-        sample_rate,
-        format: SampleFormat::F32Le,
-        chunk_frames,
-        chunk_count: u32::try_from(chunk_count)
-            .map_err(|_| LambError::Validation("chunk count exceeds u32".to_string()))?,
-        max_active_snapshots,
-    })?))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableNode {
     pub id: u32,
@@ -88,7 +67,6 @@ pub struct AvailableNode {
 
 pub struct PipeWireCapture {
     resolved: ResolvedTarget,
-    pub ring: Arc<SampleRing>,
     pub sample_rate: u32,
     pub channel_count: u32,
     stop_sender: pipewire::channel::Sender<PipeWireCommand>,
@@ -100,18 +78,22 @@ enum PipeWireCommand {
 }
 
 impl PipeWireCapture {
-    pub fn start(cfg: PipeWireCaptureConfig, ring: Arc<SampleRing>) -> Result<Self> {
+    pub fn start(
+        cfg: PipeWireCaptureConfig,
+        params: CaptureRuntimeParams,
+    ) -> Result<(Self, CaptureRuntime)> {
         let resolved = resolve_target(&cfg)?;
-        Self::start_with_resolved(cfg, resolved, ring)
+        Self::start_with_resolved(cfg, resolved, params)
     }
 
     pub(crate) fn start_with_resolved(
         cfg: PipeWireCaptureConfig,
         resolved: ResolvedTarget,
-        ring: Arc<SampleRing>,
-    ) -> Result<Self> {
+        params: CaptureRuntimeParams,
+    ) -> Result<(Self, CaptureRuntime)> {
+        let (runtime, ingress) =
+            CaptureRuntime::build(params, resolved.sample_rate, resolved.channels)?;
         let resolved_for_thread = resolved.clone();
-        let ring_for_thread = Arc::clone(&ring);
         let sample_rate = resolved.sample_rate;
         let channel_count = resolved.channels;
         let (stop_sender, stop_receiver) = pipewire::channel::channel();
@@ -121,7 +103,7 @@ impl PipeWireCapture {
             if let Err(err) = run_pipewire_stream_loop(
                 cfg,
                 resolved_for_thread,
-                ring_for_thread,
+                ingress,
                 stop_receiver,
                 ready_sender.clone(),
             ) {
@@ -132,14 +114,16 @@ impl PipeWireCapture {
         match ready_receiver.recv().map_err(|_| {
             LambError::Capture("PipeWire capture thread exited before startup".to_string())
         })? {
-            Ok(()) => Ok(Self {
-                resolved,
-                ring,
-                sample_rate,
-                channel_count,
-                stop_sender,
-                join: Some(join),
-            }),
+            Ok(()) => Ok((
+                Self {
+                    resolved,
+                    sample_rate,
+                    channel_count,
+                    stop_sender,
+                    join: Some(join),
+                },
+                runtime,
+            )),
             Err(err) => {
                 let _ = join.join();
                 Err(err)
@@ -205,7 +189,7 @@ pub fn process_interleaved_f32_chunk(
     size: u32,
     stride: i32,
     channels: u32,
-    ring: &SampleRing,
+    ingress: &CaptureIngress,
 ) -> Result<()> {
     if channels == 0 {
         return Err(LambError::Capture(
@@ -249,7 +233,7 @@ pub fn process_interleaved_f32_chunk(
 
     let samples =
         unsafe { std::slice::from_raw_parts(payload.as_ptr().cast::<f32>(), payload.len() / 4) };
-    ring.write_interleaved(samples, channels)
+    ingress.try_push_interleaved(samples, channels).map(|_| ())
 }
 
 fn resolved_from_node(cfg: &PipeWireCaptureConfig, node: &AvailableNode) -> Result<ResolvedTarget> {
@@ -399,7 +383,7 @@ fn pipewire_error(err: pipewire::Error) -> LambError {
 fn run_pipewire_stream_loop(
     cfg: PipeWireCaptureConfig,
     resolved: ResolvedTarget,
-    ring: Arc<SampleRing>,
+    ingress: CaptureIngress,
     stop_receiver: pipewire::channel::Receiver<PipeWireCommand>,
     ready_sender: mpsc::Sender<Result<()>>,
 ) -> Result<()> {
@@ -441,7 +425,7 @@ fn run_pipewire_stream_loop(
     let user_data = PipeWireStreamData {
         format: spa::param::audio::AudioInfoRaw::new(),
         channels: resolved.channels,
-        ring,
+        ingress,
     };
     let _stream_listener = stream
         .add_local_listener_with_user_data(user_data)
@@ -461,26 +445,17 @@ fn run_pipewire_stream_loop(
             let _ = user_data.format.parse(param);
         })
         .process(|stream, user_data| {
-            // Conservative per-callback frame estimate for drop accounting.
-            // PipeWire RT buffers are typically 256–1024 frames; we use 256
-            // as a floor so we undercount rather than overcount.
-            const DROP_FRAME_ESTIMATE: u64 = 256;
-
             if user_data.format.format() != spa::param::audio::AudioFormat::F32LE {
-                let _ = user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
                 return;
             }
             if user_data.format.channels() != user_data.channels {
-                let _ = user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
                 return;
             }
             let Some(mut buffer) = stream.dequeue_buffer() else {
-                let _ = user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
                 return;
             };
             let datas = buffer.datas_mut();
             if datas.is_empty() {
-                let _ = user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
                 return;
             }
             let data = &mut datas[0];
@@ -495,7 +470,7 @@ fn run_pipewire_stream_loop(
                     size,
                     stride,
                     user_data.channels,
-                    &user_data.ring,
+                    &user_data.ingress,
                 );
             }
         })
@@ -539,5 +514,5 @@ fn run_pipewire_stream_loop(
 struct PipeWireStreamData {
     format: pipewire::spa::param::audio::AudioInfoRaw,
     channels: u32,
-    ring: Arc<SampleRing>,
+    ingress: CaptureIngress,
 }

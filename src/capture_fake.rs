@@ -1,5 +1,5 @@
+use crate::capture_arena::CaptureIngress;
 use crate::error::Result;
-use crate::sample_ring::SampleRing;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -11,7 +11,7 @@ pub struct FakeCapture {
 }
 
 impl FakeCapture {
-    pub fn start(ring: Arc<SampleRing>, channels: u32, frames_per_tick: u32) -> Result<Self> {
+    pub fn start(ingress: CaptureIngress, channels: u32, frames_per_tick: u32) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
@@ -27,7 +27,7 @@ impl FakeCapture {
                         }
                     }
                 }
-                let _ = ring.write_interleaved(&samples, channels);
+                let _ = ingress.try_push_interleaved(&samples, channels);
                 thread::sleep(Duration::from_millis(20));
             }
         });

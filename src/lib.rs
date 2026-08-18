@@ -3,6 +3,7 @@ pub mod capture_arena;
 pub mod capture_fake;
 pub mod capture_jack;
 pub mod capture_pipewire;
+pub mod capture_runtime;
 pub mod config;
 pub mod control;
 pub mod control_server;
