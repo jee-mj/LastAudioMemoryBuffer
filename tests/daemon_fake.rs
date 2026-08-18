@@ -18,6 +18,9 @@ fn persistence_written_response_round_trips_with_source_frame_metadata() {
             frames: 250,
             duration_seconds: 2.5,
             lost_frames: 25,
+            retention_lost_frames: 25,
+            cleared_frames: 0,
+            capture_dropped_frames: 0,
             output_directory: PathBuf::from("/tmp/out/20260818T120000"),
             files: vec![PathBuf::from("/tmp/out/20260818T120000/mic.wav")],
         }),
@@ -42,13 +45,21 @@ fn persistence_non_written_responses_round_trip_as_successes() {
                 frames: 100,
                 duration_seconds: 1.0,
                 lost_frames: 0,
+                retention_lost_frames: 0,
+                cleared_frames: 0,
+                capture_dropped_frames: 0,
             }),
         },
         ControlResponse {
             ok: true,
             message: "no new audio".to_string(),
             status: None,
-            persistence_outcome: Some(PersistenceOutcomeResponse::NoNewAudio),
+            persistence_outcome: Some(PersistenceOutcomeResponse::NoNewAudio {
+                lost_frames: 0,
+                retention_lost_frames: 0,
+                cleared_frames: 0,
+                capture_dropped_frames: 0,
+            }),
         },
     ];
 
@@ -106,7 +117,7 @@ fn assert_persistence_commands_share_cursor(first: ControlRequest, second: Contr
         outcome => panic!("first command should write captured audio, got {outcome:?}"),
     };
     match second_response.persistence_outcome {
-        Some(PersistenceOutcomeResponse::NoNewAudio) => {}
+        Some(PersistenceOutcomeResponse::NoNewAudio { .. }) => {}
         Some(PersistenceOutcomeResponse::Written { start_frame, .. }) => {
             assert_eq!(
                 start_frame, first_end,

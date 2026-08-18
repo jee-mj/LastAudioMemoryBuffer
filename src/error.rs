@@ -15,14 +15,35 @@ pub enum LambError {
         source: std::io::Error,
     },
 
+    #[error("persistence failed ({operation}); cleanup also failed ({cleanup})")]
+    PersistenceCleanup {
+        operation: Box<LambError>,
+        cleanup: Box<LambError>,
+    },
+
+    #[error("publication outcome is indeterminate after: {operation}")]
+    IndeterminatePublication { operation: Box<LambError> },
+
+    #[error("unidentified staging at {path} requires manual removal or recovery")]
+    UnidentifiedStagingCleanup { path: PathBuf },
+
     #[error("control error: {0}")]
     Control(String),
 
     #[error("capture error: {0}")]
     Capture(String),
 
+    #[error("capture error: {0}")]
+    CaptureInvariant(&'static str),
+
     #[error("export error: {0}")]
     Export(String),
+
+    #[error("export error: {0}")]
+    ExportInvariant(&'static str),
+
+    #[error("control error: {0}")]
+    ControlInvariant(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, LambError>;

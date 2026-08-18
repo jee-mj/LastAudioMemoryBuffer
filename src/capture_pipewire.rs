@@ -467,20 +467,20 @@ fn run_pipewire_stream_loop(
             const DROP_FRAME_ESTIMATE: u64 = 256;
 
             if user_data.format.format() != spa::param::audio::AudioFormat::F32LE {
-                user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
+                let _ = user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
                 return;
             }
             if user_data.format.channels() != user_data.channels {
-                user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
+                let _ = user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
                 return;
             }
             let Some(mut buffer) = stream.dequeue_buffer() else {
-                user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
+                let _ = user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
                 return;
             };
             let datas = buffer.datas_mut();
             if datas.is_empty() {
-                user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
+                let _ = user_data.ring.record_dropped_frames(DROP_FRAME_ESTIMATE);
                 return;
             }
             let data = &mut datas[0];

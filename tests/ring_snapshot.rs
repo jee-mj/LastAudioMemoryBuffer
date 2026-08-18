@@ -329,3 +329,42 @@ fn snapshot_while_writer_is_active_captures_all_published_frames() {
     stop.store(true, std::sync::atomic::Ordering::Release);
     let _ = writer.join();
 }
+
+#[test]
+fn fixed_buffer_copy_caps_at_capacity_and_preserves_interleaving() {
+    let ring = ring();
+    let samples: Vec<f32> = (0..6)
+        .flat_map(|frame| [frame as f32, 100.0 + frame as f32])
+        .collect();
+    ring.write_interleaved(&samples, 2).unwrap();
+    let mut destination = [0.0; 6];
+
+    let copied = ring
+        .copy_interleaved_range_into(1..6, &mut destination)
+        .unwrap();
+
+    assert_eq!(copied, 3);
+    assert_eq!(destination, [1.0, 101.0, 2.0, 102.0, 3.0, 103.0]);
+}
+
+#[test]
+fn reset_rejects_active_snapshots_and_clears_all_ring_state_after_release() {
+    let ring = ring();
+    ring.write_interleaved(&interleaved_frames(6, 2, 0.0), 2)
+        .unwrap();
+    ring.record_dropped_frames(7).unwrap();
+    let snapshot = ring.snapshot_last_frames(2).unwrap();
+
+    assert!(ring.reset().is_err());
+    drop(snapshot);
+    ring.reset().unwrap();
+
+    assert_eq!(ring.write_head_frame(), 0);
+    assert_eq!(ring.oldest_frame(), 0);
+    assert_eq!(ring.status().retained_frames, 0);
+    assert_eq!(ring.status().dropped_frames, 0);
+    assert_eq!(ring.status().active_snapshots, 0);
+
+    ring.write_interleaved(&[8.0, 108.0], 2).unwrap();
+    assert_eq!(ring.snapshot_last_frames(1).unwrap().total_frames(), 1);
+}

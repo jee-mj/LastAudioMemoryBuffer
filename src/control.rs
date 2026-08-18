@@ -40,6 +40,12 @@ pub enum PersistenceOutcomeResponse {
         frames: u64,
         duration_seconds: f64,
         lost_frames: u64,
+        #[serde(default)]
+        retention_lost_frames: u64,
+        #[serde(default)]
+        cleared_frames: u64,
+        #[serde(default)]
+        capture_dropped_frames: u64,
         output_directory: PathBuf,
         files: Vec<PathBuf>,
     },
@@ -49,8 +55,23 @@ pub enum PersistenceOutcomeResponse {
         frames: u64,
         duration_seconds: f64,
         lost_frames: u64,
+        #[serde(default)]
+        retention_lost_frames: u64,
+        #[serde(default)]
+        cleared_frames: u64,
+        #[serde(default)]
+        capture_dropped_frames: u64,
     },
-    NoNewAudio,
+    NoNewAudio {
+        #[serde(default)]
+        lost_frames: u64,
+        #[serde(default)]
+        retention_lost_frames: u64,
+        #[serde(default)]
+        cleared_frames: u64,
+        #[serde(default)]
+        capture_dropped_frames: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -152,6 +173,7 @@ fn format_persistence_outcome(outcome: &PersistenceOutcomeResponse) -> String {
             lost_frames,
             output_directory,
             files,
+            ..
         } => {
             let mut lines = vec![format!(
                 "written {frames} frames ({duration_seconds:.3} seconds), source frames {start_frame}..{end_frame}"
@@ -171,6 +193,7 @@ fn format_persistence_outcome(outcome: &PersistenceOutcomeResponse) -> String {
             frames,
             duration_seconds,
             lost_frames,
+            ..
         } => {
             let mut lines = vec![format!(
                 "skipped exact-zero audio: {frames} frames ({duration_seconds:.3} seconds), source frames {start_frame}..{end_frame}"
@@ -182,7 +205,13 @@ fn format_persistence_outcome(outcome: &PersistenceOutcomeResponse) -> String {
             }
             lines.join("\n")
         }
-        PersistenceOutcomeResponse::NoNewAudio => "no new audio".to_string(),
+        PersistenceOutcomeResponse::NoNewAudio { lost_frames, .. } => {
+            if *lost_frames == 0 {
+                "no new audio".to_string()
+            } else {
+                format!("no new audio\nwarning: {lost_frames} frames were lost before persistence")
+            }
+        }
     }
 }
 
@@ -226,6 +255,9 @@ mod tests {
             frames: 250,
             duration_seconds: 2.5,
             lost_frames: 25,
+            retention_lost_frames: 25,
+            cleared_frames: 0,
+            capture_dropped_frames: 0,
             output_directory: PathBuf::from("/tmp/out/20260818120000"),
             files: vec![
                 PathBuf::from("/tmp/out/20260818120000/mic.wav"),
@@ -253,6 +285,9 @@ mod tests {
             frames: 100,
             duration_seconds: 1.0,
             lost_frames: 0,
+            retention_lost_frames: 0,
+            cleared_frames: 0,
+            capture_dropped_frames: 0,
         };
 
         assert_eq!(
@@ -264,7 +299,12 @@ mod tests {
     #[test]
     fn formats_no_new_audio_persistence_outcome() {
         assert_eq!(
-            format_persistence_outcome(&PersistenceOutcomeResponse::NoNewAudio),
+            format_persistence_outcome(&PersistenceOutcomeResponse::NoNewAudio {
+                lost_frames: 0,
+                retention_lost_frames: 0,
+                cleared_frames: 0,
+                capture_dropped_frames: 0,
+            }),
             "no new audio"
         );
     }

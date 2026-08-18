@@ -973,10 +973,11 @@ fn persistence_response(
         DumpOutcome::Written {
             range,
             frames,
-            lost_frames,
+            losses,
             output_directory,
             files,
         } => {
+            let lost_frames = losses.lost_frames();
             let message = persistence_message("written", frames, lost_frames);
             (
                 message,
@@ -986,6 +987,9 @@ fn persistence_response(
                     frames,
                     duration_seconds: frames as f64 / f64::from(sample_rate),
                     lost_frames,
+                    retention_lost_frames: losses.retention_lost_frames,
+                    cleared_frames: losses.cleared_frames,
+                    capture_dropped_frames: losses.capture_dropped_frames,
                     output_directory,
                     files,
                 },
@@ -994,8 +998,9 @@ fn persistence_response(
         DumpOutcome::SkippedSilent {
             range,
             frames,
-            lost_frames,
+            losses,
         } => {
+            let lost_frames = losses.lost_frames();
             let message = persistence_message("skipped exact-zero audio", frames, lost_frames);
             (
                 message,
@@ -1005,13 +1010,29 @@ fn persistence_response(
                     frames,
                     duration_seconds: frames as f64 / f64::from(sample_rate),
                     lost_frames,
+                    retention_lost_frames: losses.retention_lost_frames,
+                    cleared_frames: losses.cleared_frames,
+                    capture_dropped_frames: losses.capture_dropped_frames,
                 },
             )
         }
-        DumpOutcome::NoNewAudio => (
-            "no new audio".to_string(),
-            PersistenceOutcomeResponse::NoNewAudio,
-        ),
+        DumpOutcome::NoNewAudio { losses } => {
+            let lost_frames = losses.lost_frames();
+            let message = if lost_frames == 0 {
+                "no new audio".to_string()
+            } else {
+                format!("no new audio; warning: {lost_frames} frames lost before persistence")
+            };
+            (
+                message,
+                PersistenceOutcomeResponse::NoNewAudio {
+                    lost_frames,
+                    retention_lost_frames: losses.retention_lost_frames,
+                    cleared_frames: losses.cleared_frames,
+                    capture_dropped_frames: losses.capture_dropped_frames,
+                },
+            )
+        }
     };
     ControlResponse {
         ok: true,

@@ -1,4 +1,9 @@
 use crate::error::{LambError, Result};
+use crate::memory_plan::{
+    ring_metadata_budget, ExactArray, MaterializedBuffer, RING_CHUNK_OBJECT_RESERVE_BYTES,
+    RING_FIXED_METADATA_RESERVE_BYTES,
+};
+use std::mem::size_of;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -54,8 +59,11 @@ struct Chunk {
     pin_count: AtomicU32,
     valid_start_frame: AtomicU64,
     valid_frame_count: AtomicU32,
-    data: Mutex<Vec<f32>>,
+    data: Mutex<MaterializedBuffer<f32>>,
 }
+
+const _: () = assert!(size_of::<Chunk>() as u64 <= RING_CHUNK_OBJECT_RESERVE_BYTES);
+const _: () = assert!(size_of::<Arc<Chunk>>() == size_of::<usize>());
 
 #[derive(Debug, Clone)]
 pub struct SnapshotSegment {
@@ -172,7 +180,7 @@ fn collect_segments(
 
 pub struct SampleRing {
     cfg: RingConfig,
-    chunks: Vec<Arc<Chunk>>,
+    chunks: ExactArray<Arc<Chunk>>,
     write_chunk: Mutex<usize>,
     global_write_frame: AtomicU64,
     clear_after_frame: AtomicU64,
@@ -180,7 +188,11 @@ pub struct SampleRing {
     dropped_frames: AtomicU64,
     active_snapshots: Arc<AtomicU32>,
     last_overrun: Mutex<Option<SystemTime>>,
+    allocated_sample_bytes: u64,
+    metadata_budget_bytes: u64,
 }
+
+const _: () = assert!(size_of::<SampleRing>() as u64 <= RING_FIXED_METADATA_RESERVE_BYTES);
 
 impl SampleRing {
     pub fn new(cfg: RingConfig) -> Result<Self> {
@@ -207,17 +219,40 @@ impl SampleRing {
             .ok()
             .and_then(|frames| frames.checked_mul(cfg.channels as usize))
             .ok_or_else(|| LambError::Validation("chunk allocation size overflow".to_string()))?;
-        let mut chunks = Vec::with_capacity(cfg.chunk_count as usize);
-        for _ in 0..cfg.chunk_count {
-            chunks.push(Arc::new(Chunk {
+        let chunk_count = usize::try_from(cfg.chunk_count)
+            .map_err(|_| LambError::Validation("ring chunk count overflow".to_string()))?;
+        let mut allocated_sample_bytes = 0_u64;
+        let chunks = ExactArray::try_from_fn(chunk_count, |_| {
+            let data = MaterializedBuffer::new_zeroed(samples_per_chunk)?;
+            let data_bytes = u64::try_from(data.allocated_bytes()).map_err(|_| {
+                LambError::Validation("ring sample byte count overflow".to_string())
+            })?;
+            allocated_sample_bytes =
+                allocated_sample_bytes
+                    .checked_add(data_bytes)
+                    .ok_or_else(|| {
+                        LambError::Validation("ring sample byte count overflow".to_string())
+                    })?;
+            Ok(Arc::new(Chunk {
                 sequence: AtomicU64::new(0),
                 state: AtomicU8::new(ChunkState::Writable as u8),
                 pin_count: AtomicU32::new(0),
                 valid_start_frame: AtomicU64::new(0),
                 valid_frame_count: AtomicU32::new(0),
-                data: Mutex::new(vec![0.0; samples_per_chunk]),
-            }));
-        }
+                data: Mutex::new(data),
+            }))
+        })?;
+        let metadata_budget_bytes = ring_metadata_budget(
+            u64::try_from(chunks.len())
+                .map_err(|_| LambError::Validation("ring chunk count overflow".to_string()))?,
+            u64::try_from(samples_per_chunk)
+                .ok()
+                .and_then(|samples| samples.checked_mul(size_of::<f32>() as u64))
+                .ok_or_else(|| {
+                    LambError::Validation("ring chunk sample byte count overflow".to_string())
+                })?,
+        )?
+        .total()?;
         Ok(Self {
             cfg,
             chunks,
@@ -228,37 +263,205 @@ impl SampleRing {
             dropped_frames: AtomicU64::new(0),
             active_snapshots: Arc::new(AtomicU32::new(0)),
             last_overrun: Mutex::new(None),
+            allocated_sample_bytes,
+            metadata_budget_bytes,
         })
+    }
+
+    pub fn materialize_pages(&self) -> Result<()> {
+        for chunk in self.chunks.iter() {
+            let mut data = chunk
+                .data
+                .lock()
+                .map_err(|_| LambError::Capture("chunk data lock poisoned".to_string()))?;
+            data.materialize_pages()?;
+        }
+        Ok(())
+    }
+
+    pub fn allocated_sample_bytes(&self) -> u64 {
+        self.allocated_sample_bytes
+    }
+
+    pub fn metadata_budget_bytes(&self) -> u64 {
+        self.metadata_budget_bytes
+    }
+
+    pub fn reset(&self) -> Result<()> {
+        let mut write_chunk = self
+            .write_chunk
+            .lock()
+            .map_err(|_| LambError::Control("write chunk lock poisoned".to_string()))?;
+        let mut last_overrun = self
+            .last_overrun
+            .lock()
+            .map_err(|_| LambError::Control("last overrun lock poisoned".to_string()))?;
+        if self.active_snapshots.load(Ordering::Acquire) != 0
+            || self
+                .chunks
+                .iter()
+                .any(|chunk| chunk.pin_count.load(Ordering::Acquire) != 0)
+        {
+            return Err(LambError::Control(
+                "cannot reset ring while a snapshot is active".to_string(),
+            ));
+        }
+        if self.chunks.iter().any(|chunk| {
+            ChunkState::from_u8(chunk.state.load(Ordering::Acquire)) == ChunkState::Writing
+        }) {
+            return Err(LambError::Control(
+                "cannot reset ring while a writer is active".to_string(),
+            ));
+        }
+
+        for chunk in self.chunks.iter() {
+            chunk.sequence.store(0, Ordering::Release);
+            chunk.valid_start_frame.store(0, Ordering::Release);
+            chunk.valid_frame_count.store(0, Ordering::Release);
+            chunk
+                .state
+                .store(ChunkState::Writable as u8, Ordering::Release);
+        }
+        *write_chunk = 0;
+        self.global_write_frame.store(0, Ordering::Release);
+        self.clear_after_frame.store(0, Ordering::Release);
+        self.next_sequence.store(1, Ordering::Release);
+        self.dropped_frames.store(0, Ordering::Release);
+        *last_overrun = None;
+        Ok(())
+    }
+
+    pub fn copy_interleaved_range_into(
+        &self,
+        range: Range<u64>,
+        destination: &mut [f32],
+    ) -> Result<u64> {
+        if range.start > range.end {
+            return Err(LambError::ExportInvariant("copy range start exceeds end"));
+        }
+        let channels = self.cfg.channels as usize;
+        if !destination.len().is_multiple_of(channels) {
+            return Err(LambError::ExportInvariant(
+                "destination sample length is not whole frames",
+            ));
+        }
+
+        let _writer = self
+            .write_chunk
+            .lock()
+            .map_err(|_| LambError::ExportInvariant("write chunk lock poisoned"))?;
+        let head = self.write_head_frame();
+        let oldest = self.oldest_frame_at(head);
+        if range.start < oldest || range.end > head {
+            return Err(LambError::ExportInvariant(
+                "copy range is outside retained range",
+            ));
+        }
+
+        let destination_frames = destination.len() / channels;
+        let destination_frames = u64::try_from(destination_frames)
+            .map_err(|_| LambError::ExportInvariant("destination frame count overflow"))?;
+        let capacity_end = range
+            .start
+            .checked_add(destination_frames)
+            .ok_or(LambError::ExportInvariant("copy frame range overflow"))?;
+        let copy_end = range.end.min(capacity_end);
+        let mut cursor = range.start;
+        let mut destination_frame = 0_usize;
+        while cursor < copy_end {
+            let chunk_index =
+                ((cursor / u64::from(self.cfg.chunk_frames)) % self.chunks.len() as u64) as usize;
+            let chunk = &self.chunks[chunk_index];
+            if ChunkState::from_u8(chunk.state.load(Ordering::Acquire)) != ChunkState::Published {
+                return Err(LambError::ExportInvariant(
+                    "copy range has incomplete coverage",
+                ));
+            }
+            let valid_start = chunk.valid_start_frame.load(Ordering::Acquire);
+            let valid_end = valid_start
+                .checked_add(u64::from(chunk.valid_frame_count.load(Ordering::Acquire)))
+                .ok_or(LambError::ExportInvariant("chunk frame range overflow"))?;
+            if cursor < valid_start || cursor >= valid_end {
+                return Err(LambError::ExportInvariant(
+                    "copy range has incomplete coverage",
+                ));
+            }
+            let segment_end = copy_end.min(valid_end);
+            let segment_frames = usize::try_from(segment_end - cursor)
+                .map_err(|_| LambError::ExportInvariant("copy frame count overflow"))?;
+            let source_frame = usize::try_from(cursor - valid_start)
+                .map_err(|_| LambError::ExportInvariant("copy frame offset overflow"))?;
+            let source_start = source_frame
+                .checked_mul(channels)
+                .ok_or(LambError::ExportInvariant("copy sample offset overflow"))?;
+            let sample_count = segment_frames
+                .checked_mul(channels)
+                .ok_or(LambError::ExportInvariant("copy sample count overflow"))?;
+            let destination_start =
+                destination_frame
+                    .checked_mul(channels)
+                    .ok_or(LambError::ExportInvariant(
+                        "destination sample offset overflow",
+                    ))?;
+            let data = chunk
+                .data
+                .lock()
+                .map_err(|_| LambError::ExportInvariant("chunk data lock poisoned"))?;
+            destination[destination_start..destination_start + sample_count]
+                .copy_from_slice(&data[source_start..source_start + sample_count]);
+            cursor = segment_end;
+            destination_frame += segment_frames;
+        }
+        u64::try_from(destination_frame)
+            .map_err(|_| LambError::ExportInvariant("copied frame count overflow"))
     }
 
     pub fn write_interleaved(&self, samples: &[f32], channels: u32) -> Result<()> {
         if channels != self.cfg.channels {
-            return Err(LambError::Capture(format!(
-                "incoming channels {channels} do not match ring channels {}",
-                self.cfg.channels
-            )));
+            return Err(LambError::CaptureInvariant(
+                "incoming channels do not match ring channels",
+            ));
         }
         if channels == 0 || !samples.len().is_multiple_of(channels as usize) {
-            return Err(LambError::Capture(
-                "input sample length is not whole frames".to_string(),
+            return Err(LambError::CaptureInvariant(
+                "input sample length is not whole frames",
             ));
         }
 
         let total_frames = samples.len() / channels as usize;
         let mut frame_index = 0usize;
         while frame_index < total_frames {
-            let global_frame = self.global_write_frame.load(Ordering::Acquire);
-            let offset = (global_frame % u64::from(self.cfg.chunk_frames)) as u32;
             let mut write_chunk = self
                 .write_chunk
                 .lock()
-                .map_err(|_| LambError::Capture("write chunk lock poisoned".to_string()))?;
+                .map_err(|_| LambError::CaptureInvariant("write chunk lock poisoned"))?;
+            let global_frame = self.global_write_frame.load(Ordering::Acquire);
+            let offset = (global_frame % u64::from(self.cfg.chunk_frames)) as u32;
             let chunk = Arc::clone(&self.chunks[*write_chunk]);
+
+            let frames_available = (self.cfg.chunk_frames - offset) as usize;
+            let frames_to_copy = frames_available.min(total_frames - frame_index);
+            let frames_to_copy_u64 = u64::try_from(frames_to_copy)
+                .map_err(|_| LambError::CaptureInvariant("local frame count overflow"))?;
+            let new_global = global_frame
+                .checked_add(frames_to_copy_u64)
+                .ok_or(LambError::CaptureInvariant("local frame counter exhausted"))?;
+            let next_sequence = if offset == 0 {
+                Some(
+                    self.next_sequence
+                        .load(Ordering::Acquire)
+                        .checked_add(1)
+                        .ok_or(LambError::CaptureInvariant("ring sequence exhausted"))?,
+                )
+            } else {
+                None
+            };
 
             if offset == 0 {
                 if chunk.pin_count.load(Ordering::Acquire) > 0 {
-                    let remaining = (total_frames - frame_index) as u64;
-                    self.record_overrun(remaining);
+                    let remaining = u64::try_from(total_frames - frame_index)
+                        .map_err(|_| LambError::CaptureInvariant("dropped frame count overflow"))?;
+                    self.record_overrun(remaining)?;
                     break;
                 }
                 chunk
@@ -268,11 +471,16 @@ impl SampleRing {
                     .valid_start_frame
                     .store(global_frame, Ordering::Release);
                 chunk.valid_frame_count.store(0, Ordering::Release);
-                let sequence = self.next_sequence.fetch_add(1, Ordering::AcqRel);
+                let sequence = self.next_sequence.load(Ordering::Acquire);
+                let next_sequence = next_sequence.ok_or(LambError::CaptureInvariant(
+                    "ring sequence state is inconsistent",
+                ))?;
+                self.next_sequence.store(next_sequence, Ordering::Release);
                 chunk.sequence.store(sequence, Ordering::Release);
             } else if chunk.pin_count.load(Ordering::Acquire) > 0 {
-                let remaining = (total_frames - frame_index) as u64;
-                self.record_overrun(remaining);
+                let remaining = u64::try_from(total_frames - frame_index)
+                    .map_err(|_| LambError::CaptureInvariant("dropped frame count overflow"))?;
+                self.record_overrun(remaining)?;
                 break;
             } else {
                 chunk
@@ -280,13 +488,11 @@ impl SampleRing {
                     .store(ChunkState::Writing as u8, Ordering::Release);
             }
 
-            let frames_available = (self.cfg.chunk_frames - offset) as usize;
-            let frames_to_copy = frames_available.min(total_frames - frame_index);
             {
                 let mut data = chunk
                     .data
                     .lock()
-                    .map_err(|_| LambError::Capture("chunk data lock poisoned".to_string()))?;
+                    .map_err(|_| LambError::CaptureInvariant("chunk data lock poisoned"))?;
                 let dst_start = offset as usize * channels as usize;
                 let src_start = frame_index * channels as usize;
                 let sample_count = frames_to_copy * channels as usize;
@@ -298,8 +504,7 @@ impl SampleRing {
             chunk
                 .state
                 .store(ChunkState::Published as u8, Ordering::Release);
-            self.global_write_frame
-                .fetch_add(frames_to_copy as u64, Ordering::AcqRel);
+            self.global_write_frame.store(new_global, Ordering::Release);
             frame_index += frames_to_copy;
 
             if new_valid >= self.cfg.chunk_frames {
@@ -512,18 +717,28 @@ impl SampleRing {
         }
     }
 
-    fn record_overrun(&self, frames: u64) {
-        self.dropped_frames.fetch_add(frames, Ordering::AcqRel);
+    fn record_overrun(&self, frames: u64) -> Result<()> {
+        self.add_dropped_frames(frames)?;
         if let Ok(mut last) = self.last_overrun.lock() {
             *last = Some(SystemTime::now());
         }
+        Ok(())
     }
 
     /// Record frames dropped outside the normal write path (e.g. PipeWire
     /// buffer underrun, empty dequeues, format mismatches).  Does NOT
     /// update `last_overrun` because these are not chunk-pin backpressure.
-    pub fn record_dropped_frames(&self, frames: u64) {
-        self.dropped_frames.fetch_add(frames, Ordering::AcqRel);
+    pub fn record_dropped_frames(&self, frames: u64) -> Result<()> {
+        self.add_dropped_frames(frames)
+    }
+
+    fn add_dropped_frames(&self, frames: u64) -> Result<()> {
+        self.dropped_frames
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(frames)
+            })
+            .map(|_| ())
+            .map_err(|_| LambError::CaptureInvariant("dropped frame counter exhausted"))
     }
 }
 
@@ -613,5 +828,216 @@ impl Drop for Snapshot {
         if let Some(counter) = &self.active_counter {
             counter.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod materialization_tests {
+    use super::{ChunkState, RingConfig, SampleFormat, SampleRing};
+    use crate::error::LambError;
+    use std::mem::size_of;
+
+    #[test]
+    fn ring_chunk_index_has_exact_stable_storage() {
+        let ring = SampleRing::new(RingConfig {
+            channels: 2,
+            sample_rate: 48_000,
+            format: SampleFormat::F32Le,
+            chunk_frames: 4,
+            chunk_count: 3,
+            max_active_snapshots: 1,
+        })
+        .unwrap();
+        let address = ring.chunks.as_slice().as_ptr();
+
+        assert_eq!(ring.chunks.len(), 3);
+        assert_eq!(
+            ring.chunks.allocated_bytes(),
+            3 * size_of::<std::sync::Arc<super::Chunk>>()
+        );
+        ring.write_interleaved(&[1.0, 2.0, 3.0, 4.0], 2).unwrap();
+        assert_eq!(ring.chunks.as_slice().as_ptr(), address);
+    }
+
+    #[test]
+    fn ring_sample_arenas_have_exact_resident_f32_layouts() {
+        let ring = SampleRing::new(RingConfig {
+            channels: 2,
+            sample_rate: 48_000,
+            format: SampleFormat::F32Le,
+            chunk_frames: 1_025,
+            chunk_count: 2,
+            max_active_snapshots: 1,
+        })
+        .unwrap();
+        let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+
+        for chunk in ring.chunks.iter() {
+            let data = chunk.data.lock().unwrap();
+            assert_eq!(data.allocated_bytes(), 1_025 * 2 * size_of::<f32>());
+            assert!(data.as_slice().iter().all(|sample| *sample == 0.0));
+
+            let start = data.as_slice().as_ptr() as usize;
+            let end = start.checked_add(data.allocated_bytes()).unwrap();
+            let page_start = start / page_size * page_size;
+            let page_end = end.div_ceil(page_size) * page_size;
+            let mut residency = vec![0_u8; (page_end - page_start) / page_size];
+            let result = unsafe {
+                libc::mincore(
+                    page_start as *mut libc::c_void,
+                    page_end - page_start,
+                    residency.as_mut_ptr(),
+                )
+            };
+            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+            assert!(residency.iter().all(|entry| entry & 1 == 1));
+        }
+    }
+
+    #[test]
+    fn reset_reuses_exact_chunk_index_and_sample_allocations() {
+        let ring = SampleRing::new(RingConfig {
+            channels: 2,
+            sample_rate: 48_000,
+            format: SampleFormat::F32Le,
+            chunk_frames: 4,
+            chunk_count: 3,
+            max_active_snapshots: 1,
+        })
+        .unwrap();
+        let index_address = ring.chunks.as_slice().as_ptr();
+        let sample_addresses = ring
+            .chunks
+            .iter()
+            .map(|chunk| chunk.data.lock().unwrap().as_slice().as_ptr())
+            .collect::<Vec<_>>();
+
+        ring.write_interleaved(&[1.0; 16], 2).unwrap();
+        ring.reset().unwrap();
+
+        assert_eq!(ring.chunks.as_slice().as_ptr(), index_address);
+        for (chunk, expected) in ring.chunks.iter().zip(sample_addresses) {
+            assert_eq!(chunk.data.lock().unwrap().as_slice().as_ptr(), expected);
+            assert_eq!(chunk.sequence.load(std::sync::atomic::Ordering::Acquire), 0);
+            assert_eq!(
+                chunk
+                    .valid_start_frame
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            assert_eq!(
+                chunk
+                    .valid_frame_count
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            assert_eq!(
+                chunk.pin_count.load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            assert_eq!(
+                super::ChunkState::from_u8(chunk.state.load(std::sync::atomic::Ordering::Acquire)),
+                super::ChunkState::Writable
+            );
+        }
+    }
+
+    #[test]
+    fn reset_failure_does_not_partially_clear_ring_metadata() {
+        let ring = SampleRing::new(RingConfig {
+            channels: 1,
+            sample_rate: 48_000,
+            format: SampleFormat::F32Le,
+            chunk_frames: 4,
+            chunk_count: 2,
+            max_active_snapshots: 1,
+        })
+        .unwrap();
+        ring.write_interleaved(&[1.0, 2.0], 1).unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _last_overrun = ring.last_overrun.lock().unwrap();
+            panic!("poison last-overrun metadata");
+        }));
+
+        assert!(ring.reset().is_err());
+        assert_eq!(ring.write_head_frame(), 2);
+        assert_eq!(ring.oldest_frame(), 0);
+    }
+
+    #[test]
+    fn local_frame_overflow_returns_static_error_before_mutation() {
+        let ring = SampleRing::new(RingConfig {
+            channels: 1,
+            sample_rate: 48_000,
+            format: SampleFormat::F32Le,
+            chunk_frames: 4,
+            chunk_count: 2,
+            max_active_snapshots: 1,
+        })
+        .unwrap();
+        ring.global_write_frame
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+
+        assert!(matches!(
+            ring.write_interleaved(&[1.0], 1),
+            Err(LambError::CaptureInvariant("local frame counter exhausted"))
+        ));
+        assert_eq!(ring.write_head_frame(), u64::MAX);
+    }
+
+    #[test]
+    fn sequence_overflow_returns_static_error_before_chunk_mutation() {
+        let ring = SampleRing::new(RingConfig {
+            channels: 1,
+            sample_rate: 48_000,
+            format: SampleFormat::F32Le,
+            chunk_frames: 4,
+            chunk_count: 2,
+            max_active_snapshots: 1,
+        })
+        .unwrap();
+        ring.next_sequence
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+
+        assert!(matches!(
+            ring.write_interleaved(&[1.0], 1),
+            Err(LambError::CaptureInvariant("ring sequence exhausted"))
+        ));
+        assert_eq!(ring.write_head_frame(), 0);
+        assert_eq!(
+            ChunkState::from_u8(
+                ring.chunks[0]
+                    .state
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+            ChunkState::Writable
+        );
+    }
+
+    #[test]
+    fn dropped_counter_overflow_returns_static_error_without_wrap() {
+        let ring = SampleRing::new(RingConfig {
+            channels: 1,
+            sample_rate: 48_000,
+            format: SampleFormat::F32Le,
+            chunk_frames: 4,
+            chunk_count: 2,
+            max_active_snapshots: 1,
+        })
+        .unwrap();
+        ring.dropped_frames
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+
+        assert!(matches!(
+            ring.record_dropped_frames(1),
+            Err(LambError::CaptureInvariant(
+                "dropped frame counter exhausted"
+            ))
+        ));
+        assert_eq!(
+            ring.dropped_frames
+                .load(std::sync::atomic::Ordering::Acquire),
+            u64::MAX
+        );
     }
 }

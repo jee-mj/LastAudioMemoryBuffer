@@ -66,6 +66,31 @@ pub fn wav_parts_for_channel(
     bytes_per_frame: u32,
     split_when_over_bytes: u64,
 ) -> Result<Vec<WavPart>> {
+    let frames_per_part = wav_frames_per_part(bytes_per_frame, split_when_over_bytes)?;
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < total_frames {
+        let remaining = total_frames - start;
+        let count = remaining.min(frames_per_part);
+        parts.push(WavPart {
+            start_frame: start,
+            frame_count: count,
+        });
+        start += count;
+    }
+    Ok(parts)
+}
+
+pub fn wav_part_count(
+    total_frames: u64,
+    bytes_per_frame: u32,
+    split_when_over_bytes: u64,
+) -> Result<u64> {
+    let frames_per_part = wav_frames_per_part(bytes_per_frame, split_when_over_bytes)?;
+    Ok(total_frames.div_ceil(frames_per_part))
+}
+
+fn wav_frames_per_part(bytes_per_frame: u32, split_when_over_bytes: u64) -> Result<u64> {
     if bytes_per_frame == 0 {
         return Err(LambError::Validation(
             "bytes_per_frame must be > 0".to_string(),
@@ -83,16 +108,5 @@ pub fn wav_parts_for_channel(
             "splitWhenOverBytes is too small for one frame".to_string(),
         ));
     }
-    let mut parts = Vec::new();
-    let mut start = 0;
-    while start < total_frames {
-        let remaining = total_frames - start;
-        let count = remaining.min(frames_per_part);
-        parts.push(WavPart {
-            start_frame: start,
-            frame_count: count,
-        });
-        start += count;
-    }
-    Ok(parts)
+    Ok(frames_per_part)
 }
