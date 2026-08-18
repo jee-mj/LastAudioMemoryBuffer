@@ -27,6 +27,21 @@ lamb stop-capture --socket "$XDG_RUNTIME_DIR/lamb/control.sock"
 lamb reload --socket "$XDG_RUNTIME_DIR/lamb/control.sock"
 ```
 
+## Incremental Recall and Dump
+
+Within a capture session, `recall` and `dump` share one consumption cursor. Each
+command saves only the new source frames since either command last handled
+audio. A truly empty interval succeeds without creating files. An interval in
+which every source sample on every channel is exactly zero is likewise consumed
+successfully without creating files.
+
+`recall` prepares its publication through `/tmp/LAMB/staging`, then retains the
+flat, detailed files in the configured output directory. `dump` instead
+publishes a timestamp directory containing simple per-channel files. If
+publication fails, the source range remains retryable and is not consumed. Ring
+buffer retention can overwrite unhandled old frames; when this wrap loses old
+frames, the command reports the loss.
+
 ## Configuration
 
 ### Legacy mode (`configVersion = 1`)

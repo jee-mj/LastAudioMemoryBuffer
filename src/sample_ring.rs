@@ -1,4 +1,5 @@
 use crate::error::{LambError, Result};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -67,11 +68,20 @@ pub struct SnapshotSegment {
 #[derive(Debug)]
 pub struct Snapshot {
     segments: Vec<SnapshotSegment>,
+    start_frame: u64,
+    end_frame: u64,
     channels: u32,
     sample_rate: u32,
     format: SampleFormat,
     total_frames: u64,
     active_counter: Option<Arc<AtomicU32>>,
+}
+
+#[derive(Debug)]
+pub struct SnapshotSelection {
+    requested_start: u64,
+    oldest_frame: u64,
+    snapshot: Snapshot,
 }
 
 /// Guard that holds the active-snapshot slot during snapshot construction.
@@ -121,11 +131,13 @@ impl Drop for ActiveSnapshotGuard {
 /// pinned before a [`SnapshotSegment`] is appended.
 fn collect_segments(
     chunks: &[Arc<Chunk>],
+    first_chunk: usize,
     range_start: u64,
     range_end: u64,
     segments: &mut Vec<SnapshotSegment>,
 ) {
-    for chunk in chunks {
+    for offset in 0..chunks.len() {
+        let chunk = &chunks[(first_chunk + offset) % chunks.len()];
         let state = ChunkState::from_u8(chunk.state.load(Ordering::Acquire));
         if state != ChunkState::Published {
             continue;
@@ -298,46 +310,140 @@ impl SampleRing {
     }
 
     pub fn snapshot_last_frames(&self, requested_frames: u64) -> Result<Snapshot> {
-        let end_frame_before = self.global_write_frame.load(Ordering::Acquire);
-        let clear_after = self.clear_after_frame.load(Ordering::Acquire);
-        let start_frame = end_frame_before
-            .saturating_sub(requested_frames)
-            .max(clear_after);
-        if start_frame >= end_frame_before {
-            return Ok(Snapshot {
-                segments: Vec::new(),
-                channels: self.cfg.channels,
-                sample_rate: self.cfg.sample_rate,
-                format: self.cfg.format,
-                total_frames: 0,
-                active_counter: None,
-            });
+        let mut segments = Vec::with_capacity(self.chunks.len());
+        let (range, guard) = {
+            let _writer = self
+                .write_chunk
+                .lock()
+                .map_err(|_| LambError::Control("write chunk lock poisoned".to_string()))?;
+            let head = self.write_head_frame();
+            let oldest = self.oldest_frame_at(head);
+            let range = head.saturating_sub(requested_frames).max(oldest)..head;
+            let guard = self.pin_snapshot_range(&range, head, oldest, &mut segments)?;
+            (range, guard)
+        };
+        self.finish_snapshot(range, segments, guard)
+    }
+
+    pub fn write_head_frame(&self) -> u64 {
+        self.global_write_frame.load(Ordering::Acquire)
+    }
+
+    pub fn oldest_frame(&self) -> u64 {
+        let _writer = self
+            .write_chunk
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let head = self.write_head_frame();
+        self.oldest_frame_at(head)
+    }
+
+    fn oldest_frame_at(&self, head: u64) -> u64 {
+        let mut oldest = head;
+        for _ in 0..self.chunks.len() {
+            if oldest == 0 {
+                break;
+            }
+            let preceding_frame = oldest - 1;
+            let chunk_index = ((preceding_frame / u64::from(self.cfg.chunk_frames))
+                % self.chunks.len() as u64) as usize;
+            let chunk = &self.chunks[chunk_index];
+            if ChunkState::from_u8(chunk.state.load(Ordering::Acquire)) != ChunkState::Published {
+                break;
+            }
+            let start = chunk.valid_start_frame.load(Ordering::Acquire);
+            let end = start + u64::from(chunk.valid_frame_count.load(Ordering::Acquire));
+            if start >= oldest || end < oldest {
+                break;
+            }
+            oldest = start;
+        }
+        oldest.max(self.clear_after_frame.load(Ordering::Acquire))
+    }
+
+    pub fn snapshot_range(&self, range: Range<u64>) -> Result<Snapshot> {
+        let mut segments = Vec::with_capacity(self.chunks.len());
+        let guard = {
+            let _writer = self
+                .write_chunk
+                .lock()
+                .map_err(|_| LambError::Control("write chunk lock poisoned".to_string()))?;
+            let head = self.write_head_frame();
+            let oldest = self.oldest_frame_at(head);
+            self.pin_snapshot_range(&range, head, oldest, &mut segments)?
+        };
+        self.finish_snapshot(range, segments, guard)
+    }
+
+    pub fn select_snapshot(&self, committed_start: Option<u64>) -> Result<SnapshotSelection> {
+        let mut segments = Vec::with_capacity(self.chunks.len());
+        let (requested_start, oldest_frame, range, guard) = {
+            let _writer = self
+                .write_chunk
+                .lock()
+                .map_err(|_| LambError::Control("write chunk lock poisoned".to_string()))?;
+            let head = self.write_head_frame();
+            let oldest_frame = self.oldest_frame_at(head);
+            let requested_start = committed_start.unwrap_or(oldest_frame);
+            let range = requested_start.max(oldest_frame)..head;
+            let guard = self.pin_snapshot_range(&range, head, oldest_frame, &mut segments)?;
+            (requested_start, oldest_frame, range, guard)
+        };
+        let snapshot = self.finish_snapshot(range, segments, guard)?;
+        Ok(SnapshotSelection {
+            requested_start,
+            oldest_frame,
+            snapshot,
+        })
+    }
+
+    /// Validate the captured bounds and pin overlaps while `write_chunk` is held.
+    fn pin_snapshot_range(
+        &self,
+        range: &Range<u64>,
+        head: u64,
+        oldest: u64,
+        segments: &mut Vec<SnapshotSegment>,
+    ) -> Result<Option<ActiveSnapshotGuard>> {
+        if range.start > range.end {
+            return Err(LambError::Control(format!(
+                "snapshot range start {} exceeds end {}",
+                range.start, range.end
+            )));
+        }
+        if range.start < oldest {
+            return Err(LambError::Control(format!(
+                "snapshot range starts at {}, before oldest retained frame {oldest}",
+                range.start
+            )));
+        }
+        if range.end > head {
+            return Err(LambError::Control(format!(
+                "snapshot range ends at {}, after write head {head}",
+                range.end
+            )));
+        }
+        if range.start == range.end {
+            return Ok(None);
         }
 
         let guard = ActiveSnapshotGuard::acquire(
             Arc::clone(&self.active_snapshots),
             self.cfg.max_active_snapshots,
         )?;
+        let first_chunk =
+            ((range.start / u64::from(self.cfg.chunk_frames)) % self.chunks.len() as u64) as usize;
+        collect_segments(&self.chunks, first_chunk, range.start, range.end, segments);
+        Ok(Some(guard))
+    }
 
-        let mut segments = Vec::new();
-
-        // First pass: capture chunks overlapping [start_frame, end_frame_before)
-        collect_segments(&self.chunks, start_frame, end_frame_before, &mut segments);
-
-        // Second pass: catch chunks published during first pass iteration.
-        // The writer may have advanced global_write_frame and published new
-        // chunks while we were iterating.  We scan the delta range so those
-        // chunks are not silently lost (TOCTOU fix).
-        let end_frame_after = self.global_write_frame.load(Ordering::Acquire);
-        if end_frame_after > end_frame_before {
-            collect_segments(
-                &self.chunks,
-                end_frame_before,
-                end_frame_after,
-                &mut segments,
-            );
-        }
-
+    /// Sort and prove exact coverage after the writer lock has been released.
+    fn finish_snapshot(
+        &self,
+        range: Range<u64>,
+        mut segments: Vec<SnapshotSegment>,
+        guard: Option<ActiveSnapshotGuard>,
+    ) -> Result<Snapshot> {
         segments.sort_by_key(|segment| {
             segment.chunk.valid_start_frame.load(Ordering::Acquire)
                 + u64::from(segment.start_frame_in_chunk)
@@ -346,24 +452,36 @@ impl SampleRing {
             .iter()
             .map(|segment| u64::from(segment.frame_count))
             .sum();
-        if total_frames == 0 {
-            return Ok(Snapshot {
-                segments,
-                channels: self.cfg.channels,
-                sample_rate: self.cfg.sample_rate,
-                format: self.cfg.format,
-                total_frames,
-                active_counter: None,
-            });
-        }
-        Ok(Snapshot {
+        let mut snapshot = Snapshot {
             segments,
+            start_frame: range.start,
+            end_frame: range.end,
             channels: self.cfg.channels,
             sample_rate: self.cfg.sample_rate,
             format: self.cfg.format,
             total_frames,
-            active_counter: Some(guard.consume()),
-        })
+            active_counter: None,
+        };
+
+        let mut expected_start = range.start;
+        for segment in &snapshot.segments {
+            let segment_start = segment.chunk.valid_start_frame.load(Ordering::Acquire)
+                + u64::from(segment.start_frame_in_chunk);
+            if segment_start != expected_start {
+                return Err(LambError::Control(format!(
+                    "snapshot range has incomplete coverage at frame {expected_start}"
+                )));
+            }
+            expected_start = segment_start + u64::from(segment.frame_count);
+        }
+        if expected_start != range.end {
+            return Err(LambError::Control(format!(
+                "snapshot range has incomplete coverage at frame {expected_start}"
+            )));
+        }
+
+        snapshot.active_counter = guard.map(ActiveSnapshotGuard::consume);
+        Ok(snapshot)
     }
 
     pub fn clear(&self) -> Result<()> {
@@ -373,12 +491,18 @@ impl SampleRing {
     }
 
     pub fn status(&self) -> RingStatus {
-        let global = self.global_write_frame.load(Ordering::Acquire);
-        let clear_after = self.clear_after_frame.load(Ordering::Acquire);
+        let (global, oldest) = {
+            let _writer = self
+                .write_chunk
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let global = self.global_write_frame.load(Ordering::Acquire);
+            (global, self.oldest_frame_at(global))
+        };
         let capacity = u64::from(self.cfg.chunk_frames) * u64::from(self.cfg.chunk_count);
         RingStatus {
             dropped_frames: self.dropped_frames.load(Ordering::Acquire),
-            retained_frames: global.saturating_sub(clear_after).min(capacity),
+            retained_frames: global.saturating_sub(oldest),
             capacity_frames: capacity,
             active_snapshots: self.active_snapshots.load(Ordering::Acquire),
             last_overrun: *self
@@ -404,6 +528,14 @@ impl SampleRing {
 }
 
 impl Snapshot {
+    pub fn start_frame(&self) -> u64 {
+        self.start_frame
+    }
+
+    pub fn end_frame(&self) -> u64 {
+        self.end_frame
+    }
+
     pub fn total_frames(&self) -> u64 {
         self.total_frames
     }
@@ -452,6 +584,24 @@ impl Snapshot {
             }
         }
         Ok(out)
+    }
+}
+
+impl SnapshotSelection {
+    pub fn requested_start(&self) -> u64 {
+        self.requested_start
+    }
+
+    pub fn oldest_frame(&self) -> u64 {
+        self.oldest_frame
+    }
+
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    pub fn into_snapshot(self) -> Snapshot {
+        self.snapshot
     }
 }
 

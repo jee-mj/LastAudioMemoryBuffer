@@ -2,7 +2,7 @@ use crate::error::{io_error, LambError, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -27,6 +27,30 @@ pub struct ControlResponse {
     pub ok: bool,
     pub message: String,
     pub status: Option<DaemonStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence_outcome: Option<PersistenceOutcomeResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistenceOutcomeResponse {
+    Written {
+        start_frame: u64,
+        end_frame: u64,
+        frames: u64,
+        duration_seconds: f64,
+        lost_frames: u64,
+        output_directory: PathBuf,
+        files: Vec<PathBuf>,
+    },
+    SkippedSilent {
+        start_frame: u64,
+        end_frame: u64,
+        frames: u64,
+        duration_seconds: f64,
+        lost_frames: u64,
+    },
+    NoNewAudio,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -98,12 +122,67 @@ pub fn send_request(socket: &Path, request: &ControlRequest) -> Result<ControlRe
 }
 
 pub fn client_dump(socket: &Path) -> Result<()> {
-    let response = send_request(socket, &ControlRequest::Dump)?;
-    if response.ok {
-        println!("{}", response.message);
-        Ok(())
-    } else {
-        Err(LambError::Control(response.message))
+    client_persistence(socket, ControlRequest::Dump)
+}
+
+pub fn client_recall(socket: &Path) -> Result<()> {
+    client_persistence(socket, ControlRequest::Recall)
+}
+
+fn client_persistence(socket: &Path, request: ControlRequest) -> Result<()> {
+    let response = send_request(socket, &request)?;
+    if !response.ok {
+        return Err(LambError::Control(response.message));
+    }
+
+    match response.persistence_outcome {
+        Some(outcome) => println!("{}", format_persistence_outcome(&outcome)),
+        None => println!("{}", response.message),
+    }
+    Ok(())
+}
+
+fn format_persistence_outcome(outcome: &PersistenceOutcomeResponse) -> String {
+    match outcome {
+        PersistenceOutcomeResponse::Written {
+            start_frame,
+            end_frame,
+            frames,
+            duration_seconds,
+            lost_frames,
+            output_directory,
+            files,
+        } => {
+            let mut lines = vec![format!(
+                "written {frames} frames ({duration_seconds:.3} seconds), source frames {start_frame}..{end_frame}"
+            )];
+            if *lost_frames > 0 {
+                lines.push(format!(
+                    "warning: {lost_frames} frames were lost before persistence"
+                ));
+            }
+            lines.push(format!("output directory: {}", output_directory.display()));
+            lines.extend(files.iter().map(|file| file.display().to_string()));
+            lines.join("\n")
+        }
+        PersistenceOutcomeResponse::SkippedSilent {
+            start_frame,
+            end_frame,
+            frames,
+            duration_seconds,
+            lost_frames,
+        } => {
+            let mut lines = vec![format!(
+                "skipped exact-zero audio: {frames} frames ({duration_seconds:.3} seconds), source frames {start_frame}..{end_frame}"
+            )];
+            if *lost_frames > 0 {
+                lines.push(format!(
+                    "warning: {lost_frames} frames were lost before persistence"
+                ));
+            }
+            lines.join("\n")
+        }
+        PersistenceOutcomeResponse::NoNewAudio => "no new audio".to_string(),
     }
 }
 
@@ -132,5 +211,61 @@ pub fn client_reload(socket: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(LambError::Control(response.message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_written_persistence_outcome_with_paths_and_loss_warning() {
+        let outcome = PersistenceOutcomeResponse::Written {
+            start_frame: 100,
+            end_frame: 350,
+            frames: 250,
+            duration_seconds: 2.5,
+            lost_frames: 25,
+            output_directory: PathBuf::from("/tmp/out/20260818120000"),
+            files: vec![
+                PathBuf::from("/tmp/out/20260818120000/mic.wav"),
+                PathBuf::from("/tmp/out/20260818120000/gtr.wav"),
+            ],
+        };
+
+        assert_eq!(
+            format_persistence_outcome(&outcome),
+            concat!(
+                "written 250 frames (2.500 seconds), source frames 100..350\n",
+                "warning: 25 frames were lost before persistence\n",
+                "output directory: /tmp/out/20260818120000\n",
+                "/tmp/out/20260818120000/mic.wav\n",
+                "/tmp/out/20260818120000/gtr.wav"
+            )
+        );
+    }
+
+    #[test]
+    fn formats_skipped_silent_persistence_outcome() {
+        let outcome = PersistenceOutcomeResponse::SkippedSilent {
+            start_frame: 350,
+            end_frame: 450,
+            frames: 100,
+            duration_seconds: 1.0,
+            lost_frames: 0,
+        };
+
+        assert_eq!(
+            format_persistence_outcome(&outcome),
+            "skipped exact-zero audio: 100 frames (1.000 seconds), source frames 350..450"
+        );
+    }
+
+    #[test]
+    fn formats_no_new_audio_persistence_outcome() {
+        assert_eq!(
+            format_persistence_outcome(&PersistenceOutcomeResponse::NoNewAudio),
+            "no new audio"
+        );
     }
 }

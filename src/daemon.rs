@@ -3,9 +3,10 @@ use crate::capture_fake::FakeCapture;
 use crate::capture_jack::{JackCapture, JackCaptureConfig};
 use crate::capture_pipewire::{PipeWireCapture, PipeWireCaptureConfig, ResolvedTarget};
 use crate::config::{self, LambConfig};
-use crate::control::{ControlRequest, ControlResponse, DaemonStatus};
+use crate::control::{ControlRequest, ControlResponse, DaemonStatus, PersistenceOutcomeResponse};
+use crate::dump::{DumpCoordinator, DumpOutcome};
 use crate::error::{io_error, LambError, Result};
-use crate::export_wav::{export_snapshot_wav, ExportRequest};
+use crate::export_wav::{publish_dump, publish_recall, DumpPublishRequest, RecallPublishRequest};
 use crate::math::{derive_chunk_frames, estimate_ring_bytes};
 use crate::profile;
 use crate::sample_ring::{RingConfig, SampleFormat, SampleRing};
@@ -61,6 +62,7 @@ fn run_idle_fallback(path: &Path, socket_template: String, reason: String) -> Re
             last_error: Some(reason),
             active_profile: None,
             capture: None,
+            dump_coordinator: None,
         }),
         stop: AtomicBool::new(false),
     };
@@ -156,6 +158,7 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
     let ctx = DaemonContext {
         cfg,
         ring,
+        dump_coordinator: DumpCoordinator::new(),
         resolved_target,
         stop: AtomicBool::new(false),
         last_error: Mutex::new(None),
@@ -204,6 +207,7 @@ fn expand_runtime_paths(mut cfg: LambConfig) -> Result<LambConfig> {
 struct DaemonContext {
     cfg: LambConfig,
     ring: Arc<SampleRing>,
+    dump_coordinator: DumpCoordinator,
     resolved_target: Option<ResolvedTarget>,
     stop: AtomicBool,
     last_error: Mutex<Option<String>>,
@@ -222,6 +226,7 @@ struct AppRuntimeState {
     last_error: Option<String>,
     active_profile: Option<profile::ResolvedProfile>,
     capture: Option<CaptureBackend>,
+    dump_coordinator: Option<Arc<DumpCoordinator>>,
 }
 
 enum CaptureBackend {
@@ -269,6 +274,7 @@ fn run_app_config_daemon(path: &Path, config: app_config::AppConfig) -> Result<(
         last_error: None,
         active_profile: None,
         capture: None,
+        dump_coordinator: None,
     };
 
     match reload_app_config_inner(&mut state, path) {
@@ -364,6 +370,7 @@ fn handle_idle_request(ctx: &IdleDaemonContext, request: ControlRequest) -> Cont
             ok: true,
             message: "status".to_string(),
             status: Some(idle_status_response(ctx)),
+            persistence_outcome: None,
         },
         ControlRequest::Stop => {
             ctx.stop.store(true, Ordering::Release);
@@ -371,6 +378,7 @@ fn handle_idle_request(ctx: &IdleDaemonContext, request: ControlRequest) -> Cont
                 ok: true,
                 message: "stopping".to_string(),
                 status: Some(idle_status_response(ctx)),
+                persistence_outcome: None,
             }
         }
         ControlRequest::StartCapture { profile, activate } => {
@@ -379,6 +387,7 @@ fn handle_idle_request(ctx: &IdleDaemonContext, request: ControlRequest) -> Cont
                     ok: true,
                     message,
                     status: Some(idle_status_response(ctx)),
+                    persistence_outcome: None,
                 },
                 Err(err) => {
                     set_app_last_error(ctx, err.to_string());
@@ -386,6 +395,7 @@ fn handle_idle_request(ctx: &IdleDaemonContext, request: ControlRequest) -> Cont
                         ok: false,
                         message: err.to_string(),
                         status: Some(idle_status_response(ctx)),
+                        persistence_outcome: None,
                     }
                 }
             }
@@ -396,6 +406,7 @@ fn handle_idle_request(ctx: &IdleDaemonContext, request: ControlRequest) -> Cont
                 ok: true,
                 message: "capture stopped".to_string(),
                 status: Some(idle_status_response(ctx)),
+                persistence_outcome: None,
             }
         }
         ControlRequest::Recall => handle_app_recall(ctx),
@@ -406,6 +417,7 @@ fn handle_idle_request(ctx: &IdleDaemonContext, request: ControlRequest) -> Cont
                 ok: true,
                 message: "config reloaded".to_string(),
                 status: Some(idle_status_response(ctx)),
+                persistence_outcome: None,
             },
             Err(err) => {
                 set_app_last_error(ctx, err.to_string());
@@ -413,6 +425,7 @@ fn handle_idle_request(ctx: &IdleDaemonContext, request: ControlRequest) -> Cont
                     ok: false,
                     message: err.to_string(),
                     status: Some(idle_status_response(ctx)),
+                    persistence_outcome: None,
                 }
             }
         },
@@ -551,49 +564,13 @@ fn make_ring(cfg: &LambConfig, channels: u32) -> Result<Arc<SampleRing>> {
 
 fn handle_request(ctx: &DaemonContext, request: ControlRequest) -> ControlResponse {
     match request {
-        ControlRequest::Recall => match ctx
-            .ring
-            .snapshot_last_frames(u64::from(ctx.cfg.seconds) * u64::from(ctx.cfg.sample_rate))
-        {
-            Ok(snapshot) => {
-                let timestamp = iso8601_compact_label();
-                match export_snapshot_wav(ExportRequest {
-                    snapshot: &snapshot,
-                    output_dir: &ctx.cfg.output_dir,
-                    timestamp: &timestamp,
-                    split_when_over_bytes: ctx.cfg.export.split_when_over_bytes,
-                    channel_names: &ctx.cfg.channel_map,
-                    simple_names: false,
-                }) {
-                    Ok(result) => ControlResponse {
-                        ok: true,
-                        message: format!("exported {} files", result.files.len()),
-                        status: Some(status_response(ctx)),
-                    },
-                    Err(err) => {
-                        set_last_error(ctx, err.to_string());
-                        ControlResponse {
-                            ok: false,
-                            message: err.to_string(),
-                            status: Some(status_response(ctx)),
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                set_last_error(ctx, err.to_string());
-                ControlResponse {
-                    ok: false,
-                    message: err.to_string(),
-                    status: Some(status_response(ctx)),
-                }
-            }
-        },
+        ControlRequest::Recall => handle_recall(ctx),
         ControlRequest::Clear => match ctx.ring.clear() {
             Ok(()) => ControlResponse {
                 ok: true,
                 message: "cleared".to_string(),
                 status: Some(status_response(ctx)),
+                persistence_outcome: None,
             },
             Err(err) => {
                 set_last_error(ctx, err.to_string());
@@ -601,6 +578,7 @@ fn handle_request(ctx: &DaemonContext, request: ControlRequest) -> ControlRespon
                     ok: false,
                     message: err.to_string(),
                     status: Some(status_response(ctx)),
+                    persistence_outcome: None,
                 }
             }
         },
@@ -609,6 +587,7 @@ fn handle_request(ctx: &DaemonContext, request: ControlRequest) -> ControlRespon
             ok: true,
             message: "status".to_string(),
             status: Some(status_response(ctx)),
+            persistence_outcome: None,
         },
         ControlRequest::Stop => {
             ctx.stop.store(true, Ordering::Release);
@@ -616,6 +595,7 @@ fn handle_request(ctx: &DaemonContext, request: ControlRequest) -> ControlRespon
                 ok: true,
                 message: "stopping".to_string(),
                 status: Some(status_response(ctx)),
+                persistence_outcome: None,
             }
         }
         ControlRequest::StartCapture { .. }
@@ -624,6 +604,7 @@ fn handle_request(ctx: &DaemonContext, request: ControlRequest) -> ControlRespon
             ok: false,
             message: "command not available in legacy runtime config mode".to_string(),
             status: Some(status_response(ctx)),
+            persistence_outcome: None,
         },
     }
 }
@@ -673,41 +654,47 @@ fn set_last_error(ctx: &DaemonContext, message: String) {
 }
 
 fn handle_dump(ctx: &DaemonContext) -> ControlResponse {
-    match ctx
-        .ring
-        .snapshot_last_frames(u64::from(ctx.cfg.seconds) * u64::from(ctx.cfg.sample_rate))
-    {
-        Ok(snapshot) => {
-            let timestamp = iso8601_compact_label();
-            match export_snapshot_wav(ExportRequest {
-                snapshot: &snapshot,
-                output_dir: &ctx.cfg.output_dir,
-                timestamp: &timestamp,
-                split_when_over_bytes: ctx.cfg.export.split_when_over_bytes,
-                channel_names: &ctx.cfg.channel_map,
-                simple_names: false,
-            }) {
-                Ok(result) => ControlResponse {
-                    ok: true,
-                    message: format!("exported {} files", result.files.len()),
-                    status: Some(status_response(ctx)),
-                },
-                Err(err) => {
-                    set_last_error(ctx, err.to_string());
-                    ControlResponse {
-                        ok: false,
-                        message: err.to_string(),
-                        status: Some(status_response(ctx)),
-                    }
-                }
-            }
-        }
+    let timestamp = iso8601_compact_label();
+    let result = ctx.dump_coordinator.dump(&ctx.ring, |snapshot| {
+        publish_dump(DumpPublishRequest {
+            snapshot,
+            output_parent: &ctx.cfg.output_dir,
+            timestamp: &timestamp,
+            split_when_over_bytes: ctx.cfg.export.split_when_over_bytes,
+            channel_names: &ctx.cfg.channel_map,
+        })
+    });
+    legacy_persistence_response(ctx, result)
+}
+
+fn handle_recall(ctx: &DaemonContext) -> ControlResponse {
+    let timestamp = iso8601_compact_label();
+    let result = ctx.dump_coordinator.dump(&ctx.ring, |snapshot| {
+        publish_recall(RecallPublishRequest {
+            snapshot,
+            output_dir: &ctx.cfg.output_dir,
+            staging_root: Path::new("/tmp/LAMB/staging"),
+            timestamp: &timestamp,
+            split_when_over_bytes: ctx.cfg.export.split_when_over_bytes,
+            channel_names: &ctx.cfg.channel_map,
+        })
+    });
+    legacy_persistence_response(ctx, result)
+}
+
+fn legacy_persistence_response(
+    ctx: &DaemonContext,
+    result: Result<DumpOutcome>,
+) -> ControlResponse {
+    match result {
+        Ok(outcome) => persistence_response(outcome, ctx.cfg.sample_rate, status_response(ctx)),
         Err(err) => {
             set_last_error(ctx, err.to_string());
             ControlResponse {
                 ok: false,
                 message: err.to_string(),
                 status: Some(status_response(ctx)),
+                persistence_outcome: None,
             }
         }
     }
@@ -741,6 +728,7 @@ fn start_app_capture(
             .runtime
             .lock()
             .map_err(|_| LambError::Control("runtime state lock poisoned".to_string()))?;
+        runtime.dump_coordinator = None;
         runtime.capture.take()
     };
     drop(old_capture);
@@ -796,12 +784,14 @@ fn start_app_capture(
     runtime.last_error = None;
     runtime.active_profile = Some(resolved_for_runtime);
     runtime.capture = Some(backend);
+    runtime.dump_coordinator = Some(Arc::new(DumpCoordinator::new()));
     Ok(format!("capturing {profile_name}"))
 }
 
 fn stop_app_capture(ctx: &IdleDaemonContext) {
     if let Ok(mut runtime) = ctx.runtime.lock() {
         let capture = runtime.capture.take();
+        runtime.dump_coordinator = None;
         runtime.state = if runtime.active_profile.is_some() {
             "idle".to_string()
         } else {
@@ -813,54 +803,48 @@ fn stop_app_capture(ctx: &IdleDaemonContext) {
 }
 
 fn handle_app_recall(ctx: &IdleDaemonContext) -> ControlResponse {
-    let capture = ctx.runtime.lock().ok().and_then(|runtime| {
-        let backend = runtime.capture.as_ref()?;
-        let profile = runtime.active_profile.clone()?;
-        Some((
-            Arc::clone(backend.ring()),
-            backend.sample_rate(),
-            profile.buffer_seconds,
-            profile.export_output_dir,
-            backend.channel_names().to_vec(),
-        ))
-    });
-    let Some((ring, sample_rate, seconds, output_dir, channel_names)) = capture else {
+    let capture = {
+        let runtime = match ctx.runtime.lock() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                drop(error.into_inner());
+                return app_runtime_lock_error_response(ctx);
+            }
+        };
+        (|| {
+            let backend = runtime.capture.as_ref()?;
+            let profile = runtime.active_profile.clone()?;
+            let coordinator = Arc::clone(runtime.dump_coordinator.as_ref()?);
+            Some((
+                Arc::clone(backend.ring()),
+                coordinator,
+                backend.sample_rate(),
+                profile.export_output_dir,
+                backend.channel_names().to_vec(),
+            ))
+        })()
+    };
+    let Some((ring, coordinator, sample_rate, output_dir, channel_names)) = capture else {
         return ControlResponse {
             ok: false,
             message: "capture is not running".to_string(),
             status: Some(idle_status_response(ctx)),
+            persistence_outcome: None,
         };
     };
 
-    let result = ring
-        .snapshot_last_frames(u64::from(seconds) * u64::from(sample_rate))
-        .and_then(|snapshot| {
-            let timestamp = iso8601_compact_label();
-            export_snapshot_wav(ExportRequest {
-                snapshot: &snapshot,
-                output_dir: &output_dir,
-                timestamp: &timestamp,
-                split_when_over_bytes: crate::math::WAV_SPLIT_DEFAULT_BYTES,
-                channel_names: &channel_names,
-                simple_names: false,
-            })
-            .map(|result| format!("exported {} files", result.files.len()))
-        });
-    match result {
-        Ok(message) => ControlResponse {
-            ok: true,
-            message,
-            status: Some(idle_status_response(ctx)),
-        },
-        Err(err) => {
-            set_app_last_error(ctx, err.to_string());
-            ControlResponse {
-                ok: false,
-                message: err.to_string(),
-                status: Some(idle_status_response(ctx)),
-            }
-        }
-    }
+    let timestamp = iso8601_compact_label();
+    let result = coordinator.dump(&ring, |snapshot| {
+        publish_recall(RecallPublishRequest {
+            snapshot,
+            output_dir: &output_dir,
+            staging_root: Path::new("/tmp/LAMB/staging"),
+            timestamp: &timestamp,
+            split_when_over_bytes: crate::math::WAV_SPLIT_DEFAULT_BYTES,
+            channel_names: &channel_names,
+        })
+    });
+    app_persistence_response(ctx, result, sample_rate)
 }
 
 fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
@@ -875,6 +859,7 @@ fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
             ok: false,
             message: "capture is not running".to_string(),
             status: Some(idle_status_response(ctx)),
+            persistence_outcome: None,
         };
     };
     match ring.clear() {
@@ -882,6 +867,7 @@ fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
             ok: true,
             message: "cleared".to_string(),
             status: Some(idle_status_response(ctx)),
+            persistence_outcome: None,
         },
         Err(err) => {
             set_app_last_error(ctx, err.to_string());
@@ -889,27 +875,38 @@ fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
                 ok: false,
                 message: err.to_string(),
                 status: Some(idle_status_response(ctx)),
+                persistence_outcome: None,
             }
         }
     }
 }
 
 fn handle_app_dump(ctx: &IdleDaemonContext) -> ControlResponse {
-    let capture = ctx.runtime.lock().ok().and_then(|runtime| {
-        let backend = runtime.capture.as_ref()?;
-        let profile = runtime.active_profile.clone()?;
-        Some((
-            Arc::clone(backend.ring()),
-            backend.sample_rate(),
-            profile.buffer_seconds,
-            backend.channel_names().to_vec(),
-        ))
-    });
-    let Some((ring, sample_rate, seconds, channel_names)) = capture else {
+    let capture = {
+        let runtime = match ctx.runtime.lock() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                drop(error.into_inner());
+                return app_runtime_lock_error_response(ctx);
+            }
+        };
+        (|| {
+            let backend = runtime.capture.as_ref()?;
+            let coordinator = Arc::clone(runtime.dump_coordinator.as_ref()?);
+            Some((
+                Arc::clone(backend.ring()),
+                coordinator,
+                backend.sample_rate(),
+                backend.channel_names().to_vec(),
+            ))
+        })()
+    };
+    let Some((ring, coordinator, sample_rate, channel_names)) = capture else {
         return ControlResponse {
             ok: false,
             message: "capture is not running".to_string(),
             status: Some(idle_status_response(ctx)),
+            persistence_outcome: None,
         };
     };
 
@@ -920,47 +917,115 @@ fn handle_app_dump(ctx: &IdleDaemonContext) -> ControlResponse {
                 ok: false,
                 message: "HOME not set, cannot resolve dump output path".to_string(),
                 status: Some(idle_status_response(ctx)),
+                persistence_outcome: None,
             }
         }
     };
     let dump_dir = PathBuf::from(home).join(".cache/lamb/out");
 
-    let result = ring
-        .snapshot_last_frames(u64::from(seconds) * u64::from(sample_rate))
-        .and_then(|snapshot| {
-            let timestamp = iso8601_compact_label();
-            let ts_dir = dump_dir.join(&timestamp);
-            export_snapshot_wav(ExportRequest {
-                snapshot: &snapshot,
-                output_dir: &ts_dir,
-                timestamp: &timestamp,
-                split_when_over_bytes: crate::math::WAV_SPLIT_DEFAULT_BYTES,
-                channel_names: &channel_names,
-                simple_names: true,
-            })
-            .map(|result| {
-                let paths: Vec<String> = result
-                    .files
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect();
-                paths.join("\n")
-            })
-        });
+    let timestamp = iso8601_compact_label();
+    let result = coordinator.dump(&ring, |snapshot| {
+        publish_dump(DumpPublishRequest {
+            snapshot,
+            output_parent: &dump_dir,
+            timestamp: &timestamp,
+            split_when_over_bytes: crate::math::WAV_SPLIT_DEFAULT_BYTES,
+            channel_names: &channel_names,
+        })
+    });
+    app_persistence_response(ctx, result, sample_rate)
+}
+
+fn app_persistence_response(
+    ctx: &IdleDaemonContext,
+    result: Result<DumpOutcome>,
+    sample_rate: u32,
+) -> ControlResponse {
     match result {
-        Ok(message) => ControlResponse {
-            ok: true,
-            message,
-            status: Some(idle_status_response(ctx)),
-        },
+        Ok(outcome) => persistence_response(outcome, sample_rate, idle_status_response(ctx)),
         Err(err) => {
             set_app_last_error(ctx, err.to_string());
             ControlResponse {
                 ok: false,
                 message: err.to_string(),
                 status: Some(idle_status_response(ctx)),
+                persistence_outcome: None,
             }
         }
+    }
+}
+
+fn app_runtime_lock_error_response(ctx: &IdleDaemonContext) -> ControlResponse {
+    ControlResponse {
+        ok: false,
+        message: "runtime state lock poisoned".to_string(),
+        status: Some(idle_status_response(ctx)),
+        persistence_outcome: None,
+    }
+}
+
+fn persistence_response(
+    outcome: DumpOutcome,
+    sample_rate: u32,
+    status: DaemonStatus,
+) -> ControlResponse {
+    let (message, persistence_outcome) = match outcome {
+        DumpOutcome::Written {
+            range,
+            frames,
+            lost_frames,
+            output_directory,
+            files,
+        } => {
+            let message = persistence_message("written", frames, lost_frames);
+            (
+                message,
+                PersistenceOutcomeResponse::Written {
+                    start_frame: range.start,
+                    end_frame: range.end,
+                    frames,
+                    duration_seconds: frames as f64 / f64::from(sample_rate),
+                    lost_frames,
+                    output_directory,
+                    files,
+                },
+            )
+        }
+        DumpOutcome::SkippedSilent {
+            range,
+            frames,
+            lost_frames,
+        } => {
+            let message = persistence_message("skipped exact-zero audio", frames, lost_frames);
+            (
+                message,
+                PersistenceOutcomeResponse::SkippedSilent {
+                    start_frame: range.start,
+                    end_frame: range.end,
+                    frames,
+                    duration_seconds: frames as f64 / f64::from(sample_rate),
+                    lost_frames,
+                },
+            )
+        }
+        DumpOutcome::NoNewAudio => (
+            "no new audio".to_string(),
+            PersistenceOutcomeResponse::NoNewAudio,
+        ),
+    };
+    ControlResponse {
+        ok: true,
+        message,
+        status: Some(status),
+        persistence_outcome: Some(persistence_outcome),
+    }
+}
+
+fn persistence_message(kind: &str, frames: u64, lost_frames: u64) -> String {
+    if lost_frames == 0 {
+        format!("{kind}: {frames} frames")
+    } else {
+        format!("{kind}: {frames} frames; warning: {lost_frames} frames lost before persistence")
     }
 }
 
@@ -976,6 +1041,7 @@ fn set_app_fault(
         runtime.last_error = Some(error);
         runtime.active_profile = resolved;
         runtime.capture = None;
+        runtime.dump_coordinator = None;
     }
 }
 
@@ -1003,6 +1069,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                 state.active_profile = Some(profile.clone());
                 if state.config.daemon.start_mode == "auto" {
                     state.capture.take();
+                    state.dump_coordinator = None;
                     let channel_names: Vec<String> =
                         profile.ports.iter().map(|p| p.name.clone()).collect();
                     match profile.backend.as_str() {
@@ -1016,6 +1083,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                                     state.last_error = None;
                                     state.capture =
                                         Some(CaptureBackend::Jack(capture, channel_names));
+                                    state.dump_coordinator = Some(Arc::new(DumpCoordinator::new()));
                                 }
                                 Err(err) => {
                                     state.state = "faulted".to_string();
@@ -1048,6 +1116,8 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                                                                 capture,
                                                                 channel_names,
                                                             ));
+                                                        state.dump_coordinator =
+                                                            Some(Arc::new(DumpCoordinator::new()));
                                                     }
                                                     Err(err) => {
                                                         state.state = "faulted".to_string();
@@ -1081,12 +1151,14 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                     state.state = "idle".to_string();
                     state.last_error = None;
                     state.capture = None;
+                    state.dump_coordinator = None;
                 }
             } else {
                 state.state = "unconfigured".to_string();
                 state.last_error = Some("no active profile configured".to_string());
                 state.active_profile = None;
                 state.capture = None;
+                state.dump_coordinator = None;
             }
             Ok(())
         }
@@ -1096,6 +1168,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
             state.last_error = Some(format!("config file not found: {}", path.display()));
             state.active_profile = None;
             state.capture = None;
+            state.dump_coordinator = None;
             Ok(())
         }
         ConfigLoadState::Invalid => {
@@ -1104,6 +1177,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
             state.last_error = loaded.error;
             state.active_profile = None;
             state.capture = None;
+            state.dump_coordinator = None;
             Ok(())
         }
     }
@@ -1139,6 +1213,47 @@ fn iso8601_compact_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_recall_reports_poisoned_runtime_lock_as_internal_error() {
+        let ctx = poisoned_runtime_context();
+
+        let response = handle_app_recall(&ctx);
+
+        assert!(!response.ok);
+        assert_eq!(response.message, "runtime state lock poisoned");
+    }
+
+    #[test]
+    fn app_dump_reports_poisoned_runtime_lock_as_internal_error() {
+        let ctx = poisoned_runtime_context();
+
+        let response = handle_app_dump(&ctx);
+
+        assert!(!response.ok);
+        assert_eq!(response.message, "runtime state lock poisoned");
+    }
+
+    fn poisoned_runtime_context() -> IdleDaemonContext {
+        let ctx = IdleDaemonContext {
+            config_path: PathBuf::from("/tmp/lamb-test-config.toml"),
+            control_socket_path: PathBuf::from("/tmp/lamb-test-control.sock"),
+            runtime: Mutex::new(AppRuntimeState {
+                config: app_config::AppConfig::default(),
+                state: "idle".to_string(),
+                last_error: None,
+                active_profile: None,
+                capture: None,
+                dump_coordinator: None,
+            }),
+            stop: AtomicBool::new(false),
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _runtime = ctx.runtime.lock().unwrap();
+            panic!("poison runtime lock");
+        }));
+        ctx
+    }
 
     #[test]
     fn iso8601_compact_label_is_14_digits() {

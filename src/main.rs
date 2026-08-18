@@ -82,7 +82,7 @@ fn main() {
     let result = match cli.command {
         Command::Daemon { config } => lamb::daemon::run_from_config_path(&config),
         Command::Config { command } => run_config_command(command),
-        Command::Recall { socket } => lamb::control::client_send_simple(&socket, "recall"),
+        Command::Recall { socket } => lamb::control::client_recall(&socket),
         Command::Clear { socket } => lamb::control::client_send_simple(&socket, "clear"),
         Command::Status { socket, json } => lamb::control::client_status(&socket, json),
         Command::Stop { socket } => lamb::control::client_send_simple(&socket, "stop"),

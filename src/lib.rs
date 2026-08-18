@@ -5,6 +5,7 @@ pub mod capture_pipewire;
 pub mod config;
 pub mod control;
 pub mod daemon;
+pub mod dump;
 pub mod error;
 pub mod export_wav;
 pub mod math;
