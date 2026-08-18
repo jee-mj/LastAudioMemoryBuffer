@@ -415,6 +415,11 @@ fn publish_prepared_recall(
             ))
         }
     };
+    // NOTE: the export layer's `planned`/`partials`/`created_finals` vectors are
+    // non-realtime and bounded by the configured output-part count. They remain
+    // intentionally outside the arena-backed persistence model so that
+    // arena-specific APIs do not propagate through the export layer. Only the
+    // manifest model and streaming WAV buffers are arena-backed.
     let transaction_id = match staging_directory.file_name().and_then(|name| name.to_str()) {
         Some(transaction_id) => transaction_id.to_string(),
         None => {

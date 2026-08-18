@@ -12,7 +12,8 @@ use crate::memory_plan::{
     OUTPUT_PATH_SLOTS_PER_PART,
 };
 use crate::recovery::{
-    recover_dump_parent, recover_recall_root, ManifestEntrySlot, RecoveryOutcome, TransactionKind,
+    recover_dump_parent, recover_dump_root, recover_recall_root, recover_recall_staging_root,
+    ManifestEntrySlot, RecoveryOutcome, RecoveryScanSummary, TransactionKind,
 };
 use crate::sample_ring::SampleFormat;
 use std::fmt;
@@ -1017,6 +1018,34 @@ impl PersistenceWorkspace {
             }
             None => Ok(PublicationRecovery::Pending),
         }
+    }
+
+    /// Recovers marked recall transactions under `staging_root` using this
+    /// workspace's reserved manifest parse arenas, at startup before persistence
+    /// is admitted.
+    pub fn recover_recall_staging(
+        &mut self,
+        staging_root: &Path,
+        output_root: &Path,
+    ) -> RecoveryScanSummary {
+        recover_recall_staging_root(
+            staging_root,
+            output_root,
+            self.manifest_entries.as_mut_slice(),
+            self.manifest_paths.as_mut_slice(),
+            self.manifest_serialization.as_mut_slice(),
+        )
+    }
+
+    /// Recovers marked dump transactions under `dump_parent` using this
+    /// workspace's reserved manifest parse arenas.
+    pub fn recover_dumps(&mut self, dump_parent: &Path) -> RecoveryScanSummary {
+        recover_dump_root(
+            dump_parent,
+            self.manifest_entries.as_mut_slice(),
+            self.manifest_paths.as_mut_slice(),
+            self.manifest_serialization.as_mut_slice(),
+        )
     }
 
     pub(crate) fn finish_completed_publication(&mut self) {

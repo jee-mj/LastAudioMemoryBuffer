@@ -1,8 +1,8 @@
 use lamb::error::LambError;
 use lamb::recovery::{
-    capture_identity, recover_dump_parent, recover_recall_root, FileIdentity, ManifestEntrySlot,
-    ManifestPhase, ManifestStore, PathRef, RecoveryOutcome, TransactionKind, TransactionManifest,
-    MANIFEST_VERSION,
+    capture_identity, recover_dump_parent, recover_dump_root, recover_recall_root,
+    recover_recall_staging_root, FileIdentity, ManifestEntrySlot, ManifestPhase, ManifestStore,
+    PathRef, RecoveryOutcome, TransactionKind, TransactionManifest, MANIFEST_VERSION,
 };
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt};
@@ -802,4 +802,104 @@ fn manifest_update_never_overwrites_foreign_temp_file() {
         .read(&manifest_path, &mut rec_slots, &mut rec_paths)
         .unwrap();
     assert_eq!(stored.phase, original_phase);
+}
+
+#[test]
+fn startup_scan_recovers_marked_recall_and_ignores_unmarked() {
+    let root = tempfile::tempdir().unwrap();
+    let staging_root = root.path().join("staging");
+    let output = root.path().join("output");
+    fs::create_dir_all(&staging_root).unwrap();
+
+    let transaction = staging_root.join("recall-scan");
+    let (mut slots, mut path_bytes) = fresh_manifest();
+    let manifest = recall_manifest(&mut slots, &mut path_bytes, &transaction, &output, 2);
+    write_manifest(&transaction.join("manifest.json"), &manifest);
+
+    let legacy = staging_root.join("legacy-unmarked");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("legacy.wav"), b"legacy").unwrap();
+
+    let (mut rec_slots, mut rec_paths) = fresh_manifest();
+    let mut buffer = vec![0_u8; BUFFER_BYTES];
+    let summary = recover_recall_staging_root(
+        &staging_root,
+        &output,
+        &mut rec_slots,
+        &mut rec_paths,
+        &mut buffer,
+    );
+
+    assert_eq!(summary.discovered, 1);
+    assert_eq!(summary.completed, 1);
+    assert!(!transaction.exists());
+    assert_eq!(fs::read(legacy.join("legacy.wav")).unwrap(), b"legacy");
+}
+
+#[test]
+fn startup_dump_scan_recovers_marked_dump_and_preserves_foreign() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("dumps");
+    let (mut slots, mut path_bytes) = fresh_manifest();
+    let (manifest_path, manifest) = dump_manifest(&mut slots, &mut path_bytes, &parent, true);
+    write_manifest(&manifest_path, &manifest);
+
+    let foreign = parent.join(".foreign.manifest.json");
+    fs::write(&foreign, b"foreign").unwrap();
+
+    let (mut rec_slots, mut rec_paths) = fresh_manifest();
+    let mut buffer = vec![0_u8; BUFFER_BYTES];
+    let summary = recover_dump_root(&parent, &mut rec_slots, &mut rec_paths, &mut buffer);
+
+    assert_eq!(summary.discovered, 2);
+    assert_eq!(summary.completed, 1);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(fs::read(&foreign).unwrap(), b"foreign");
+}
+
+#[test]
+fn startup_scan_records_issues_for_failed_and_pending_transactions() {
+    // Failed: a dump parent with a malformed foreign manifest.
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("dumps");
+    fs::create_dir_all(&parent).unwrap();
+    let foreign = parent.join(".foreign.manifest.json");
+    fs::write(&foreign, b"not json").unwrap();
+    let (mut slots, mut path_bytes) = fresh_manifest();
+    let mut buffer = vec![0_u8; BUFFER_BYTES];
+    let summary = recover_dump_root(&parent, &mut slots, &mut path_bytes, &mut buffer);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.issues.len(), 1);
+    assert_eq!(summary.issues[0].path, foreign);
+    assert!(!summary.issues[0].error.is_empty());
+    assert_eq!(fs::read(&foreign).unwrap(), b"not json");
+
+    // Pending: a recall transaction whose staged file was replaced by a
+    // foreign inode leaves the directory non-empty and cannot be finalized.
+    let root2 = tempfile::tempdir().unwrap();
+    let staging_root = root2.path().join("staging");
+    let output = root2.path().join("output");
+    let transaction = staging_root.join("recall-pending");
+    let (mut slots2, mut path_bytes2) = fresh_manifest();
+    let manifest = recall_manifest(&mut slots2, &mut path_bytes2, &transaction, &output, 1);
+    let staged = transaction.join("channel-0.wav");
+    let replacement = transaction.join("replacement");
+    fs::write(&replacement, b"foreign staged").unwrap();
+    fs::rename(&replacement, &staged).unwrap();
+    write_manifest(&transaction.join("manifest.json"), &manifest);
+
+    let (mut rec_slots, mut rec_paths) = fresh_manifest();
+    let mut buffer2 = vec![0_u8; BUFFER_BYTES];
+    let summary2 = recover_recall_staging_root(
+        &staging_root,
+        &output,
+        &mut rec_slots,
+        &mut rec_paths,
+        &mut buffer2,
+    );
+    assert_eq!(summary2.pending, 1);
+    assert_eq!(summary2.issues.len(), 1);
+    assert_eq!(summary2.issues[0].path, transaction);
+    assert!(!summary2.issues[0].error.is_empty());
+    assert_eq!(fs::read(&staged).unwrap(), b"foreign staged");
 }

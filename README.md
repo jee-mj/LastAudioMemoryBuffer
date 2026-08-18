@@ -42,6 +42,37 @@ publication fails, the source range remains retryable and is not consumed. Ring
 buffer retention can overwrite unhandled old frames; when this wrap loses old
 frames, the command reports the loss.
 
+## Preallocated Persistence Runtime
+
+Each capture session reserves its worst-case memory up front, before capture
+starts, so persistence never performs allocation proportional to the selected
+recording length:
+
+- Two complete dual-epoch retention rings are allocated and page-touched at
+  startup. Capture callbacks copy frames into a fixed ingress queue; one
+  sole-owner capture worker writes the active ring, so filesystem persistence
+  never blocks the realtime producer.
+- A capture session computes a full memory plan (rings, persistence workspace,
+  capture ingress, control queues, worker stacks) and validates it against
+  `memory.max` before any backend starts. A plan that exceeds `memory.max`
+  fails at startup with a component report rather than during persistence.
+- Persistence streams the selected range into synchronized temporary WAVs using
+  fixed reusable buffers; exact-zero silence is discarded without final output.
+
+Control stays responsive during persistence: the control server handles
+`status` directly and hands mutating commands (`recall`, `dump`, `clear`, and
+capture lifecycle) to one bounded, prestarted operation worker.
+
+Publication is transactional and crash-recoverable. Recall and dump write a
+versioned, identity-checked manifest alongside their files; at startup LAMB
+recovers only marked transactions, completing fully-published recordings,
+rolling back incomplete owned sets, and never touching unmarked or foreign
+files. Loss is reported by cause — `retention_lost_frames`, `cleared_frames`,
+and `capture_dropped_frames` — with `lost_frames` as their total.
+
+Publication requires Linux `renameat2` and directory `fsync`; unsupported
+targets fail to compile rather than failing at first publication.
+
 ## Configuration
 
 ### Legacy mode (`configVersion = 1`)

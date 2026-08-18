@@ -57,18 +57,19 @@ impl<T> OperationLane<T> {
 
     /// Enqueues a job if there is spare capacity and the lane is still open.
     /// The backing `VecDeque` never reallocates past `capacity`, so saturation
-    /// is a deterministic busy result rather than unbounded growth.
-    pub fn try_enqueue(&self, job: T) -> std::result::Result<(), EnqueueError> {
+    /// is a deterministic busy result rather than unbounded growth. On failure
+    /// the job is returned so the caller can report the busy/closed condition.
+    pub fn try_enqueue(&self, job: T) -> std::result::Result<(), (EnqueueError, T)> {
         let mut queue = self
             .state
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.state.closed.load(Ordering::Acquire) {
-            return Err(EnqueueError::Closed);
+            return Err((EnqueueError::Closed, job));
         }
         if queue.len() >= self.state.capacity {
-            return Err(EnqueueError::Full);
+            return Err((EnqueueError::Full, job));
         }
         queue.push_back(job);
         self.state.not_empty.notify_one();
@@ -116,14 +117,21 @@ impl<T> Drop for OperationLane<T> {
 /// configured stack pages before entering the loop so startup latency is
 /// committed rather than paid on the first operation. The operation worker is
 /// not a realtime thread; it may block on filesystem persistence.
-pub fn spawn_operation_worker<T, F>(
+///
+/// Once the lane is closed, jobs that were queued but not yet started are
+/// handed to `cancel` (so callers can answer them with a shutting-down
+/// response) rather than executed. The job currently running in `handler`
+/// always finishes first.
+pub fn spawn_operation_worker<T, F, C>(
     lane: Arc<OperationLane<T>>,
     stack_bytes: usize,
     handler: F,
+    cancel: C,
 ) -> thread::JoinHandle<()>
 where
     T: Send + 'static,
     F: Fn(T) + Send + 'static,
+    C: Fn(T) + Send + 'static,
 {
     thread::Builder::new()
         .name("lamb-operation-worker".to_string())
@@ -131,7 +139,11 @@ where
         .spawn(move || {
             touch_stack_pages();
             while let Some(job) = lane.pop() {
-                handler(job);
+                if lane.is_closed() {
+                    cancel(job);
+                } else {
+                    handler(job);
+                }
             }
         })
         .expect("failed to spawn operation worker")
@@ -174,7 +186,7 @@ mod tests {
         lane.try_enqueue(1).unwrap();
         lane.try_enqueue(2).unwrap();
         lane.try_enqueue(3).unwrap();
-        assert_eq!(lane.try_enqueue(4), Err(EnqueueError::Full));
+        assert_eq!(lane.try_enqueue(4), Err((EnqueueError::Full, 4)));
         assert_eq!(lane.pop(), Some(1));
         assert_eq!(lane.pop(), Some(2));
         assert_eq!(lane.pop(), Some(3));
@@ -188,7 +200,7 @@ mod tests {
         lane.try_enqueue(10).unwrap();
         lane.try_enqueue(11).unwrap();
         lane.close();
-        assert_eq!(lane.try_enqueue(12), Err(EnqueueError::Closed));
+        assert_eq!(lane.try_enqueue(12), Err((EnqueueError::Closed, 12)));
         assert_eq!(lane.pop(), Some(10));
         assert_eq!(lane.pop(), Some(11));
         assert_eq!(lane.pop(), None);
@@ -199,9 +211,14 @@ mod tests {
         let lane = Arc::new(OperationLane::new(4).unwrap());
         let processed = Arc::new(AtomicUsize::new(0));
         let processed_w = Arc::clone(&processed);
-        let worker = spawn_operation_worker(Arc::clone(&lane), 64 * 1024, move |job: usize| {
-            processed_w.fetch_add(job, Ordering::SeqCst);
-        });
+        let worker = spawn_operation_worker(
+            Arc::clone(&lane),
+            64 * 1024,
+            move |job: usize| {
+                processed_w.fetch_add(job, Ordering::SeqCst);
+            },
+            |_job: usize| {},
+        );
         for job in [1, 2, 3, 4] {
             lane.try_enqueue(job).unwrap();
         }
@@ -215,18 +232,43 @@ mod tests {
     }
 
     #[test]
-    fn close_and_join_drains_queued_jobs_before_returning() {
+    fn close_cancels_queued_jobs_after_the_active_one_finishes() {
+        use std::sync::Barrier;
         let lane = Arc::new(OperationLane::new(4).unwrap());
         let processed = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
         let processed_w = Arc::clone(&processed);
-        let worker = spawn_operation_worker(Arc::clone(&lane), 64 * 1024, move |job: usize| {
-            processed_w.fetch_add(job, Ordering::SeqCst);
-        });
-        lane.try_enqueue(5).unwrap();
-        lane.try_enqueue(6).unwrap();
+        let cancelled_w = Arc::clone(&cancelled);
+        let entered_w = Arc::clone(&entered);
+        let release_w = Arc::clone(&release);
+        let worker = spawn_operation_worker(
+            Arc::clone(&lane),
+            64 * 1024,
+            move |job: usize| {
+                if job == 1 {
+                    entered_w.wait();
+                    release_w.wait();
+                }
+                processed_w.fetch_add(job, Ordering::SeqCst);
+            },
+            move |job: usize| {
+                cancelled_w.fetch_add(job, Ordering::SeqCst);
+            },
+        );
+
+        lane.try_enqueue(1).unwrap();
+        entered.wait();
+        lane.try_enqueue(2).unwrap();
+        lane.try_enqueue(3).unwrap();
         lane.close();
+        release.wait();
         worker.join().unwrap();
-        assert_eq!(processed.load(Ordering::SeqCst), 11);
+
+        assert_eq!(processed.load(Ordering::SeqCst), 1);
+        assert_eq!(cancelled.load(Ordering::SeqCst), 5);
     }
 
     #[test]

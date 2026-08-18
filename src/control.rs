@@ -163,6 +163,20 @@ fn client_persistence(socket: &Path, request: ControlRequest) -> Result<()> {
     Ok(())
 }
 
+fn format_loss_causes(retention: u64, cleared: u64, dropped: u64) -> String {
+    let mut causes = Vec::new();
+    if retention > 0 {
+        causes.push(format!("retention {retention}"));
+    }
+    if cleared > 0 {
+        causes.push(format!("cleared {cleared}"));
+    }
+    if dropped > 0 {
+        causes.push(format!("capture-dropped {dropped}"));
+    }
+    causes.join(", ")
+}
+
 fn format_persistence_outcome(outcome: &PersistenceOutcomeResponse) -> String {
     match outcome {
         PersistenceOutcomeResponse::Written {
@@ -171,16 +185,23 @@ fn format_persistence_outcome(outcome: &PersistenceOutcomeResponse) -> String {
             frames,
             duration_seconds,
             lost_frames,
+            retention_lost_frames,
+            cleared_frames,
+            capture_dropped_frames,
             output_directory,
             files,
-            ..
         } => {
             let mut lines = vec![format!(
                 "written {frames} frames ({duration_seconds:.3} seconds), source frames {start_frame}..{end_frame}"
             )];
             if *lost_frames > 0 {
                 lines.push(format!(
-                    "warning: {lost_frames} frames were lost before persistence"
+                    "warning: {lost_frames} frames were lost before persistence ({})",
+                    format_loss_causes(
+                        *retention_lost_frames,
+                        *cleared_frames,
+                        *capture_dropped_frames
+                    )
                 ));
             }
             lines.push(format!("output directory: {}", output_directory.display()));
@@ -193,23 +214,42 @@ fn format_persistence_outcome(outcome: &PersistenceOutcomeResponse) -> String {
             frames,
             duration_seconds,
             lost_frames,
-            ..
+            retention_lost_frames,
+            cleared_frames,
+            capture_dropped_frames,
         } => {
             let mut lines = vec![format!(
                 "skipped exact-zero audio: {frames} frames ({duration_seconds:.3} seconds), source frames {start_frame}..{end_frame}"
             )];
             if *lost_frames > 0 {
                 lines.push(format!(
-                    "warning: {lost_frames} frames were lost before persistence"
+                    "warning: {lost_frames} frames were lost before persistence ({})",
+                    format_loss_causes(
+                        *retention_lost_frames,
+                        *cleared_frames,
+                        *capture_dropped_frames
+                    )
                 ));
             }
             lines.join("\n")
         }
-        PersistenceOutcomeResponse::NoNewAudio { lost_frames, .. } => {
+        PersistenceOutcomeResponse::NoNewAudio {
+            lost_frames,
+            retention_lost_frames,
+            cleared_frames,
+            capture_dropped_frames,
+        } => {
             if *lost_frames == 0 {
                 "no new audio".to_string()
             } else {
-                format!("no new audio\nwarning: {lost_frames} frames were lost before persistence")
+                format!(
+                    "no new audio\nwarning: {lost_frames} frames were lost before persistence ({})",
+                    format_loss_causes(
+                        *retention_lost_frames,
+                        *cleared_frames,
+                        *capture_dropped_frames
+                    )
+                )
             }
         }
     }
@@ -269,11 +309,52 @@ mod tests {
             format_persistence_outcome(&outcome),
             concat!(
                 "written 250 frames (2.500 seconds), source frames 100..350\n",
-                "warning: 25 frames were lost before persistence\n",
+                "warning: 25 frames were lost before persistence (retention 25)\n",
                 "output directory: /tmp/out/20260818120000\n",
                 "/tmp/out/20260818120000/mic.wav\n",
                 "/tmp/out/20260818120000/gtr.wav"
             )
+        );
+    }
+
+    #[test]
+    fn formats_written_loss_causes_individually_and_suppresses_zeroes() {
+        let outcome = PersistenceOutcomeResponse::Written {
+            start_frame: 0,
+            end_frame: 100,
+            frames: 100,
+            duration_seconds: 1.0,
+            lost_frames: 30,
+            retention_lost_frames: 10,
+            cleared_frames: 20,
+            capture_dropped_frames: 0,
+            output_directory: PathBuf::from("/tmp/out"),
+            files: vec![],
+        };
+
+        let rendered = format_persistence_outcome(&outcome);
+        assert!(
+            rendered.contains(
+                "warning: 30 frames were lost before persistence (retention 10, cleared 20)"
+            ),
+            "got: {rendered}"
+        );
+        assert!(!rendered.contains("capture-dropped"), "got: {rendered}");
+    }
+
+    #[test]
+    fn formats_no_new_audio_with_mixed_loss_causes() {
+        let rendered = format_persistence_outcome(&PersistenceOutcomeResponse::NoNewAudio {
+            lost_frames: 7,
+            retention_lost_frames: 0,
+            cleared_frames: 3,
+            capture_dropped_frames: 4,
+        });
+        assert!(
+            rendered.contains(
+                "no new audio\nwarning: 7 frames were lost before persistence (cleared 3, capture-dropped 4)"
+            ),
+            "got: {rendered}"
         );
     }
 

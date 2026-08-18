@@ -1133,6 +1133,127 @@ pub fn sync_directory(path: &Path) -> Result<()> {
         .map_err(|source| io_error(path, source))
 }
 
+/// A single recovery problem surfaced to the operator: a transaction that
+/// failed or could not be resolved (pending), with its identity and cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryIssue {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// Best-effort summary of a startup recovery scan over marked transactions.
+#[derive(Debug, Default)]
+pub struct RecoveryScanSummary {
+    pub discovered: usize,
+    pub completed: usize,
+    pub rolled_back: usize,
+    pub pending: usize,
+    pub failed: usize,
+    pub issues: Vec<RecoveryIssue>,
+}
+
+impl RecoveryScanSummary {
+    pub fn merge(&mut self, other: RecoveryScanSummary) {
+        self.discovered += other.discovered;
+        self.completed += other.completed;
+        self.rolled_back += other.rolled_back;
+        self.pending += other.pending;
+        self.failed += other.failed;
+        self.issues.extend(other.issues);
+    }
+}
+
+/// Recovers every marked recall transaction under `staging_root` (each
+/// immediate child directory containing a recall manifest). Recovery is
+/// best-effort per transaction; unmarked legacy artifacts are never touched.
+/// The caller provides the fixed parse arenas, reused across transactions.
+pub fn recover_recall_staging_root(
+    staging_root: &Path,
+    output_root: &Path,
+    slots: &mut [ManifestEntrySlot],
+    path_bytes: &mut [u8],
+    buffer: &mut [u8],
+) -> RecoveryScanSummary {
+    let mut summary = RecoveryScanSummary::default();
+    let Ok(entries) = fs::read_dir(staging_root) else {
+        return summary;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let manifest_path = path.join(RECALL_MANIFEST_NAME);
+        if !manifest_path.is_file() {
+            continue;
+        }
+        summary.discovered += 1;
+        match recover_recall_root(&path, output_root, buffer, slots, path_bytes) {
+            Ok(RecoveryOutcome::Complete) => summary.completed += 1,
+            Ok(RecoveryOutcome::RolledBack) => summary.rolled_back += 1,
+            Ok(RecoveryOutcome::Pending) => {
+                summary.pending += 1;
+                summary.issues.push(RecoveryIssue {
+                    path: path.clone(),
+                    error: "recovery incomplete; transaction remains pending".to_string(),
+                });
+            }
+            Err(error) => {
+                summary.failed += 1;
+                summary.issues.push(RecoveryIssue {
+                    path: path.clone(),
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+    summary
+}
+
+/// Recovers every marked dump transaction under `dump_parent` (each sibling
+/// `.<id>.manifest.json`). Best-effort per transaction; foreign/unmarked files
+/// are untouched.
+pub fn recover_dump_root(
+    dump_parent: &Path,
+    slots: &mut [ManifestEntrySlot],
+    path_bytes: &mut [u8],
+    buffer: &mut [u8],
+) -> RecoveryScanSummary {
+    let mut summary = RecoveryScanSummary::default();
+    let Ok(entries) = fs::read_dir(dump_parent) else {
+        return summary;
+    };
+    for entry in entries.flatten() {
+        let manifest_path = entry.path();
+        let Some(name) = manifest_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with('.') || !name.ends_with(".manifest.json") {
+            continue;
+        }
+        summary.discovered += 1;
+        match recover_dump_parent(dump_parent, &manifest_path, buffer, slots, path_bytes) {
+            Ok(RecoveryOutcome::Complete) => summary.completed += 1,
+            Ok(RecoveryOutcome::RolledBack) => summary.rolled_back += 1,
+            Ok(RecoveryOutcome::Pending) => {
+                summary.pending += 1;
+                summary.issues.push(RecoveryIssue {
+                    path: manifest_path.clone(),
+                    error: "recovery incomplete; transaction remains pending".to_string(),
+                });
+            }
+            Err(error) => {
+                summary.failed += 1;
+                summary.issues.push(RecoveryIssue {
+                    path: manifest_path.clone(),
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+    summary
+}
+
 fn sync_owned_directory(path: &Path, expected: FileIdentity) -> Result<()> {
     let directory = OpenOptions::new()
         .read(true)

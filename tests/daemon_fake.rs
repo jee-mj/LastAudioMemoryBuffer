@@ -598,3 +598,69 @@ splitWhenOverBytes = 3900000000
     assert!(names.contains(&"mic.wav".to_string()), "got: {joined}");
     assert!(names.contains(&"gtr.wav".to_string()), "got: {joined}");
 }
+
+#[test]
+fn tight_memory_max_fails_before_capture_or_socket_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("control.sock");
+    let out = temp.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let config = temp.path().join("lamb.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+configVersion = 1
+user = "{}"
+channels = 2
+channelMap = ["mic", "gtr"]
+seconds = 5
+sampleRate = 100
+sampleFormat = "F32LE"
+dontRemix = true
+outputDir = "{}"
+maxActiveSnapshots = 1
+allowQueuedRecall = false
+controlSocketPath = "{}"
+controlPermissions = "0600"
+backend = "fake"
+chunkFrames = 1
+
+[memory]
+headroom = 1.25
+max = 100
+
+[export]
+mode = "per-channel"
+format = "wav"
+splitWhenOverBytes = 3900000000
+"#,
+            whoami(),
+            out.display(),
+            socket.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lamb"))
+        .arg("daemon")
+        .arg("--config")
+        .arg(&config)
+        .env("LAMB_SKIP_RUNTIME_VALIDATION", "1")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "daemon should refuse a plan that exceeds memory.max"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("memory"),
+        "startup error should mention memory, got: {stderr}"
+    );
+    assert!(
+        !socket.exists(),
+        "control socket must not be created when memory validation fails"
+    );
+}

@@ -10,6 +10,7 @@ use crate::capture_runtime::{
 };
 use crate::config::{self, LambConfig};
 use crate::control::{ControlRequest, ControlResponse, DaemonStatus, PersistenceOutcomeResponse};
+use crate::control_server::{spawn_operation_worker, EnqueueError, OperationLane};
 use crate::dump::{DumpCoordinator, DumpOutcome};
 use crate::error::{io_error, LambError, Result};
 use crate::persistence_workspace::{PersistenceWorkspace, PrepareRequest};
@@ -56,6 +57,43 @@ impl CaptureSession {
     fn status(&self) -> Result<CaptureArenaStatus> {
         self.arena.status(PERSIST_TIMEOUT)
     }
+
+    /// Recovers marked recall/dump transactions before admitting persistence,
+    /// using the reserved manifest arenas of this session's workspace, and
+    /// logs a summary plus an operator-visible warning for every failed or
+    /// indeterminate recovery.
+    fn recover_startup(
+        &self,
+        staging_root: &Path,
+        recall_output: &Path,
+        dump_parent: &Path,
+    ) -> crate::recovery::RecoveryScanSummary {
+        let mut workspace = self
+            .workspace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut summary = workspace.recover_recall_staging(staging_root, recall_output);
+        summary.merge(workspace.recover_dumps(dump_parent));
+        log_recovery_summary(&summary);
+        summary
+    }
+}
+
+fn log_recovery_summary(summary: &crate::recovery::RecoveryScanSummary) {
+    if summary.discovered == 0 {
+        return;
+    }
+    eprintln!(
+        "lamb: startup recovery: {} discovered, {} completed, {} rolled back, {} pending, {} failed",
+        summary.discovered, summary.completed, summary.rolled_back, summary.pending, summary.failed
+    );
+    for issue in &summary.issues {
+        eprintln!(
+            "lamb: warning: recovery of {}: {}",
+            issue.path.display(),
+            issue.error
+        );
+    }
 }
 
 fn legacy_runtime_params(cfg: &LambConfig) -> CaptureRuntimeParams {
@@ -88,6 +126,12 @@ fn app_runtime_params(profile: &profile::ResolvedProfile) -> CaptureRuntimeParam
         control_queue_capacity: DEFAULT_CONTROL_QUEUE_CAPACITY,
         worker_stack_bytes: DEFAULT_WORKER_STACK_BYTES,
     }
+}
+
+fn app_dump_dir() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".cache/lamb/out"))
 }
 
 pub fn run_from_config_path(path: &Path) -> Result<()> {
@@ -228,23 +272,56 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
         channel_names,
         output_dir: cfg.output_dir.clone(),
     };
-    let ctx = DaemonContext {
+    let _recovery = session.recover_startup(
+        Path::new(APP_STAGING_ROOT),
+        &cfg.output_dir,
+        &cfg.output_dir,
+    );
+    let ctx = Arc::new(DaemonContext {
         cfg,
         session,
         resolved_target,
         stop: AtomicBool::new(false),
         last_error: Mutex::new(None),
-    };
+    });
+    let lane = Arc::new(OperationLane::new(DEFAULT_CONTROL_QUEUE_CAPACITY as usize)?);
+    let worker = spawn_operation_worker(
+        Arc::clone(&lane),
+        DEFAULT_WORKER_STACK_BYTES as usize,
+        {
+            let ctx = Arc::clone(&ctx);
+            move |(request, stream): (ControlRequest, UnixStream)| {
+                let response = handle_request(&ctx, request);
+                let _ = write_response(stream, &response);
+            }
+        },
+        {
+            let ctx = Arc::clone(&ctx);
+            move |(_request, stream): (ControlRequest, UnixStream)| {
+                let response = ControlResponse {
+                    ok: false,
+                    message: "shutting down".to_string(),
+                    status: Some(status_response(&ctx)),
+                    persistence_outcome: None,
+                };
+                let _ = write_response(stream, &response);
+            }
+        },
+    );
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| io_error(&ctx.cfg.control_socket_path, source))?;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                if let Err(err) = handle_stream(&ctx, stream) {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Err(err) = route_legacy_stream(&ctx, &lane, stream) {
                     if let Ok(mut last) = ctx.last_error.lock() {
                         *last = Some(err.to_string());
                     }
                 }
             }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(err) => {
                 if let Ok(mut last) = ctx.last_error.lock() {
                     *last = Some(err.to_string());
@@ -254,7 +331,10 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
         if ctx.stop.load(Ordering::Acquire) {
             break;
         }
+        std::thread::sleep(Duration::from_millis(10));
     }
+    lane.close();
+    let _ = worker.join();
 
     if let Some(capture) = fake_capture {
         capture.stop();
@@ -313,13 +393,6 @@ impl CaptureBackend {
         }
     }
 
-    fn channel_count(&self) -> u32 {
-        match self {
-            CaptureBackend::Jack(c, _) => c.channel_count,
-            CaptureBackend::PipeWire(c, _) => c.channel_count,
-        }
-    }
-
     fn channel_names(&self) -> &[String] {
         match self {
             CaptureBackend::Jack(_, names) => names,
@@ -348,18 +421,46 @@ fn run_app_config_daemon(path: &Path, config: app_config::AppConfig) -> Result<(
         }
     }
 
-    let ctx = IdleDaemonContext {
+    let ctx = Arc::new(IdleDaemonContext {
         config_path: path.to_path_buf(),
         control_socket_path,
         runtime: Mutex::new(state),
         stop: AtomicBool::new(false),
-    };
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let _ = handle_idle_stream(&ctx, stream);
+    });
+    let lane = Arc::new(OperationLane::new(DEFAULT_CONTROL_QUEUE_CAPACITY as usize)?);
+    let worker = spawn_operation_worker(
+        Arc::clone(&lane),
+        DEFAULT_WORKER_STACK_BYTES as usize,
+        {
+            let ctx = Arc::clone(&ctx);
+            move |(request, stream): (ControlRequest, UnixStream)| {
+                let response = handle_idle_request(&ctx, request);
+                let _ = write_response(stream, &response);
             }
+        },
+        {
+            let ctx = Arc::clone(&ctx);
+            move |(_request, stream): (ControlRequest, UnixStream)| {
+                let response = ControlResponse {
+                    ok: false,
+                    message: "shutting down".to_string(),
+                    status: Some(idle_status_response(&ctx)),
+                    persistence_outcome: None,
+                };
+                let _ = write_response(stream, &response);
+            }
+        },
+    );
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| io_error(&ctx.control_socket_path, source))?;
+
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = route_idle_stream(&ctx, &lane, stream);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(err) => {
                 eprintln!("lamb: connection error: {err}");
             }
@@ -367,7 +468,10 @@ fn run_app_config_daemon(path: &Path, config: app_config::AppConfig) -> Result<(
         if ctx.stop.load(Ordering::Acquire) {
             break;
         }
+        std::thread::sleep(Duration::from_millis(10));
     }
+    lane.close();
+    let _ = worker.join();
 
     let _ = fs::remove_file(&ctx.control_socket_path);
     Ok(())
@@ -396,7 +500,10 @@ fn bind_control_socket(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn handle_stream(ctx: &DaemonContext, stream: UnixStream) -> Result<()> {
+fn read_request(stream: UnixStream) -> Result<(ControlRequest, UnixStream)> {
+    stream
+        .set_read_timeout(Some(PERSIST_TIMEOUT))
+        .map_err(|source| LambError::Control(source.to_string()))?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader
@@ -404,12 +511,102 @@ fn handle_stream(ctx: &DaemonContext, stream: UnixStream) -> Result<()> {
         .map_err(|source| LambError::Control(source.to_string()))?;
     let request: ControlRequest = serde_json::from_str(&line)
         .map_err(|err| LambError::Control(format!("invalid control request: {err}")))?;
-    let response = handle_request(ctx, request);
-    let mut stream = reader.into_inner();
+    Ok((request, reader.into_inner()))
+}
+
+fn write_response(stream: UnixStream, response: &ControlResponse) -> Result<()> {
     let body =
-        serde_json::to_string(&response).map_err(|err| LambError::Control(err.to_string()))?;
+        serde_json::to_string(response).map_err(|err| LambError::Control(err.to_string()))?;
+    let mut stream = stream;
     writeln!(stream, "{body}").map_err(|source| LambError::Control(source.to_string()))?;
     Ok(())
+}
+
+/// Routes one legacy control connection: status is answered directly (so it
+/// stays responsive during persistence), stop sets the stop flag, and mutating
+/// requests are transferred to the operation lane.
+fn route_legacy_stream(
+    ctx: &DaemonContext,
+    lane: &OperationLane<(ControlRequest, UnixStream)>,
+    stream: UnixStream,
+) -> Result<()> {
+    let (request, stream) = read_request(stream)?;
+    match request {
+        ControlRequest::Status => {
+            let response = ControlResponse {
+                ok: true,
+                message: "status".to_string(),
+                status: Some(status_response(ctx)),
+                persistence_outcome: None,
+            };
+            write_response(stream, &response)
+        }
+        ControlRequest::Stop => {
+            ctx.stop.store(true, Ordering::Release);
+            lane.close();
+            let response = ControlResponse {
+                ok: true,
+                message: "stopping".to_string(),
+                status: Some(status_response(ctx)),
+                persistence_outcome: None,
+            };
+            write_response(stream, &response)
+        }
+        request => match lane.try_enqueue((request, stream)) {
+            Ok(()) => Ok(()),
+            Err((EnqueueError::Full | EnqueueError::Closed, (_, stream))) => {
+                let response = ControlResponse {
+                    ok: false,
+                    message: "operation queue is busy or shutting down".to_string(),
+                    status: Some(status_response(ctx)),
+                    persistence_outcome: None,
+                };
+                write_response(stream, &response)
+            }
+        },
+    }
+}
+
+fn route_idle_stream(
+    ctx: &IdleDaemonContext,
+    lane: &OperationLane<(ControlRequest, UnixStream)>,
+    stream: UnixStream,
+) -> Result<()> {
+    let (request, stream) = read_request(stream)?;
+    match request {
+        ControlRequest::Status => {
+            let response = ControlResponse {
+                ok: true,
+                message: "status".to_string(),
+                status: Some(idle_status_response(ctx)),
+                persistence_outcome: None,
+            };
+            write_response(stream, &response)
+        }
+        ControlRequest::Stop => {
+            ctx.stop.store(true, Ordering::Release);
+            lane.close();
+            let response = ControlResponse {
+                ok: true,
+                message: "stopping".to_string(),
+                status: Some(idle_status_response(ctx)),
+                persistence_outcome: None,
+            };
+            write_response(stream, &response)
+        }
+        request => match lane.try_enqueue((request, stream)) {
+            Ok(()) => Ok(()),
+            Err((EnqueueError::Full | EnqueueError::Closed, (_, stream))) => {
+                let response = ControlResponse {
+                    ok: false,
+                    message: "operation queue is busy or shutting down".to_string(),
+                    status: Some(idle_status_response(ctx)),
+                    persistence_outcome: None,
+                };
+                write_response(stream, &response)
+            }
+        },
+    }
 }
 
 fn handle_idle_stream(ctx: &IdleDaemonContext, stream: UnixStream) -> Result<()> {
@@ -508,6 +705,7 @@ fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
         buffer_capacity,
         retained,
         dropped,
+        frozen_pending,
     ) = if let Some(ref runtime) = runtime {
         let state = if ctx.stop.load(Ordering::Acquire) {
             "stopping".to_string()
@@ -515,29 +713,30 @@ fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
             runtime.state.clone()
         };
         let last_error = runtime.last_error.clone();
-        if let (Some(session), Some(backend)) = (runtime.session.as_ref(), runtime.capture.as_ref())
-        {
-            let (capacity, retained, dropped) = match session.status() {
+        if let Some(session) = runtime.session.as_ref() {
+            let (capacity, retained, dropped, frozen_pending) = match session.status() {
                 Ok(status) => (
                     status.capacity_frames,
                     status.retained_frames,
                     status.dropped_frames,
+                    status.frozen_pending,
                 ),
-                Err(_) => (0, 0, 0),
+                Err(_) => (0, 0, 0, false),
             };
-            let capacity = capacity as f64 / f64::from(backend.sample_rate());
-            let retained = retained as f64 / f64::from(backend.sample_rate());
+            let capacity = capacity as f64 / f64::from(session.sample_rate);
+            let retained = retained as f64 / f64::from(session.sample_rate);
             let resolved = runtime.active_profile.as_ref().map(|p| p.name.clone());
             (
                 state,
                 last_error,
                 resolved,
-                backend.sample_rate(),
-                backend.channel_count(),
+                session.sample_rate,
+                session.channel_names.len() as u32,
                 "F32LE".to_string(),
                 capacity,
                 retained,
                 dropped,
+                frozen_pending,
             )
         } else {
             let resolved = runtime.active_profile.as_ref().map(|p| p.name.clone());
@@ -551,6 +750,7 @@ fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
                 0.0,
                 0.0,
                 0,
+                false,
             )
         }
     } else {
@@ -564,11 +764,12 @@ fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
             0.0,
             0.0,
             0,
+            false,
         )
     };
     DaemonStatus {
         state,
-        active_export_count: 0,
+        active_export_count: u32::from(frozen_pending),
         pending_recall_count: 0,
         buffer_capacity_seconds: buffer_capacity,
         retained_seconds: retained,
@@ -816,6 +1017,10 @@ fn start_app_capture(
         channel_names: backend.channel_names().to_vec(),
         output_dir: resolved_for_runtime.export_output_dir.clone(),
     });
+    if let Some(dump_dir) = app_dump_dir() {
+        let _ =
+            session.recover_startup(Path::new(APP_STAGING_ROOT), &session.output_dir, &dump_dir);
+    }
 
     let mut runtime = ctx
         .runtime
@@ -1147,14 +1352,22 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                             let sample_rate = backend.sample_rate();
                             let names = backend.channel_names().to_vec();
                             let output_dir = profile.export_output_dir.clone();
-                            state.session = Some(Arc::new(CaptureSession {
+                            let session = Arc::new(CaptureSession {
                                 arena: Arc::new(runtime.arena),
                                 workspace: Mutex::new(runtime.workspace),
                                 coordinator: Arc::new(DumpCoordinator::new()),
                                 sample_rate,
                                 channel_names: names,
-                                output_dir,
-                            }));
+                                output_dir: output_dir.clone(),
+                            });
+                            if let Some(dump_dir) = app_dump_dir() {
+                                let _ = session.recover_startup(
+                                    Path::new(APP_STAGING_ROOT),
+                                    &output_dir,
+                                    &dump_dir,
+                                );
+                            }
+                            state.session = Some(session);
                             state.state = "capturing".to_string();
                             state.last_error = None;
                             state.capture = Some(backend);
@@ -1230,6 +1443,71 @@ fn iso8601_compact_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_status_reports_pending_frozen_epoch() {
+        let params = CaptureRuntimeParams {
+            seconds: 1,
+            chunk_frames_override: Some(100),
+            memory_max: None,
+            headroom: 1.0,
+            split_when_over_bytes: 3_900_000_000,
+            io_buffer_bytes_per_channel: 4096,
+            maximum_path_bytes: 512,
+            capture_queue_slots: 8,
+            capture_worker_stack_bytes: 64 * 1024,
+            control_queue_capacity: 2,
+            worker_stack_bytes: 64 * 1024,
+        };
+        let (runtime, ingress) = CaptureRuntime::build(params, 100, 1).unwrap();
+        ingress.try_push_interleaved(&[0.1, 0.2, 0.3], 1).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let status = runtime
+                .arena
+                .status(std::time::Duration::from_secs(1))
+                .unwrap();
+            if status.worker_written_frames >= 3 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "capture worker did not drain"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let frozen = runtime
+            .arena
+            .freeze_since(None, std::time::Duration::from_secs(1))
+            .unwrap()
+            .expect("three frames were written");
+
+        let session = Arc::new(CaptureSession {
+            arena: Arc::new(runtime.arena),
+            workspace: Mutex::new(runtime.workspace),
+            coordinator: Arc::new(DumpCoordinator::new()),
+            sample_rate: 100,
+            channel_names: vec!["mic".to_string()],
+            output_dir: PathBuf::from("/tmp/out"),
+        });
+        let ctx = IdleDaemonContext {
+            config_path: PathBuf::from("/tmp/lamb-test-config.toml"),
+            control_socket_path: PathBuf::from("/tmp/lamb-test-control.sock"),
+            runtime: Mutex::new(AppRuntimeState {
+                config: app_config::AppConfig::default(),
+                state: "capturing".to_string(),
+                last_error: None,
+                active_profile: None,
+                capture: None,
+                session: Some(session),
+            }),
+            stop: AtomicBool::new(false),
+        };
+
+        let status = idle_status_response(&ctx);
+        assert_eq!(status.active_export_count, 1);
+        let _ = frozen;
+    }
 
     #[test]
     fn app_recall_reports_poisoned_runtime_lock_as_internal_error() {

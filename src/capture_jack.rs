@@ -122,6 +122,11 @@ impl Drop for JackCapture {
 }
 
 impl jack::ProcessHandler for JackProcessHandler {
+    // NOTE: `scratch` is a bounded warm-up allocation. It grows once when JACK
+    // first invokes the callback or changes the buffer size, and is reused
+    // thereafter. This pre-existing allocation is outside the new
+    // preallocated-persistence-runtime guarantee of zero callback allocation;
+    // it is not a recording-length allocation.
     fn process(&mut self, _: &jack::Client, process_scope: &jack::ProcessScope) -> jack::Control {
         let Some(first) = self.ports.first() else {
             return jack::Control::Quit;
