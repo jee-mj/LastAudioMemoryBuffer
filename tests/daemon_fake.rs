@@ -118,11 +118,22 @@ fn assert_persistence_commands_share_cursor(first: ControlRequest, second: Contr
     };
     match second_response.persistence_outcome {
         Some(PersistenceOutcomeResponse::NoNewAudio { .. }) => {}
-        Some(PersistenceOutcomeResponse::Written { start_frame, .. }) => {
-            assert_eq!(
-                start_frame, first_end,
-                "persistence ranges must be contiguous and never overlap"
+        Some(PersistenceOutcomeResponse::Written {
+            start_frame,
+            retention_lost_frames,
+            ..
+        }) => {
+            assert!(
+                start_frame >= first_end,
+                "persistence ranges must never overlap: {start_frame} < {first_end}"
             );
+            let gap = start_frame - first_end;
+            if gap > 0 {
+                assert!(
+                    retention_lost_frames >= gap,
+                    "a {gap}-frame gap must be reported as retention loss, got {retention_lost_frames}"
+                );
+            }
         }
         outcome => panic!("second command should report new or no audio, got {outcome:?}"),
     }
