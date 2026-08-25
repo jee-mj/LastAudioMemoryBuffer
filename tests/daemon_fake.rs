@@ -16,6 +16,8 @@ fn persistence_written_response_round_trips_with_source_frame_metadata() {
             start_frame: 100,
             end_frame: 350,
             frames: 250,
+            export_start_frame: 100,
+            export_frames: 250,
             duration_seconds: 2.5,
             lost_frames: 25,
             retention_lost_frames: 25,

@@ -271,7 +271,9 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
     let session = CaptureSession {
         arena: Arc::new(runtime.arena),
         workspace: Mutex::new(runtime.workspace),
-        coordinator: Arc::new(DumpCoordinator::new()),
+        coordinator: Arc::new(DumpCoordinator::with_frozen_decision(
+            runtime.frozen_export_decision,
+        )),
         sample_rate,
         channel_names,
         output_dir: cfg.output_dir.clone(),
@@ -1050,7 +1052,9 @@ fn start_app_capture(
     let session = Arc::new(CaptureSession {
         arena: Arc::new(runtime_session.arena),
         workspace: Mutex::new(runtime_session.workspace),
-        coordinator: Arc::new(DumpCoordinator::new()),
+        coordinator: Arc::new(DumpCoordinator::with_frozen_decision(
+            runtime_session.frozen_export_decision,
+        )),
         sample_rate: backend.sample_rate(),
         channel_names: backend.channel_names().to_vec(),
         output_dir: resolved_for_runtime.export_policy.output_dir.clone(),
@@ -1230,6 +1234,8 @@ fn persistence_response(
         DumpOutcome::Written {
             range,
             frames,
+            export_start_frame,
+            export_frames,
             losses,
             output_directory,
             files,
@@ -1242,6 +1248,8 @@ fn persistence_response(
                     start_frame: range.start,
                     end_frame: range.end,
                     frames,
+                    export_start_frame,
+                    export_frames,
                     duration_seconds: frames as f64 / f64::from(sample_rate),
                     lost_frames,
                     retention_lost_frames: losses.retention_lost_frames,
@@ -1262,6 +1270,27 @@ fn persistence_response(
             (
                 message,
                 PersistenceOutcomeResponse::SkippedSilent {
+                    start_frame: range.start,
+                    end_frame: range.end,
+                    frames,
+                    duration_seconds: frames as f64 / f64::from(sample_rate),
+                    lost_frames,
+                    retention_lost_frames: losses.retention_lost_frames,
+                    cleared_frames: losses.cleared_frames,
+                    capture_dropped_frames: losses.capture_dropped_frames,
+                },
+            )
+        }
+        DumpOutcome::SkippedByPolicy {
+            range,
+            frames,
+            losses,
+        } => {
+            let lost_frames = losses.lost_frames();
+            let message = persistence_message("skipped by policy", frames, lost_frames);
+            (
+                message,
+                PersistenceOutcomeResponse::SkippedByPolicy {
                     start_frame: range.start,
                     end_frame: range.end,
                     frames,
@@ -1400,7 +1429,9 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                             let session = Arc::new(CaptureSession {
                                 arena: Arc::new(runtime.arena),
                                 workspace: Mutex::new(runtime.workspace),
-                                coordinator: Arc::new(DumpCoordinator::new()),
+                                coordinator: Arc::new(DumpCoordinator::with_frozen_decision(
+                                    runtime.frozen_export_decision,
+                                )),
                                 sample_rate,
                                 channel_names: names,
                                 output_dir: output_dir.clone(),
@@ -1570,7 +1601,9 @@ mod tests {
         CaptureSession {
             arena: Arc::new(runtime.arena),
             workspace: Mutex::new(runtime.workspace),
-            coordinator: Arc::new(DumpCoordinator::new()),
+            coordinator: Arc::new(DumpCoordinator::with_frozen_decision(
+                runtime.frozen_export_decision,
+            )),
             sample_rate: 100,
             channel_names: vec!["mic".to_string()],
             output_dir: PathBuf::from("/tmp/out"),
@@ -1650,7 +1683,9 @@ mod tests {
         let session = Arc::new(CaptureSession {
             arena: Arc::new(runtime.arena),
             workspace: Mutex::new(runtime.workspace),
-            coordinator: Arc::new(DumpCoordinator::new()),
+            coordinator: Arc::new(DumpCoordinator::with_frozen_decision(
+                runtime.frozen_export_decision,
+            )),
             sample_rate: 100,
             channel_names: vec!["mic".to_string()],
             output_dir: PathBuf::from("/tmp/out"),

@@ -5,11 +5,18 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
+use lamb::activity::{
+    classify_frozen_epoch, ActivityDetectorKind, ChannelExportMode, DetectorWorkspace,
+    FrozenExportDecision,
+};
+use lamb::app_config::ActivityThresholdConfig;
 use lamb::capture_arena::{CaptureArena, CaptureIngress, CaptureRuntimeConfig};
 use lamb::dump::{
-    DumpCoordinator, DumpOutcome, FrameRange, LossBreakdown, PublishedOutput, SampleSnapshot,
+    DecisionPreparation, DumpCoordinator, DumpOutcome, FrameRange, LossBreakdown, PublishedOutput,
+    SampleSnapshot,
 };
 use lamb::error::{LambError, Result};
+use lamb::export_policy::{ChannelActivityPolicy, ResolvedActivityPolicy};
 use lamb::export_wav::{
     publish_dump, publish_prepared, publish_prepared_with_hook, DumpPublishRequest,
     PreparedPublication, PreparedPublicationHook, PublicationCheckpoint,
@@ -31,6 +38,7 @@ struct FrozenFixture {
     coordinator: DumpCoordinator,
     root: tempfile::TempDir,
     names: Vec<String>,
+    plan: SessionMemoryPlan,
 }
 
 impl FrozenFixture {
@@ -112,9 +120,12 @@ impl FrozenFixture {
             arena,
             ingress,
             workspace,
-            coordinator: DumpCoordinator::new(),
+            coordinator: DumpCoordinator::with_frozen_decision(
+                FrozenExportDecision::new(&plan).unwrap(),
+            ),
             root: tempfile::tempdir().unwrap(),
             names: vec!["mic".to_string()],
+            plan,
         }
     }
 
@@ -147,6 +158,25 @@ impl FrozenFixture {
             },
             DEADLINE,
         )
+    }
+}
+
+fn exact_zero_policy(mode: ChannelExportMode) -> ResolvedActivityPolicy {
+    ResolvedActivityPolicy {
+        detector: ActivityDetectorKind::ExactZero,
+        channels: vec![ChannelActivityPolicy {
+            name: "mic".to_string(),
+            mode,
+            threshold: Some(ActivityThresholdConfig {
+                threshold_dbfs: -3.0,
+                threshold_source: lamb::activity::ThresholdSource::Manual,
+                updated_at_unix_seconds: 0,
+                input_id: "test".to_string(),
+                calibration_id: None,
+            }),
+        }],
+        whole_export_exact_zero_gate: false,
+        trim_leading_silence: true,
     }
 }
 
@@ -429,6 +459,8 @@ fn incremental_dumps_write_each_frame_once_then_report_no_new_audio() {
         DumpOutcome::Written {
             range: FrameRange { start: 0, end: 3 },
             frames: 3,
+            export_start_frame: 0,
+            export_frames: 3,
             losses: LossBreakdown {
                 retention_lost_frames: 0,
                 cleared_frames: 0,
@@ -451,6 +483,8 @@ fn incremental_dumps_write_each_frame_once_then_report_no_new_audio() {
         DumpOutcome::Written {
             range: FrameRange { start: 3, end: 5 },
             frames: 2,
+            export_start_frame: 3,
+            export_frames: 2,
             losses: LossBreakdown {
                 retention_lost_frames: 0,
                 cleared_frames: 0,
@@ -828,7 +862,9 @@ fn concurrent_capture_never_omits_or_duplicates_handled_ranges() {
             }
             DumpOutcome::NoNewAudio { .. } if done.load(Ordering::Acquire) => break,
             DumpOutcome::NoNewAudio { .. } => thread::yield_now(),
-            DumpOutcome::SkippedSilent { .. } => panic!("writer only captures nonzero samples"),
+            DumpOutcome::SkippedSilent { .. } | DumpOutcome::SkippedByPolicy { .. } => {
+                panic!("writer only captures nonzero samples")
+            }
         }
     }
 
@@ -1021,6 +1057,386 @@ fn exact_silent_frozen_epoch_commits_without_publication() {
         fixture.dump_preallocated(TIMESTAMP_B).unwrap().range(),
         None
     );
+}
+
+#[test]
+fn retry_preserves_the_classified_frozen_decision_when_policy_changes() {
+    let mut fixture = FrozenFixture::new(8, 8, 4);
+    fixture.push(&[0.0, 0.75, 0.5]);
+    let first_policy = exact_zero_policy(ChannelExportMode::Always);
+    let changed_policy = exact_zero_policy(ChannelExportMode::Never);
+    assert_ne!(first_policy, changed_policy);
+    let mut detector = DetectorWorkspace::new(&fixture.plan).unwrap();
+    let mut first_decision = None;
+
+    let error = fixture
+        .coordinator
+        .persist_with_decision_preparation_and_publisher(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PrepareRequest::Dump {
+                output_parent: &fixture.root.path().join("dumps"),
+                timestamp: TIMESTAMP_A,
+                channel_names: &fixture.names,
+            },
+            DEADLINE,
+            DEADLINE,
+            |frozen, decision| {
+                assert!(!decision.valid());
+                classify_frozen_epoch(frozen, &first_policy, &mut detector, decision)?;
+                first_decision = Some((
+                    decision.export_range(),
+                    decision.channels().to_vec(),
+                    decision.storage_id(),
+                ));
+                Ok(DecisionPreparation::Continue)
+            },
+            |_| PreparedPublication::RetryableFailure(LambError::Export("retry".to_string())),
+        )
+        .unwrap_err();
+    assert!(matches!(error, LambError::Export(message) if message == "retry"));
+
+    let mut retry_decision = None;
+    let retry = fixture
+        .coordinator
+        .persist_with_decision_preparation_and_publisher(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PrepareRequest::Dump {
+                output_parent: &fixture.root.path().join("dumps"),
+                timestamp: TIMESTAMP_B,
+                channel_names: &fixture.names,
+            },
+            DEADLINE,
+            DEADLINE,
+            |_, decision| {
+                assert!(decision.valid());
+                retry_decision = Some((
+                    decision.export_range(),
+                    decision.channels().to_vec(),
+                    decision.storage_id(),
+                ));
+                // A changed retry policy must not classify an already frozen decision.
+                assert_eq!(changed_policy.channels[0].mode, ChannelExportMode::Never);
+                Ok(DecisionPreparation::Continue)
+            },
+            |_| PreparedPublication::Published(fake_publication("retry")),
+        )
+        .unwrap();
+
+    assert_eq!(retry.range(), Some(FrameRange { start: 0, end: 3 }));
+    assert_eq!(retry_decision, first_decision);
+}
+
+#[test]
+fn successful_completion_recycles_the_same_reset_decision_for_the_next_range() {
+    let mut fixture = FrozenFixture::new(8, 8, 4);
+    fixture.push(&[0.5]);
+    let mut first_storage = None;
+    fixture
+        .coordinator
+        .persist_with_decision_preparation_and_publisher(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PrepareRequest::Dump {
+                output_parent: &fixture.root.path().join("dumps"),
+                timestamp: TIMESTAMP_A,
+                channel_names: &fixture.names,
+            },
+            DEADLINE,
+            DEADLINE,
+            |frozen, decision| {
+                assert!(!decision.valid());
+                decision.finalize(
+                    frozen.absolute_range(),
+                    &[lamb::activity::FrozenChannelDecision::retained(
+                        ChannelExportMode::Always,
+                        lamb::activity::ActivityResult::Active,
+                        Some(frozen.absolute_range().start),
+                    )],
+                    false,
+                    false,
+                )?;
+                first_storage = Some((decision.storage_id(), decision.channels().len()));
+                Ok(DecisionPreparation::Continue)
+            },
+            |_| PreparedPublication::Published(fake_publication("first")),
+        )
+        .unwrap();
+
+    fixture.push(&[0.25]);
+    let mut second_storage = None;
+    let second = fixture
+        .coordinator
+        .persist_with_decision_preparation_and_publisher(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PrepareRequest::Dump {
+                output_parent: &fixture.root.path().join("dumps"),
+                timestamp: TIMESTAMP_B,
+                channel_names: &fixture.names,
+            },
+            DEADLINE,
+            DEADLINE,
+            |frozen, decision| {
+                assert!(!decision.valid());
+                assert_eq!(decision.export_range(), 0..0);
+                second_storage = Some((decision.storage_id(), decision.channels().len()));
+                decision.finalize(
+                    frozen.absolute_range(),
+                    &[lamb::activity::FrozenChannelDecision::retained(
+                        ChannelExportMode::Always,
+                        lamb::activity::ActivityResult::Active,
+                        Some(frozen.absolute_range().start),
+                    )],
+                    false,
+                    false,
+                )?;
+                Ok(DecisionPreparation::Continue)
+            },
+            |_| PreparedPublication::Published(fake_publication("second")),
+        )
+        .unwrap();
+
+    assert_eq!(second.range(), Some(FrameRange { start: 1, end: 2 }));
+    assert_eq!(second_storage, first_storage);
+}
+
+#[test]
+fn only_all_never_decisions_skip_by_policy_without_preparing_or_publishing() {
+    let mut fixture = FrozenFixture::new(8, 8, 4);
+    fixture.push(&[0.75]);
+    let publisher_called = AtomicBool::new(false);
+
+    let outcome = fixture
+        .coordinator
+        .persist_with_decision_preparation_and_publisher(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PrepareRequest::Dump {
+                output_parent: &fixture.root.path().join("dumps"),
+                timestamp: TIMESTAMP_A,
+                channel_names: &fixture.names,
+            },
+            DEADLINE,
+            DEADLINE,
+            |frozen, decision| {
+                decision.finalize(
+                    frozen.absolute_range(),
+                    &[lamb::activity::FrozenChannelDecision {
+                        mode: ChannelExportMode::Never,
+                        result: lamb::activity::ActivityResult::Inactive,
+                        disposition: lamb::activity::ChannelDisposition::Omit,
+                        first_evidence_frame: None,
+                    }],
+                    false,
+                    false,
+                )?;
+                Ok(DecisionPreparation::Continue)
+            },
+            |_| {
+                publisher_called.store(true, Ordering::Release);
+                PreparedPublication::Published(fake_publication("must-not-publish"))
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        DumpOutcome::SkippedByPolicy {
+            range: FrameRange { start: 0, end: 1 },
+            ..
+        }
+    ));
+    assert!(!publisher_called.load(Ordering::Acquire));
+}
+
+#[test]
+fn inactive_auto_decision_is_a_silent_skip_not_a_policy_skip() {
+    let mut fixture = FrozenFixture::new(8, 8, 4);
+    fixture.push(&[0.75]);
+    let publisher_called = AtomicBool::new(false);
+
+    let outcome = fixture
+        .coordinator
+        .persist_with_decision_preparation_and_publisher(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PrepareRequest::Dump {
+                output_parent: &fixture.root.path().join("dumps"),
+                timestamp: TIMESTAMP_A,
+                channel_names: &fixture.names,
+            },
+            DEADLINE,
+            DEADLINE,
+            |frozen, decision| {
+                decision.finalize(
+                    frozen.absolute_range(),
+                    &[lamb::activity::FrozenChannelDecision {
+                        mode: ChannelExportMode::Auto,
+                        result: lamb::activity::ActivityResult::Inactive,
+                        disposition: lamb::activity::ChannelDisposition::Omit,
+                        first_evidence_frame: None,
+                    }],
+                    false,
+                    false,
+                )?;
+                Ok(DecisionPreparation::SkippedSilent)
+            },
+            |_| {
+                publisher_called.store(true, Ordering::Release);
+                PreparedPublication::Published(fake_publication("must-not-publish"))
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        DumpOutcome::SkippedSilent {
+            range: FrameRange { start: 0, end: 1 },
+            ..
+        }
+    ));
+    assert!(!publisher_called.load(Ordering::Acquire));
+}
+
+#[test]
+fn never_plus_inactive_auto_decision_is_a_silent_skip_not_a_policy_skip() {
+    let plan = SessionMemoryPlan::calculate(SessionMemoryInputs {
+        retention_frames: 8,
+        channels: 2,
+        sample_rate: 48_000,
+        sample_format: SampleFormat::F32Le,
+        chunk_frames: 2,
+        max_active_snapshots: 1,
+        sample_bytes: 4,
+        split_when_over_bytes: 1_000_000,
+        control_queue_capacity: 2,
+        worker_stack_bytes: 64 * 1024,
+        capture_queue_slots: 8,
+        capture_slot_frames: 4,
+        capture_worker_stack_bytes: 256 * 1024,
+        io_buffer_bytes_per_channel: 4 * 1024,
+        maximum_path_bytes: 512,
+        headroom: 1.0,
+    })
+    .unwrap();
+    let (arena, ingress) = CaptureArena::new(
+        &plan,
+        CaptureRuntimeConfig {
+            ring: RingConfig {
+                channels: 2,
+                sample_rate: 48_000,
+                format: SampleFormat::F32Le,
+                chunk_frames: 2,
+                chunk_count: 4,
+                max_active_snapshots: 1,
+            },
+            queue_slots: 8,
+            slot_frames: 4,
+            sample_bytes: 4,
+            worker_stack_bytes: 256 * 1024,
+        },
+    )
+    .unwrap();
+    let mut workspace = PersistenceWorkspace::new(
+        &plan,
+        PersistenceWorkspaceConfig {
+            retention_frames: 8,
+            channels: 2,
+            sample_rate: 48_000,
+            sample_format: SampleFormat::F32Le,
+            chunk_frames: 2,
+            sample_bytes: 4,
+            split_when_over_bytes: 1_000_000,
+            io_buffer_bytes_per_channel: 4 * 1024,
+            maximum_path_bytes: 512,
+        },
+    )
+    .unwrap();
+    ingress.try_push_interleaved(&[0.75, 0.5], 2).unwrap();
+    let coordinator =
+        DumpCoordinator::with_frozen_decision(FrozenExportDecision::new(&plan).unwrap());
+    let publisher_called = AtomicBool::new(false);
+    let root = tempfile::tempdir().unwrap();
+    let names = vec!["never".to_string(), "auto".to_string()];
+
+    let outcome = coordinator
+        .persist_with_decision_preparation_and_publisher(
+            &arena,
+            &mut workspace,
+            PrepareRequest::Dump {
+                output_parent: &root.path().join("dumps"),
+                timestamp: TIMESTAMP_A,
+                channel_names: &names,
+            },
+            DEADLINE,
+            DEADLINE,
+            |frozen, decision| {
+                decision.finalize(
+                    frozen.absolute_range(),
+                    &[
+                        lamb::activity::FrozenChannelDecision {
+                            mode: ChannelExportMode::Never,
+                            result: lamb::activity::ActivityResult::Inactive,
+                            disposition: lamb::activity::ChannelDisposition::Omit,
+                            first_evidence_frame: None,
+                        },
+                        lamb::activity::FrozenChannelDecision {
+                            mode: ChannelExportMode::Auto,
+                            result: lamb::activity::ActivityResult::Inactive,
+                            disposition: lamb::activity::ChannelDisposition::Omit,
+                            first_evidence_frame: None,
+                        },
+                    ],
+                    false,
+                    false,
+                )?;
+                Ok(DecisionPreparation::SkippedSilent)
+            },
+            |_| {
+                publisher_called.store(true, Ordering::Release);
+                PreparedPublication::Published(fake_publication("must-not-publish"))
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        DumpOutcome::SkippedSilent {
+            range: FrameRange { start: 0, end: 1 },
+            ..
+        }
+    ));
+    assert!(!publisher_called.load(Ordering::Acquire));
+}
+
+#[test]
+fn decisionless_persistence_rejects_before_freezing_and_preserves_audio_for_a_planned_coordinator()
+{
+    let mut fixture = FrozenFixture::new(8, 8, 4);
+    fixture.push(&[0.75]);
+    let decisionless = DumpCoordinator::new();
+    let error = decisionless
+        .persist(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PrepareRequest::Dump {
+                output_parent: &fixture.root.path().join("dumps"),
+                timestamp: TIMESTAMP_A,
+                channel_names: &fixture.names,
+            },
+            DEADLINE,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        LambError::ControlInvariant("persistence coordinator has no reusable frozen decision")
+    ));
+    assert!(!fixture.arena.status(DEADLINE).unwrap().frozen_pending);
+
+    let recovered = fixture.dump_preallocated(TIMESTAMP_B).unwrap();
+    assert_eq!(recovered.range(), Some(FrameRange { start: 0, end: 1 }));
 }
 
 #[test]
@@ -1389,6 +1805,7 @@ fn capture_drops_during_blocked_publication_belong_to_successful_outcome_once() 
         coordinator,
         root,
         names,
+        ..
     } = fixture;
     let publisher_entered = Arc::new(Barrier::new(2));
     let capture_finished = Arc::new(Barrier::new(2));

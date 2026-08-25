@@ -31,13 +31,15 @@ pub struct ControlResponse {
     pub persistence_outcome: Option<PersistenceOutcomeResponse>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PersistenceOutcomeResponse {
     Written {
         start_frame: u64,
         end_frame: u64,
         frames: u64,
+        export_start_frame: u64,
+        export_frames: u64,
         duration_seconds: f64,
         lost_frames: u64,
         #[serde(default)]
@@ -62,6 +64,19 @@ pub enum PersistenceOutcomeResponse {
         #[serde(default)]
         capture_dropped_frames: u64,
     },
+    SkippedByPolicy {
+        start_frame: u64,
+        end_frame: u64,
+        frames: u64,
+        duration_seconds: f64,
+        lost_frames: u64,
+        #[serde(default)]
+        retention_lost_frames: u64,
+        #[serde(default)]
+        cleared_frames: u64,
+        #[serde(default)]
+        capture_dropped_frames: u64,
+    },
     NoNewAudio {
         #[serde(default)]
         lost_frames: u64,
@@ -72,6 +87,154 @@ pub enum PersistenceOutcomeResponse {
         #[serde(default)]
         capture_dropped_frames: u64,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PersistenceOutcomeResponseWire {
+    Written {
+        start_frame: u64,
+        end_frame: u64,
+        frames: u64,
+        #[serde(default)]
+        export_start_frame: Option<u64>,
+        #[serde(default)]
+        export_frames: Option<u64>,
+        duration_seconds: f64,
+        lost_frames: u64,
+        #[serde(default)]
+        retention_lost_frames: u64,
+        #[serde(default)]
+        cleared_frames: u64,
+        #[serde(default)]
+        capture_dropped_frames: u64,
+        output_directory: PathBuf,
+        files: Vec<PathBuf>,
+    },
+    SkippedSilent {
+        start_frame: u64,
+        end_frame: u64,
+        frames: u64,
+        duration_seconds: f64,
+        lost_frames: u64,
+        #[serde(default)]
+        retention_lost_frames: u64,
+        #[serde(default)]
+        cleared_frames: u64,
+        #[serde(default)]
+        capture_dropped_frames: u64,
+    },
+    SkippedByPolicy {
+        start_frame: u64,
+        end_frame: u64,
+        frames: u64,
+        duration_seconds: f64,
+        lost_frames: u64,
+        #[serde(default)]
+        retention_lost_frames: u64,
+        #[serde(default)]
+        cleared_frames: u64,
+        #[serde(default)]
+        capture_dropped_frames: u64,
+    },
+    NoNewAudio {
+        #[serde(default)]
+        lost_frames: u64,
+        #[serde(default)]
+        retention_lost_frames: u64,
+        #[serde(default)]
+        cleared_frames: u64,
+        #[serde(default)]
+        capture_dropped_frames: u64,
+    },
+}
+
+impl<'de> Deserialize<'de> for PersistenceOutcomeResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(
+            match PersistenceOutcomeResponseWire::deserialize(deserializer)? {
+                PersistenceOutcomeResponseWire::Written {
+                    start_frame,
+                    end_frame,
+                    frames,
+                    export_start_frame,
+                    export_frames,
+                    duration_seconds,
+                    lost_frames,
+                    retention_lost_frames,
+                    cleared_frames,
+                    capture_dropped_frames,
+                    output_directory,
+                    files,
+                } => Self::Written {
+                    start_frame,
+                    end_frame,
+                    frames,
+                    export_start_frame: export_start_frame.unwrap_or(start_frame),
+                    export_frames: export_frames
+                        .unwrap_or_else(|| end_frame.saturating_sub(start_frame)),
+                    duration_seconds,
+                    lost_frames,
+                    retention_lost_frames,
+                    cleared_frames,
+                    capture_dropped_frames,
+                    output_directory,
+                    files,
+                },
+                PersistenceOutcomeResponseWire::SkippedSilent {
+                    start_frame,
+                    end_frame,
+                    frames,
+                    duration_seconds,
+                    lost_frames,
+                    retention_lost_frames,
+                    cleared_frames,
+                    capture_dropped_frames,
+                } => Self::SkippedSilent {
+                    start_frame,
+                    end_frame,
+                    frames,
+                    duration_seconds,
+                    lost_frames,
+                    retention_lost_frames,
+                    cleared_frames,
+                    capture_dropped_frames,
+                },
+                PersistenceOutcomeResponseWire::SkippedByPolicy {
+                    start_frame,
+                    end_frame,
+                    frames,
+                    duration_seconds,
+                    lost_frames,
+                    retention_lost_frames,
+                    cleared_frames,
+                    capture_dropped_frames,
+                } => Self::SkippedByPolicy {
+                    start_frame,
+                    end_frame,
+                    frames,
+                    duration_seconds,
+                    lost_frames,
+                    retention_lost_frames,
+                    cleared_frames,
+                    capture_dropped_frames,
+                },
+                PersistenceOutcomeResponseWire::NoNewAudio {
+                    lost_frames,
+                    retention_lost_frames,
+                    cleared_frames,
+                    capture_dropped_frames,
+                } => Self::NoNewAudio {
+                    lost_frames,
+                    retention_lost_frames,
+                    cleared_frames,
+                    capture_dropped_frames,
+                },
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -183,6 +346,8 @@ fn format_persistence_outcome(outcome: &PersistenceOutcomeResponse) -> String {
             start_frame,
             end_frame,
             frames,
+            export_start_frame: _,
+            export_frames: _,
             duration_seconds,
             lost_frames,
             retention_lost_frames,
@@ -220,6 +385,31 @@ fn format_persistence_outcome(outcome: &PersistenceOutcomeResponse) -> String {
         } => {
             let mut lines = vec![format!(
                 "skipped exact-zero audio: {frames} frames ({duration_seconds:.3} seconds), source frames {start_frame}..{end_frame}"
+            )];
+            if *lost_frames > 0 {
+                lines.push(format!(
+                    "warning: {lost_frames} frames were lost before persistence ({})",
+                    format_loss_causes(
+                        *retention_lost_frames,
+                        *cleared_frames,
+                        *capture_dropped_frames
+                    )
+                ));
+            }
+            lines.join("\n")
+        }
+        PersistenceOutcomeResponse::SkippedByPolicy {
+            start_frame,
+            end_frame,
+            frames,
+            duration_seconds,
+            lost_frames,
+            retention_lost_frames,
+            cleared_frames,
+            capture_dropped_frames,
+        } => {
+            let mut lines = vec![format!(
+                "skipped by policy: {frames} frames ({duration_seconds:.3} seconds), source frames {start_frame}..{end_frame}"
             )];
             if *lost_frames > 0 {
                 lines.push(format!(
@@ -293,6 +483,8 @@ mod tests {
             start_frame: 100,
             end_frame: 350,
             frames: 250,
+            export_start_frame: 100,
+            export_frames: 250,
             duration_seconds: 2.5,
             lost_frames: 25,
             retention_lost_frames: 25,
@@ -323,6 +515,8 @@ mod tests {
             start_frame: 0,
             end_frame: 100,
             frames: 100,
+            export_start_frame: 0,
+            export_frames: 100,
             duration_seconds: 1.0,
             lost_frames: 30,
             retention_lost_frames: 10,
@@ -387,6 +581,79 @@ mod tests {
                 capture_dropped_frames: 0,
             }),
             "no new audio"
+        );
+    }
+
+    #[test]
+    fn persistence_outcomes_round_trip_policy_skip_and_written_export_range() {
+        let skipped = PersistenceOutcomeResponse::SkippedByPolicy {
+            start_frame: 100,
+            end_frame: 250,
+            frames: 150,
+            duration_seconds: 1.5,
+            lost_frames: 0,
+            retention_lost_frames: 0,
+            cleared_frames: 0,
+            capture_dropped_frames: 0,
+        };
+        assert_eq!(
+            serde_json::from_str::<PersistenceOutcomeResponse>(
+                &serde_json::to_string(&skipped).unwrap()
+            )
+            .unwrap(),
+            skipped
+        );
+
+        let written = PersistenceOutcomeResponse::Written {
+            start_frame: 100,
+            end_frame: 250,
+            frames: 150,
+            export_start_frame: 120,
+            export_frames: 130,
+            duration_seconds: 1.5,
+            lost_frames: 0,
+            retention_lost_frames: 0,
+            cleared_frames: 0,
+            capture_dropped_frames: 0,
+            output_directory: PathBuf::from("/tmp/out"),
+            files: vec![],
+        };
+        let PersistenceOutcomeResponse::Written {
+            start_frame,
+            end_frame,
+            export_start_frame,
+            export_frames,
+            ..
+        } = serde_json::from_str::<PersistenceOutcomeResponse>(
+            &serde_json::to_string(&written).unwrap(),
+        )
+        .unwrap()
+        else {
+            panic!("written response must round-trip");
+        };
+        assert!(export_start_frame >= start_frame);
+        assert_eq!(export_start_frame + export_frames, end_frame);
+    }
+
+    #[test]
+    fn old_written_json_defaults_export_range_to_the_consumed_range() {
+        let old = r#"{"kind":"written","start_frame":100,"end_frame":250,"frames":150,"duration_seconds":1.5,"lost_frames":0,"output_directory":"/tmp/out","files":[]}"#;
+        assert_eq!(
+            serde_json::from_str::<PersistenceOutcomeResponse>(old).unwrap(),
+            PersistenceOutcomeResponse::Written {
+                start_frame: 100,
+                end_frame: 250,
+                frames: 150,
+                export_start_frame: 100,
+                export_frames: 150,
+                duration_seconds: 1.5,
+                lost_frames: 0,
+                retention_lost_frames: 0,
+                cleared_frames: 0,
+                capture_dropped_frames: 0,
+                output_directory: PathBuf::from("/tmp/out"),
+                files: vec![],
+            }
         );
     }
 }

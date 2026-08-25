@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::activity::FrozenExportDecision;
 use crate::capture_arena::{
     CaptureArena, CaptureClearAccounting, CaptureClearRecovery, FrozenCaptureEpoch,
 };
@@ -28,16 +29,29 @@ pub struct PublishedOutput {
     pub files: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionPreparation {
+    Continue,
+    SkippedSilent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DumpOutcome {
     Written {
         range: FrameRange,
         frames: u64,
+        export_start_frame: u64,
+        export_frames: u64,
         losses: LossBreakdown,
         output_directory: PathBuf,
         files: Vec<PathBuf>,
     },
     SkippedSilent {
+        range: FrameRange,
+        frames: u64,
+        losses: LossBreakdown,
+    },
+    SkippedByPolicy {
         range: FrameRange,
         frames: u64,
         losses: LossBreakdown,
@@ -67,13 +81,16 @@ impl DumpOutcome {
         match self {
             Self::Written { losses, .. }
             | Self::SkippedSilent { losses, .. }
+            | Self::SkippedByPolicy { losses, .. }
             | Self::NoNewAudio { losses } => *losses,
         }
     }
 
     pub fn range(&self) -> Option<FrameRange> {
         match self {
-            Self::Written { range, .. } | Self::SkippedSilent { range, .. } => Some(*range),
+            Self::Written { range, .. }
+            | Self::SkippedSilent { range, .. }
+            | Self::SkippedByPolicy { range, .. } => Some(*range),
             Self::NoNewAudio { .. } => None,
         }
     }
@@ -82,6 +99,7 @@ impl DumpOutcome {
 struct FrozenTransaction {
     frozen: FrozenCaptureEpoch,
     retention_lost_frames: u64,
+    decision: FrozenExportDecision,
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +125,7 @@ struct DumpState {
     bound_runtime_id: Option<u64>,
     committed_until: Option<u64>,
     frozen: Option<FrozenTransaction>,
+    reusable_decision: Option<FrozenExportDecision>,
     pending_clear: Option<PendingClear>,
     pending_release: Option<FrozenCaptureEpoch>,
     indeterminate_publication: Option<IndeterminatePublication>,
@@ -132,6 +151,17 @@ impl DumpCoordinator {
             id,
             state: Mutex::new(DumpState::default()),
         }
+    }
+
+    /// Constructs a persistence-capable coordinator with one decision allocated at session startup.
+    pub fn with_frozen_decision(decision: FrozenExportDecision) -> Self {
+        let mut coordinator = Self::new();
+        coordinator
+            .state
+            .get_mut()
+            .expect("new dump coordinator state is not poisoned")
+            .reusable_decision = Some(decision);
+        coordinator
     }
 
     pub fn dump<F>(&self, ring: &SampleRing, publisher: F) -> Result<DumpOutcome>
@@ -183,6 +213,8 @@ impl DumpCoordinator {
         Ok(DumpOutcome::Written {
             range,
             frames,
+            export_start_frame: range.start,
+            export_frames: frames,
             losses: LossBreakdown {
                 retention_lost_frames: lost_frames,
                 ..LossBreakdown::default()
@@ -239,6 +271,32 @@ impl DumpCoordinator {
     where
         F: FnOnce(PreparedPersistence<'_>) -> PreparedPublication,
     {
+        self.persist_with_decision_preparation_and_publisher(
+            arena,
+            workspace,
+            request,
+            timeout,
+            release_timeout,
+            |_, _| Ok(DecisionPreparation::Continue),
+            publisher,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // preserves the existing publisher seam while adding preparation.
+    pub fn persist_with_decision_preparation_and_publisher<P, F>(
+        &self,
+        arena: &CaptureArena,
+        workspace: &mut PersistenceWorkspace,
+        request: PrepareRequest<'_>,
+        timeout: Duration,
+        release_timeout: Duration,
+        prepare_decision: P,
+        publisher: F,
+    ) -> Result<DumpOutcome>
+    where
+        P: FnOnce(&FrozenCaptureEpoch, &mut FrozenExportDecision) -> Result<DecisionPreparation>,
+        F: FnOnce(PreparedPersistence<'_>) -> PreparedPublication,
+    {
         let mut state = self.lock_state()?;
         Self::bind_arena(&mut state, arena)?;
         Self::recover_pending_clear(&mut state, self.id, arena, timeout)?;
@@ -273,13 +331,23 @@ impl DumpCoordinator {
                 .frozen
                 .take()
                 .expect("prevalidated recovered publication retains its frozen transaction");
+            let export_range = if transaction.decision.valid() {
+                transaction.decision.export_range()
+            } else {
+                range.start..range.end
+            };
             let outcome = DumpOutcome::Written {
                 range,
                 frames: range.end - range.start,
+                export_start_frame: export_range.start,
+                export_frames: export_range.end - export_range.start,
                 losses,
                 output_directory: published.output_directory,
                 files: published.files,
             };
+            let mut decision = transaction.decision;
+            decision.reset();
+            state.reusable_decision = Some(decision);
             let mut frozen = transaction.frozen;
             if arena.release_frozen(&mut frozen, release_timeout).is_err() {
                 state.pending_release = Some(frozen);
@@ -288,6 +356,11 @@ impl DumpCoordinator {
         }
         Self::recover_pending_release(&mut state, arena, timeout)?;
 
+        if state.frozen.is_none() && state.reusable_decision.is_none() {
+            return Err(LambError::ControlInvariant(
+                "persistence coordinator has no reusable frozen decision",
+            ));
+        }
         if state.frozen.is_none() {
             let Some(frozen) = arena.freeze_since(state.committed_until, timeout)? else {
                 let cumulative = arena.cumulative_capture_dropped_frames();
@@ -300,24 +373,72 @@ impl DumpCoordinator {
             state.frozen = Some(FrozenTransaction {
                 frozen,
                 retention_lost_frames,
+                decision: state
+                    .reusable_decision
+                    .take()
+                    .ok_or(LambError::ControlInvariant(
+                        "persistence coordinator has no reusable frozen decision",
+                    ))?,
             });
         }
 
-        let transaction = state.frozen.as_ref().ok_or(LambError::ControlInvariant(
-            "frozen transaction disappeared",
-        ))?;
-        let range = FrameRange {
-            start: transaction.frozen.absolute_range().start,
-            end: transaction.frozen.absolute_range().end,
+        let (
+            range,
+            retention_lost_frames,
+            decision_export_range,
+            skipped_by_policy,
+            skipped_silent,
+        ) = {
+            let transaction = state.frozen.as_mut().ok_or(LambError::ControlInvariant(
+                "frozen transaction disappeared",
+            ))?;
+            let range = FrameRange {
+                start: transaction.frozen.absolute_range().start,
+                end: transaction.frozen.absolute_range().end,
+            };
+            let retention_lost_frames = transaction.retention_lost_frames;
+            let preparation = prepare_decision(&transaction.frozen, &mut transaction.decision)?;
+            let decision_export_range = if transaction.decision.valid() {
+                transaction.decision.export_range()
+            } else {
+                range.start..range.end
+            };
+            if decision_export_range.start < range.start
+                || decision_export_range.end != range.end
+                || decision_export_range.start > decision_export_range.end
+            {
+                return Err(LambError::ExportInvariant(
+                    "frozen export range is outside the consumed range",
+                ));
+            }
+            let skipped_by_policy = transaction.decision.valid()
+                && transaction
+                    .decision
+                    .channels()
+                    .iter()
+                    .all(|channel| channel.mode == crate::activity::ChannelExportMode::Never);
+            let skipped_silent = preparation == DecisionPreparation::SkippedSilent;
+            (
+                range,
+                retention_lost_frames,
+                decision_export_range,
+                skipped_by_policy,
+                skipped_silent,
+            )
         };
-        let retention_lost_frames = transaction.retention_lost_frames;
         let cumulative_before_preparation = arena.cumulative_capture_dropped_frames();
         let loss_commit = Self::prevalidate_loss_commit(
             &state,
             cumulative_before_preparation,
             retention_lost_frames,
         )?;
-        let published = {
+        let published = if skipped_by_policy || skipped_silent {
+            None
+        } else {
+            let transaction = state
+                .frozen
+                .as_ref()
+                .expect("frozen transaction remains prepared");
             let prepared = workspace.prepare(&transaction.frozen, request)?;
             match prepared {
                 PreparedPersistence::Silent => None,
@@ -345,9 +466,16 @@ impl DumpCoordinator {
             Some(published) => DumpOutcome::Written {
                 range,
                 frames,
+                export_start_frame: decision_export_range.start,
+                export_frames: decision_export_range.end - decision_export_range.start,
                 losses,
                 output_directory: published.output_directory,
                 files: published.files,
+            },
+            None if skipped_by_policy => DumpOutcome::SkippedByPolicy {
+                range,
+                frames,
+                losses,
             },
             None => DumpOutcome::SkippedSilent {
                 range,
@@ -358,6 +486,9 @@ impl DumpCoordinator {
 
         workspace.finish_completed_publication();
 
+        let mut decision = transaction.decision;
+        decision.reset();
+        state.reusable_decision = Some(decision);
         let mut frozen = transaction.frozen;
         if arena.release_frozen(&mut frozen, release_timeout).is_err() {
             state.pending_release = Some(frozen);
@@ -620,6 +751,9 @@ impl DumpCoordinator {
                 .frozen
                 .take()
                 .expect("validated pending clear retains its frozen capability");
+            let mut decision = transaction.decision;
+            decision.reset();
+            state.reusable_decision = Some(decision);
             state.pending_release = Some(transaction.frozen);
         }
         state.pending_clear = None;
@@ -837,6 +971,7 @@ mod coordinator_review_tests {
             state.frozen = Some(FrozenTransaction {
                 retention_lost_frames: 0,
                 frozen,
+                decision: FrozenExportDecision::new(&runtime(8, 8, 4).2).unwrap(),
             });
             state.pending_cleared_frames = u64::MAX;
         }
@@ -870,7 +1005,9 @@ mod coordinator_review_tests {
     fn status_stashes_timed_out_clear_and_persist_commits_it_once_before_freeze() {
         let (arena, ingress, plan) = runtime(2, 1, 4);
         let arena = Arc::new(arena);
-        let coordinator = Arc::new(DumpCoordinator::new());
+        let coordinator = Arc::new(DumpCoordinator::with_frozen_decision(
+            FrozenExportDecision::new(&plan).unwrap(),
+        ));
         let mut workspace = workspace(&plan, 2);
         let root = tempfile::tempdir().unwrap();
         let names = vec!["mic".to_string()];

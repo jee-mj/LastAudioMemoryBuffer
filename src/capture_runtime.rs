@@ -1,3 +1,4 @@
+use crate::activity::FrozenExportDecision;
 use crate::capture_arena::{CaptureArena, CaptureIngress, CaptureRuntimeConfig};
 use crate::error::{LambError, Result};
 use crate::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
@@ -35,6 +36,7 @@ pub const DEFAULT_MAXIMUM_PATH_BYTES: u64 = 4096;
 pub struct CaptureRuntime {
     pub arena: CaptureArena,
     pub workspace: PersistenceWorkspace,
+    pub frozen_export_decision: FrozenExportDecision,
 }
 
 impl CaptureRuntime {
@@ -102,6 +104,14 @@ impl CaptureRuntime {
                 maximum_path_bytes: params.maximum_path_bytes,
             },
         )?;
-        Ok((Self { arena, workspace }, ingress))
+        let frozen_export_decision = FrozenExportDecision::new(&plan)?;
+        Ok((
+            Self {
+                arena,
+                workspace,
+                frozen_export_decision,
+            },
+            ingress,
+        ))
     }
 }

@@ -8,6 +8,7 @@ use crate::memory_plan::{
 use serde::{Deserialize, Serialize};
 use std::mem::size_of;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -93,7 +94,10 @@ pub struct FrozenExportDecision {
     export_range: Range<u64>,
     sample_rate: u32,
     valid: bool,
+    storage_id: u64,
 }
+
+static NEXT_FROZEN_EXPORT_DECISION_STORAGE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl FrozenExportDecision {
     pub fn new(plan: &SessionMemoryPlan) -> Result<Self> {
@@ -104,6 +108,7 @@ impl FrozenExportDecision {
             export_range: 0..0,
             sample_rate: plan.sample_rate(),
             valid: false,
+            storage_id: NEXT_FROZEN_EXPORT_DECISION_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -115,6 +120,20 @@ impl FrozenExportDecision {
     }
     pub fn channels(&self) -> &[FrozenChannelDecision] {
         self.channels.as_slice()
+    }
+
+    /// Returns a stable allocation identity without exposing the backing storage.
+    pub fn storage_id(&self) -> u64 {
+        self.storage_id
+    }
+
+    /// Recycles this preallocated decision after its frozen transaction completes.
+    pub(crate) fn reset(&mut self) {
+        for channel in self.channels.as_mut_slice() {
+            *channel = FrozenChannelDecision::empty();
+        }
+        self.export_range = 0..0;
+        self.valid = false;
     }
 
     pub fn finalize(
