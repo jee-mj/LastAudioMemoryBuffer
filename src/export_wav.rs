@@ -11,18 +11,16 @@ use crate::recovery::{
 };
 use crate::sample_ring::Snapshot;
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(target_os = "linux")]
-use std::ffi::CString;
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 
 static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -30,6 +28,269 @@ static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(0);
 struct FileIdentity {
     device: u64,
     inode: u64,
+}
+
+struct TrustedFileSetRoot {
+    anchor_path: PathBuf,
+    anchor_identity: FileIdentity,
+    output: File,
+    output_identity: FileIdentity,
+    output_path: PathBuf,
+}
+
+impl TrustedFileSetRoot {
+    fn open(output_path: &Path) -> Result<Self> {
+        if !output_path.is_absolute() {
+            return Err(LambError::Validation(
+                "file-set output root must be absolute".to_string(),
+            ));
+        }
+        let mut directory = open_absolute_root(output_path)?;
+        let mut anchor_path = PathBuf::from("/");
+        let mut output_relative = PathBuf::new();
+        let mut missing = false;
+        for component in output_path.components() {
+            match component {
+                Component::RootDir => continue,
+                Component::Normal(name) if missing => output_relative.push(name),
+                Component::Normal(name) => match open_directory_at(&directory, name) {
+                    Ok(next) => {
+                        directory = next;
+                        anchor_path.push(name);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        missing = true;
+                        output_relative.push(name);
+                    }
+                    Err(source) => return Err(io_error(output_path, source)),
+                },
+                _ => {
+                    return Err(LambError::Validation(
+                        "file-set output root is not a normalized absolute path".to_string(),
+                    ))
+                }
+            }
+        }
+        let anchor_metadata = directory
+            .metadata()
+            .map_err(|source| io_error(&anchor_path, source))?;
+        for component in output_relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(LambError::ExportInvariant(
+                    "trusted output root contains a non-normal component",
+                ));
+            };
+            directory = match open_directory_at(&directory, name) {
+                Ok(next) => next,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    mkdir_at(&directory, name, output_path)?;
+                    open_directory_at(&directory, name)
+                        .map_err(|source| io_error(output_path, source))?
+                }
+                Err(source) => return Err(io_error(output_path, source)),
+            };
+        }
+        let output_metadata = directory
+            .metadata()
+            .map_err(|source| io_error(output_path, source))?;
+        Ok(Self {
+            anchor_path,
+            anchor_identity: FileIdentity {
+                device: anchor_metadata.dev(),
+                inode: anchor_metadata.ino(),
+            },
+            output: directory,
+            output_identity: FileIdentity {
+                device: output_metadata.dev(),
+                inode: output_metadata.ino(),
+            },
+            output_path: output_path.to_path_buf(),
+        })
+    }
+
+    fn verify(&self) -> Result<()> {
+        let reopened = open_existing_absolute_directory(&self.anchor_path)?;
+        let metadata = reopened
+            .metadata()
+            .map_err(|source| io_error(&self.anchor_path, source))?;
+        if metadata.dev() != self.anchor_identity.device
+            || metadata.ino() != self.anchor_identity.inode
+        {
+            return Err(LambError::ExportInvariant(
+                "file-set output anchor identity changed during publication",
+            ));
+        }
+        let output = open_existing_absolute_directory(&self.output_path)?;
+        let metadata = output
+            .metadata()
+            .map_err(|source| io_error(&self.output_path, source))?;
+        if metadata.dev() != self.output_identity.device
+            || metadata.ino() != self.output_identity.inode
+        {
+            return Err(LambError::ExportInvariant(
+                "configured file-set output root identity changed during publication",
+            ));
+        }
+        Ok(())
+    }
+
+    fn output_root(&self) -> Result<File> {
+        self.verify()?;
+        self.output
+            .try_clone()
+            .map_err(|source| io_error(&self.output_path, source))
+    }
+
+    fn open_relative_directory(&self, relative: &Path) -> Result<File> {
+        let mut directory = self.output_root()?;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(LambError::ExportInvariant(
+                    "file-set relative directory contains a non-normal component",
+                ));
+            };
+            directory = open_directory_at(&directory, name)
+                .map_err(|source| io_error(&self.output_path, source))?;
+        }
+        Ok(directory)
+    }
+
+    fn materialize_directory_slot(&self, relative: &Path) -> Result<(File, bool)> {
+        let name = relative.file_name().ok_or(LambError::ExportInvariant(
+            "file-set directory intent has no final component",
+        ))?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let parent_directory = self.open_relative_directory(parent)?;
+        match open_directory_at(&parent_directory, name) {
+            Ok(directory) => Ok((directory, false)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                mkdir_at(&parent_directory, name, &self.output_path)?;
+                let directory = open_directory_at(&parent_directory, name)
+                    .map_err(|source| io_error(&self.output_path, source))?;
+                Ok((directory, true))
+            }
+            Err(source) => Err(io_error(&self.output_path, source)),
+        }
+    }
+}
+
+fn open_absolute_root(path: &Path) -> Result<File> {
+    let root = CString::new("/").expect("root path has no NUL");
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(io_error(path, io::Error::last_os_error()))
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn open_existing_absolute_directory(path: &Path) -> Result<File> {
+    let mut directory = open_absolute_root(path)?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                directory =
+                    open_directory_at(&directory, name).map_err(|source| io_error(path, source))?;
+            }
+            _ => {
+                return Err(LambError::Validation(
+                    "absolute directory path is not normalized".to_string(),
+                ))
+            }
+        }
+    }
+    Ok(directory)
+}
+
+fn component_cstring(name: &std::ffi::OsStr) -> io::Result<CString> {
+    CString::new(name.as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn open_directory_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+    let name = component_cstring(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn mkdir_at(parent: &File, name: &std::ffi::OsStr, error_path: &Path) -> Result<()> {
+    let name = component_cstring(name).map_err(|source| io_error(error_path, source))?;
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o777) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_error(error_path, io::Error::last_os_error()))
+    }
+}
+
+fn create_new_file_at(parent: &File, name: &std::ffi::OsStr, error_path: &Path) -> Result<File> {
+    let name = component_cstring(name).map_err(|source| io_error(error_path, source))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666,
+        )
+    };
+    if fd < 0 {
+        Err(io_error(error_path, io::Error::last_os_error()))
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace_at(
+    parent: &File,
+    old_name: &std::ffi::OsStr,
+    new_name: &std::ffi::OsStr,
+    error_path: &Path,
+) -> Result<()> {
+    let old_name = component_cstring(old_name).map_err(|source| io_error(error_path, source))?;
+    let new_name = component_cstring(new_name).map_err(|source| io_error(error_path, source))?;
+    let result = unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            old_name.as_ptr(),
+            parent.as_raw_fd(),
+            new_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_error(error_path, io::Error::last_os_error()))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_no_replace_at(
+    _parent: &File,
+    _old_name: &std::ffi::OsStr,
+    _new_name: &std::ffi::OsStr,
+    _error_path: &Path,
+) -> Result<()> {
+    Err(LambError::Export(
+        "atomic no-overwrite publication requires Linux renameat2".to_string(),
+    ))
 }
 
 #[derive(Clone)]
@@ -517,6 +778,8 @@ fn publish_recall_inner(
     output_directory: &Path,
     staging_identity: (u64, u64),
 ) -> std::result::Result<PublishedOutput, RecallPublishError> {
+    let trusted_root =
+        TrustedFileSetRoot::open(output_directory).map_err(RecallPublishError::retryable)?;
     let mut manifest = TransactionManifest::new_with_directories(slots, directories, path_bytes);
     manifest.version = MANIFEST_VERSION;
     manifest.uid = unsafe { libc::geteuid() };
@@ -589,8 +852,14 @@ fn publish_recall_inner(
     // manifest records every absent candidate as an identity-unknown intent;
     // a crash before identity capture is consequently conservative.
     for (entry_index, (_, final_path)) in planned.iter().enumerate() {
-        register_file_set_parent_intents(&mut manifest, output_directory, entry_index, final_path)
-            .map_err(RecallPublishError::retryable)?;
+        register_file_set_parent_intents(
+            &mut manifest,
+            &trusted_root,
+            output_directory,
+            entry_index,
+            final_path,
+        )
+        .map_err(RecallPublishError::retryable)?;
     }
     let manifest_path = staging_directory.join(RECALL_MANIFEST_NAME);
     persist_manifest(&mut *serialization, &manifest_path, &manifest, hook)
@@ -602,9 +871,18 @@ fn publish_recall_inner(
             created_finals: Vec::new(),
             partials: Vec::new(),
         })?;
+    trusted_root
+        .verify()
+        .map_err(|operation| RecallPublishError {
+            operation,
+            durable_failure: true,
+            created_finals: Vec::new(),
+            partials: Vec::new(),
+        })?;
 
     if let Err(operation) = materialize_file_set_parents(
         &mut manifest,
+        &trusted_root,
         output_directory,
         &manifest_path,
         serialization,
@@ -621,6 +899,7 @@ fn publish_recall_inner(
     let mut durable_failure = false;
     let mut partials = Vec::with_capacity(planned.len());
     let mut created_finals = Vec::with_capacity(planned.len());
+    let mut created_final_files = Vec::with_capacity(planned.len());
     let publication = (|| {
         for (index, (staged_path, final_path)) in planned.iter().enumerate() {
             manifest.phase = ManifestPhase::Publishing { index };
@@ -628,13 +907,23 @@ fn publish_recall_inner(
             let partial_path = manifest
                 .path(manifest.entry(index).partial_path)
                 .to_path_buf();
+            let final_parent = final_path.parent().ok_or(LambError::ExportInvariant(
+                "prepared file-set final path has no parent",
+            ))?;
+            let relative_parent = final_parent.strip_prefix(output_directory).map_err(|_| {
+                LambError::Validation("file-set final path escapes output root".to_string())
+            })?;
+            trusted_root.verify()?;
+            let parent_directory = trusted_root.open_relative_directory(relative_parent)?;
+            let partial_name = partial_path.file_name().ok_or(LambError::ExportInvariant(
+                "prepared file-set partial path has no filename",
+            ))?;
+            let final_name = final_path.file_name().ok_or(LambError::ExportInvariant(
+                "prepared file-set final path has no filename",
+            ))?;
             let mut source =
                 File::open(staged_path).map_err(|source| io_error(staged_path, source))?;
-            let mut partial = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&partial_path)
-                .map_err(|source| io_error(&partial_path, source))?;
+            let mut partial = create_new_file_at(&parent_directory, partial_name, &partial_path)?;
             let partial_owned = OwnedPath::from_file(partial_path.clone(), &partial)
                 .map_err(|source| io_error(&partial_path, source))?;
             partials.push(partial_owned.clone());
@@ -646,7 +935,6 @@ fn publish_recall_inner(
             partial
                 .sync_all()
                 .map_err(|source| io_error(&partial_path, source))?;
-            drop(partial);
             if let Err(error) =
                 hook.checkpoint(PublicationCheckpoint::RecallPartialCreatedBeforeManifest { index })
             {
@@ -671,9 +959,11 @@ fn publish_recall_inner(
                 return Err(error);
             }
             hook.before_rename(index, final_path)?;
-            rename_no_replace(&partial_path, final_path)?;
+            trusted_root.verify()?;
+            rename_no_replace_at(&parent_directory, partial_name, final_name, final_path)?;
             let final_owned = partial_owned.with_path(final_path.to_path_buf());
             created_finals.push(final_owned.clone());
+            created_final_files.push(partial);
             if let Err(error) =
                 hook.checkpoint(PublicationCheckpoint::RecallRenamedBeforeManifest { index })
             {
@@ -710,9 +1000,9 @@ fn publish_recall_inner(
         });
     }
 
-    for owned in &created_finals {
-        sync_published_file(&owned.path).map_err(|operation| RecallPublishError {
-            operation,
+    for (owned, file) in created_finals.iter().zip(&created_final_files) {
+        file.sync_all().map_err(|source| RecallPublishError {
+            operation: io_error(&owned.path, source),
             durable_failure: true,
             created_finals: Vec::new(),
             partials: Vec::new(),
@@ -742,7 +1032,47 @@ fn publish_recall_inner(
     parents.sort();
     parents.dedup();
     for parent in parents {
+        trusted_root
+            .verify()
+            .map_err(|operation| RecallPublishError {
+                operation,
+                durable_failure: true,
+                created_finals: Vec::new(),
+                partials: Vec::new(),
+            })?;
+        let relative = parent
+            .strip_prefix(output_directory)
+            .map_err(|_| RecallPublishError {
+                operation: LambError::Validation(
+                    "file-set sync directory escapes output root".to_string(),
+                ),
+                durable_failure: true,
+                created_finals: Vec::new(),
+                partials: Vec::new(),
+            })?;
+        let directory = trusted_root
+            .open_relative_directory(relative)
+            .map_err(|operation| RecallPublishError {
+                operation,
+                durable_failure: true,
+                created_finals: Vec::new(),
+                partials: Vec::new(),
+            })?;
+        directory.sync_all().map_err(|source| RecallPublishError {
+            operation: io_error(&parent, source),
+            durable_failure: true,
+            created_finals: Vec::new(),
+            partials: Vec::new(),
+        })?;
         hook.sync_directory(&parent)
+            .map_err(|operation| RecallPublishError {
+                operation,
+                durable_failure: true,
+                created_finals: Vec::new(),
+                partials: Vec::new(),
+            })?;
+        trusted_root
+            .verify()
             .map_err(|operation| RecallPublishError {
                 operation,
                 durable_failure: true,
@@ -781,6 +1111,14 @@ fn publish_recall_inner(
             partials: Vec::new(),
         },
     )?;
+    trusted_root
+        .verify()
+        .map_err(|operation| RecallPublishError {
+            operation,
+            durable_failure: true,
+            created_finals: Vec::new(),
+            partials: Vec::new(),
+        })?;
 
     Ok(PublishedOutput {
         output_directory: output_directory.to_path_buf(),
@@ -802,6 +1140,7 @@ fn path_to_str<'a>(path: &'a Path, description: &str) -> std::result::Result<&'a
 /// lexical containment; this closes the filesystem race/indirection boundary.
 fn register_file_set_parent_intents(
     manifest: &mut TransactionManifest,
+    trusted_root: &TrustedFileSetRoot,
     output_root: &Path,
     entry_index: usize,
     final_path: &Path,
@@ -812,24 +1151,9 @@ fn register_file_set_parent_intents(
     let relative = parent.strip_prefix(output_root).map_err(|_| {
         LambError::Validation("file-set final path escapes output root".to_string())
     })?;
+    trusted_root.verify()?;
     let mut current = output_root.to_path_buf();
-    match fs::symlink_metadata(&current) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(LambError::Validation(format!(
-                "refusing symlink output root: {}",
-                current.display()
-            )))
-        }
-        Ok(metadata) if !metadata.is_dir() => {
-            return Err(LambError::Validation(format!(
-                "file-set output root is not a directory: {}",
-                current.display()
-            )))
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => return Err(io_error(&current, source)),
-    }
+    let mut directory = Some(trusted_root.output_root()?);
     for component in relative.components() {
         if !matches!(component, std::path::Component::Normal(_)) {
             return Err(LambError::Validation(
@@ -837,92 +1161,69 @@ fn register_file_set_parent_intents(
             ));
         }
         current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(LambError::Validation(format!(
-                    "refusing symlink ancestor: {}",
-                    current.display()
-                )))
+        let next = match directory.as_ref() {
+            Some(parent) => match open_directory_at(parent, component.as_os_str()) {
+                Ok(next) => Some(next),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(source) => return Err(io_error(&current, source)),
+            },
+            None => None,
+        };
+        if next.is_none() {
+            let prefix_len = current
+                .to_str()
+                .ok_or_else(|| {
+                    LambError::Validation("created directory path is not valid UTF-8".to_string())
+                })?
+                .len();
+            if !manifest.directories().iter().any(|slot| {
+                manifest
+                    .directory_path(slot)
+                    .is_ok_and(|path| path == current)
+            }) {
+                manifest.push_directory_intent(entry_index, prefix_len)?;
             }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(LambError::Validation(format!(
-                    "file-set parent is not a directory: {}",
-                    current.display()
-                )))
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let prefix_len = current
-                    .to_str()
-                    .ok_or_else(|| {
-                        LambError::Validation(
-                            "created directory path is not valid UTF-8".to_string(),
-                        )
-                    })?
-                    .len();
-                if !manifest.directories().iter().any(|slot| {
-                    manifest
-                        .directory_path(slot)
-                        .is_ok_and(|path| path == current)
-                }) {
-                    manifest.push_directory_intent(entry_index, prefix_len)?;
-                }
-            }
-            Err(source) => return Err(io_error(&current, source)),
         }
+        directory = next;
     }
     Ok(())
 }
 
 fn materialize_file_set_parents(
     manifest: &mut TransactionManifest,
+    trusted_root: &TrustedFileSetRoot,
     output_root: &Path,
     manifest_path: &Path,
     serialization: &mut [u8],
     hook: &mut impl PreparedPublicationHook,
 ) -> Result<()> {
-    // Output root belongs to configuration rather than the transaction journal.
-    match fs::symlink_metadata(output_root) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(LambError::Validation(format!(
-                "invalid file-set output root: {}",
-                output_root.display()
-            )))
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(output_root).map_err(|source| io_error(output_root, source))?
-        }
-        Err(source) => return Err(io_error(output_root, source)),
-    }
+    trusted_root.verify()?;
+    let _output_directory = trusted_root.output_root()?;
     for index in 0..manifest.directory_count {
         let directory = manifest.directories()[index];
         let path = manifest.directory_path(&directory)?;
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(LambError::Validation(format!(
-                    "invalid file-set parent: {}",
-                    path.display()
-                )))
-            }
-            Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(path).map_err(|source| io_error(path, source))?;
-                // If we crash before this capture/update, the durable Intent is
-                // intentionally left identity-unknown and recovery will not rmdir it.
-                hook.checkpoint(
-                    PublicationCheckpoint::RecallParentCreatedBeforeOwnedManifest { index },
-                )?;
-                let identity = capture_identity(path)?;
-                let slot = manifest.directory_mut(index)?;
-                slot.state = Some(crate::recovery::ManifestDirectoryState::Owned);
-                slot.identity = Some(identity);
-                persist_manifest(serialization, manifest_path, manifest, hook)?;
-                hook.checkpoint(PublicationCheckpoint::RecallParentOwnedManifestRecorded {
-                    index,
-                })?;
-            }
-            Err(source) => return Err(io_error(path, source)),
+        let relative = path.strip_prefix(output_root).map_err(|_| {
+            LambError::Validation("file-set parent escapes output root".to_string())
+        })?;
+        let (directory_file, created) = trusted_root.materialize_directory_slot(relative)?;
+        if created {
+            // If we crash before this capture/update, the durable Intent is
+            // intentionally left identity-unknown and recovery will not rmdir it.
+            hook.checkpoint(
+                PublicationCheckpoint::RecallParentCreatedBeforeOwnedManifest { index },
+            )?;
+            let metadata = directory_file
+                .metadata()
+                .map_err(|source| io_error(path, source))?;
+            let identity = ManifestIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            };
+            let slot = manifest.directory_mut(index)?;
+            slot.state = Some(crate::recovery::ManifestDirectoryState::Owned);
+            slot.identity = Some(identity);
+            persist_manifest(serialization, manifest_path, manifest, hook)?;
+            hook.checkpoint(PublicationCheckpoint::RecallParentOwnedManifestRecorded { index })?;
         }
     }
     Ok(())

@@ -672,6 +672,10 @@ impl PersistenceWorkspace {
                     maximum_path_bytes: self.config.maximum_path_bytes,
                 };
                 self.plan_policy_paths(&details, policy, &context, decision)?;
+                if let Err(error) = self.preflight_policy_finals(kind) {
+                    self.reset_slots();
+                    return Err(error);
+                }
                 return self.finish_policy_prepare(
                     frozen,
                     decision.export_range(),
@@ -744,6 +748,31 @@ impl PersistenceWorkspace {
             PersistenceKind::Recall => PreparedPersistence::FileSet { staging },
             PersistenceKind::Dump => PreparedPersistence::AtomicDirectory { staging },
         })
+    }
+
+    fn preflight_policy_finals(&self, kind: PersistenceKind) -> Result<()> {
+        match kind {
+            PersistenceKind::Recall => {
+                for index in 0..self.output_count {
+                    let final_path = self.paths[self.outputs[index].final_path as usize].as_path();
+                    preflight_absent_final_chain(
+                        final_path,
+                        "prepared file-set final path already exists",
+                    )?;
+                }
+            }
+            PersistenceKind::Dump => {
+                let final_path = self.paths[self.outputs[0].final_path as usize].as_path();
+                let final_directory = final_path.parent().ok_or(LambError::ExportInvariant(
+                    "prepared atomic final path has no parent",
+                ))?;
+                preflight_absent_final_chain(
+                    final_directory,
+                    "prepared atomic final directory already exists",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn plan_policy_paths(
@@ -1831,6 +1860,28 @@ impl PreparedFile<'_> {
     pub fn frame_count(&self) -> u64 {
         self.slot().frame_count
     }
+}
+
+fn preflight_absent_final_chain(path: &Path, collision: &'static str) -> Result<()> {
+    for (depth, ancestor) in path.ancestors().enumerate() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) if depth == 0 => return Err(LambError::ExportInvariant(collision)),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(LambError::ExportInvariant(
+                    "prepared final path has a symlink ancestor",
+                ))
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(LambError::ExportInvariant(
+                    "prepared final path has a non-directory ancestor",
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(ancestor, source)),
+        }
+    }
+    Ok(())
 }
 
 fn validate_workspace_plan(

@@ -104,6 +104,19 @@ fn collect_files(root: &Path, files: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+fn copy_directory_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_directory_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 #[derive(Default)]
 struct SyncTrace {
     checkpoints: Vec<PublicationCheckpoint>,
@@ -153,6 +166,93 @@ impl PreparedPublicationHook for FailAtCheckpoint {
 impl TestPublicationHook for FailAtCheckpoint {
     fn setup(&mut self, output: &Path) {
         self.mutation_parent = Some(output.join(TIMESTAMP).join("nested"));
+    }
+}
+
+#[derive(Default)]
+struct SwapAbsoluteAncestorAtManifestPrepared {
+    ancestor: Option<PathBuf>,
+    original: Option<PathBuf>,
+    attacker: Option<PathBuf>,
+    swapped: bool,
+}
+
+impl PreparedPublicationHook for SwapAbsoluteAncestorAtManifestPrepared {
+    fn checkpoint(&mut self, checkpoint: PublicationCheckpoint) -> lamb::error::Result<()> {
+        if checkpoint == PublicationCheckpoint::RecallManifestPrepared && !self.swapped {
+            let ancestor = self.ancestor.as_ref().unwrap();
+            let original = self.original.as_ref().unwrap();
+            let attacker = self.attacker.as_ref().unwrap();
+            fs::rename(ancestor, original).unwrap();
+            fs::create_dir(attacker).unwrap();
+            copy_directory_tree(&original.join("staging"), &attacker.join("staging"));
+            symlink(attacker, ancestor).unwrap();
+            self.swapped = true;
+        }
+        Ok(())
+    }
+}
+
+impl TestPublicationHook for SwapAbsoluteAncestorAtManifestPrepared {
+    fn setup(&mut self, output: &Path) {
+        let ancestor = output.parent().unwrap().to_path_buf();
+        self.original = Some(ancestor.with_extension("original"));
+        self.attacker = Some(ancestor.with_extension("attacker"));
+        self.ancestor = Some(ancestor);
+    }
+}
+
+#[derive(Default)]
+struct ReplaceNewlyCreatedOutputRoot {
+    output: Option<PathBuf>,
+    original: Option<PathBuf>,
+    replaced: bool,
+}
+
+impl PreparedPublicationHook for ReplaceNewlyCreatedOutputRoot {
+    fn checkpoint(&mut self, checkpoint: PublicationCheckpoint) -> lamb::error::Result<()> {
+        if checkpoint == (PublicationCheckpoint::RecallParentOwnedManifestRecorded { index: 0 })
+            && !self.replaced
+        {
+            let output = self.output.as_ref().unwrap();
+            let original = self.original.as_ref().unwrap();
+            fs::rename(output, original).unwrap();
+            fs::create_dir(output).unwrap();
+            self.replaced = true;
+        }
+        Ok(())
+    }
+}
+
+impl TestPublicationHook for ReplaceNewlyCreatedOutputRoot {
+    fn setup(&mut self, output: &Path) {
+        fs::remove_dir(output).unwrap();
+        self.original = Some(output.with_extension("original-root"));
+        self.output = Some(output.to_path_buf());
+    }
+}
+
+#[derive(Default)]
+struct RemoveExistingIntermediateAtManifestPrepared {
+    intermediate: Option<PathBuf>,
+    removed: bool,
+}
+
+impl PreparedPublicationHook for RemoveExistingIntermediateAtManifestPrepared {
+    fn checkpoint(&mut self, checkpoint: PublicationCheckpoint) -> lamb::error::Result<()> {
+        if checkpoint == PublicationCheckpoint::RecallManifestPrepared && !self.removed {
+            fs::remove_dir(self.intermediate.as_ref().unwrap()).unwrap();
+            self.removed = true;
+        }
+        Ok(())
+    }
+}
+
+impl TestPublicationHook for RemoveExistingIntermediateAtManifestPrepared {
+    fn setup(&mut self, output: &Path) {
+        let intermediate = output.join("existing");
+        fs::create_dir(&intermediate).unwrap();
+        self.intermediate = Some(intermediate);
     }
 }
 
@@ -261,7 +361,6 @@ fn with_real_capture(
     let output = root.path().join("output");
     let staging = root.path().join("staging");
     fs::create_dir_all(&output).unwrap();
-    hook.setup(&output);
     ingress.try_push_interleaved(&[0.5], 1).unwrap();
     let frozen = arena
         .freeze_since(None, Duration::from_secs(2))
@@ -282,6 +381,7 @@ fn with_real_capture(
             },
         )
         .unwrap();
+    hook.setup(&output);
     let result = publish_prepared_with_hook(prepared, hook);
     test(
         &mut workspace,
@@ -676,6 +776,83 @@ fn nested_final_collision_preserves_existing_file_and_corrected_retry_succeeds()
                 PreparedPublication::Published(_)
             ));
             assert!(output.join("corrected").join("mic.wav").is_file());
+        },
+    );
+}
+
+#[test]
+fn fileset_ancestor_swap_after_preflight_never_mutates_attacker_or_reports_published() {
+    let mut hook = SwapAbsoluteAncestorAtManifestPrepared::default();
+    with_real_capture(
+        ExportCommand::Recall,
+        custom_directory_layout("{timestamp}/nested"),
+        &mut hook,
+        |_, _, _, output, _, _, result| {
+            let ancestor = output.parent().unwrap();
+            let original = ancestor.with_extension("original");
+            let attacker = ancestor.with_extension("attacker");
+            let attacker_output_created = attacker.join("output").exists();
+            let reported_published = matches!(result, PreparedPublication::Published(_));
+
+            fs::remove_file(ancestor).unwrap();
+            fs::rename(&original, ancestor).unwrap();
+            fs::remove_dir_all(&attacker).unwrap();
+
+            assert!(
+                !attacker_output_created,
+                "publication redirected final-tree mutation into attacker target"
+            );
+            assert!(
+                !reported_published,
+                "publication reported success through a swapped absolute ancestor"
+            );
+        },
+    );
+}
+
+#[test]
+fn fileset_newly_created_output_root_replacement_is_rejected_before_mutation() {
+    let mut hook = ReplaceNewlyCreatedOutputRoot::default();
+    with_real_capture(
+        ExportCommand::Recall,
+        custom_directory_layout("{timestamp}/nested"),
+        &mut hook,
+        |_, _, _, output, _, _, result| {
+            let original = output.with_extension("original-root");
+            let replacement_is_empty = fs::read_dir(output).unwrap().next().is_none();
+            let reported_published = matches!(result, PreparedPublication::Published(_));
+
+            fs::remove_dir_all(output).unwrap();
+            fs::rename(&original, output).unwrap();
+
+            assert!(
+                replacement_is_empty,
+                "publication mutated the replacement configured output root"
+            );
+            assert!(
+                !reported_published,
+                "publication reported success through a replacement output root"
+            );
+        },
+    );
+}
+
+#[test]
+fn fileset_vanished_unjournaled_parent_is_not_recreated_by_deeper_intent() {
+    let mut hook = RemoveExistingIntermediateAtManifestPrepared::default();
+    with_real_capture(
+        ExportCommand::Recall,
+        custom_directory_layout("existing/deeper"),
+        &mut hook,
+        |_, _, _, output, _, _, result| {
+            assert!(
+                !output.join("existing").exists(),
+                "deeper intent recreated an unjournaled intermediate parent"
+            );
+            assert!(
+                !matches!(result, PreparedPublication::Published(_)),
+                "publication succeeded after an unjournaled parent vanished"
+            );
         },
     );
 }

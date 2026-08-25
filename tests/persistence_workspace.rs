@@ -1209,6 +1209,170 @@ fn canonical_preflight_blocks_staging_and_open_then_reuses_frozen_decision_on_re
     }
 }
 
+#[test]
+fn fileset_existing_nested_final_fails_before_staging_or_wav_open() {
+    let geometry = Geometry {
+        retention_frames: 2,
+        channels: 1,
+        chunk_frames: 2,
+        split_when_over_bytes: 1_000,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("output");
+    let staging = root.path().join("staging");
+    let final_path = output.join("nested").join("foreign.wav");
+    fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+    fs::write(&final_path, b"foreign collision").unwrap();
+    let policy = activity_policy(
+        &output,
+        &[ChannelExportMode::Always],
+        custom_layout("nested", "foreign.wav"),
+        false,
+    );
+    let frozen = freeze(&mut arena, &ingress, &[0.25; 2], 1);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut io = CountingIo::default();
+
+    let result = workspace.prepare_with_io(
+        &frozen,
+        PrepareRequest::Policy {
+            command: ExportCommand::Recall,
+            policy: &policy,
+            profile: "preflight",
+            staging_root: &staging,
+            timestamp: TIMESTAMP,
+            decision: &mut decision,
+        },
+        &mut io,
+    );
+
+    assert!(result.is_err(), "existing final must reject preparation");
+    drop(result);
+    assert_eq!(fs::read(&final_path).unwrap(), b"foreign collision");
+    assert!(io.opened.is_empty());
+    assert_eq!(io.headers, 0);
+    assert!(!staging.exists());
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn atomic_directory_existing_final_fails_before_staging_or_wav_open() {
+    let geometry = Geometry {
+        retention_frames: 2,
+        channels: 1,
+        chunk_frames: 2,
+        split_when_over_bytes: 1_000,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("output");
+    let staging = root.path().join("staging");
+    let final_directory = output.join(TIMESTAMP);
+    fs::create_dir_all(&final_directory).unwrap();
+    fs::write(final_directory.join("foreign"), b"preserve").unwrap();
+    let policy = activity_policy(
+        &output,
+        &[ChannelExportMode::Always],
+        ResolvedLayout::TimestampDirectory,
+        false,
+    );
+    let frozen = freeze(&mut arena, &ingress, &[0.25; 2], 1);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut io = CountingIo::default();
+
+    let result = workspace.prepare_with_io(
+        &frozen,
+        PrepareRequest::Policy {
+            command: ExportCommand::Dump,
+            policy: &policy,
+            profile: "preflight",
+            staging_root: &staging,
+            timestamp: TIMESTAMP,
+            decision: &mut decision,
+        },
+        &mut io,
+    );
+
+    assert!(
+        result.is_err(),
+        "existing final directory must reject preparation"
+    );
+    drop(result);
+    assert_eq!(
+        fs::read(final_directory.join("foreign")).unwrap(),
+        b"preserve"
+    );
+    assert!(io.opened.is_empty());
+    assert_eq!(io.headers, 0);
+    assert!(!staging.exists());
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn fileset_absolute_symlink_ancestor_fails_before_staging_or_wav_open() {
+    use std::os::unix::fs::symlink;
+
+    let geometry = Geometry {
+        retention_frames: 2,
+        channels: 1,
+        chunk_frames: 2,
+        split_when_over_bytes: 1_000,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("attacker-target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("marker"), b"unchanged").unwrap();
+    let symlink_ancestor = root.path().join("redirect");
+    symlink(&target, &symlink_ancestor).unwrap();
+    let output = symlink_ancestor.join("configured-output");
+    let staging = root.path().join("staging");
+    let policy = activity_policy(
+        &output,
+        &[ChannelExportMode::Always],
+        custom_layout("nested", "mic.wav"),
+        false,
+    );
+    let frozen = freeze(&mut arena, &ingress, &[0.25; 2], 1);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut io = CountingIo::default();
+
+    let result = workspace.prepare_with_io(
+        &frozen,
+        PrepareRequest::Policy {
+            command: ExportCommand::Recall,
+            policy: &policy,
+            profile: "preflight",
+            staging_root: &staging,
+            timestamp: TIMESTAMP,
+            decision: &mut decision,
+        },
+        &mut io,
+    );
+
+    assert!(
+        result.is_err(),
+        "absolute symlink ancestor must reject preparation"
+    );
+    drop(result);
+    assert_eq!(fs::read(target.join("marker")).unwrap(), b"unchanged");
+    assert!(!target.join("configured-output").exists());
+    assert!(io.opened.is_empty());
+    assert_eq!(io.headers, 0);
+    assert!(!staging.exists());
+    arena.shutdown(DEADLINE).unwrap();
+}
+
 fn workspace_with_cleanup_faults(
     plan: &SessionMemoryPlan,
     geometry: Geometry,
