@@ -34,7 +34,7 @@ pub const CAPTURE_COMMAND_RESULT_SLOT_BYTES: u64 = 512;
 // ExactArray payload slots. Activity owns compile-time assertions that tie these
 // module-cycle-free plan constants to the concrete private detector layouts.
 pub const FROZEN_EXPORT_DECISION_SLOT_BYTES: u64 = 24;
-pub const ACTIVITY_DETECTOR_CHANNEL_WORKSPACE_BYTES: u64 = 128;
+pub const ACTIVITY_DETECTOR_STATE_SLOT_BYTES: u64 = 104;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SessionMemoryInputs {
@@ -322,16 +322,33 @@ impl SessionMemoryPlan {
             "frozen export decision storage overflow",
             u64::from(inputs.channels),
             FROZEN_EXPORT_DECISION_SLOT_BYTES,
-        )?;
+        )
+        .and_then(allocation_budget_bytes)?;
+        let activity_detector_states = checked_mul(
+            "activity detector state storage overflow",
+            u64::from(inputs.channels),
+            ACTIVITY_DETECTOR_STATE_SLOT_BYTES,
+        )
+        .and_then(allocation_budget_bytes)?;
+        let activity_detector_decisions = checked_mul(
+            "activity detector decision storage overflow",
+            u64::from(inputs.channels),
+            FROZEN_EXPORT_DECISION_SLOT_BYTES,
+        )
+        .and_then(allocation_budget_bytes)?;
+        let activity_detector_scratch = allocation_budget_bytes(interleaved_scratch)?;
         let activity_detector_workspace = checked_add(
-            "activity detector workspace overflow",
-            checked_mul(
-                "activity detector channel workspace overflow",
-                u64::from(inputs.channels),
-                ACTIVITY_DETECTOR_CHANNEL_WORKSPACE_BYTES,
-            )?,
-            interleaved_scratch,
-        )?;
+            "activity detector state and decision workspace overflow",
+            activity_detector_states,
+            activity_detector_decisions,
+        )
+        .and_then(|workspace| {
+            checked_add(
+                "activity detector workspace overflow",
+                workspace,
+                activity_detector_scratch,
+            )
+        })?;
 
         let components = vec![
             MemoryComponent {

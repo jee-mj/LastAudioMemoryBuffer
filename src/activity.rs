@@ -2,7 +2,7 @@ use crate::capture_arena::FrozenCaptureEpoch;
 use crate::error::{LambError, Result};
 use crate::export_policy::ResolvedActivityPolicy;
 use crate::memory_plan::{
-    ExactArray, MaterializedBuffer, SessionMemoryPlan, ACTIVITY_DETECTOR_CHANNEL_WORKSPACE_BYTES,
+    ExactArray, MaterializedBuffer, SessionMemoryPlan, ACTIVITY_DETECTOR_STATE_SLOT_BYTES,
     FROZEN_EXPORT_DECISION_SLOT_BYTES,
 };
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,20 @@ pub enum ActivityResult {
 pub enum ChannelDisposition {
     Retain,
     Omit,
+}
+
+const fn canonical_disposition(
+    mode: ChannelExportMode,
+    result: ActivityResult,
+) -> ChannelDisposition {
+    match mode {
+        ChannelExportMode::Never => ChannelDisposition::Omit,
+        ChannelExportMode::Always => ChannelDisposition::Retain,
+        ChannelExportMode::Auto if matches!(result, ActivityResult::Inactive) => {
+            ChannelDisposition::Omit
+        }
+        ChannelExportMode::Auto => ChannelDisposition::Retain,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +135,13 @@ impl FrozenExportDecision {
             ));
         }
         if channels.iter().any(|channel| {
+            channel.disposition != canonical_disposition(channel.mode, channel.result)
+        }) {
+            return Err(LambError::ExportInvariant(
+                "activity disposition contradicts mode and result",
+            ));
+        }
+        if channels.iter().any(|channel| {
             channel
                 .first_evidence_frame
                 .is_some_and(|frame| frame < frozen_range.start || frame >= frozen_range.end)
@@ -193,8 +214,7 @@ struct DetectorState {
     evidence: Option<u64>,
 }
 
-const _: [(); ACTIVITY_DETECTOR_CHANNEL_WORKSPACE_BYTES as usize] =
-    [(); size_of::<DetectorState>() + size_of::<FrozenChannelDecision>()];
+const _: [(); ACTIVITY_DETECTOR_STATE_SLOT_BYTES as usize] = [(); size_of::<DetectorState>()];
 
 impl DetectorState {
     const fn empty() -> Self {
@@ -500,14 +520,7 @@ fn channel_decision(mode: ChannelExportMode, state: DetectorState) -> FrozenChan
     FrozenChannelDecision {
         mode,
         result: state.result,
-        disposition: match mode {
-            ChannelExportMode::Never => ChannelDisposition::Omit,
-            ChannelExportMode::Always => ChannelDisposition::Retain,
-            ChannelExportMode::Auto if state.result == ActivityResult::Inactive => {
-                ChannelDisposition::Omit
-            }
-            ChannelExportMode::Auto => ChannelDisposition::Retain,
-        },
+        disposition: canonical_disposition(mode, state.result),
         first_evidence_frame: state.evidence,
     }
 }

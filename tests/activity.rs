@@ -496,6 +496,53 @@ fn invalid_evidence_never_partially_mutates_or_validates_a_frozen_decision() {
 }
 
 #[test]
+fn contradictory_dispositions_are_rejected_without_mutating_frozen_decision() {
+    let memory_plan = plan(1, 100);
+    let default = [FrozenChannelDecision {
+        mode: ChannelExportMode::Never,
+        result: ActivityResult::Inactive,
+        disposition: ChannelDisposition::Omit,
+        first_evidence_frame: None,
+    }];
+    let contradictory = [
+        FrozenChannelDecision {
+            mode: ChannelExportMode::Never,
+            result: ActivityResult::Active,
+            disposition: ChannelDisposition::Retain,
+            first_evidence_frame: None,
+        },
+        FrozenChannelDecision {
+            mode: ChannelExportMode::Always,
+            result: ActivityResult::Inactive,
+            disposition: ChannelDisposition::Omit,
+            first_evidence_frame: None,
+        },
+        FrozenChannelDecision {
+            mode: ChannelExportMode::Auto,
+            result: ActivityResult::Inactive,
+            disposition: ChannelDisposition::Retain,
+            first_evidence_frame: None,
+        },
+        FrozenChannelDecision {
+            mode: ChannelExportMode::Auto,
+            result: ActivityResult::Active,
+            disposition: ChannelDisposition::Omit,
+            first_evidence_frame: None,
+        },
+    ];
+
+    for invalid in contradictory {
+        let mut decision = FrozenExportDecision::new(&memory_plan).unwrap();
+        assert!(decision
+            .finalize(100..500, &[invalid], true, false)
+            .is_err());
+        assert!(!decision.valid());
+        assert_eq!(decision.export_range(), 0..0);
+        assert_eq!(decision.channels(), &default);
+    }
+}
+
+#[test]
 fn frozen_decision_is_immutable_and_crops_common_preroll_without_trimming_end() {
     let memory_plan = plan(2, 100);
     let mut decision = FrozenExportDecision::new(&memory_plan).unwrap();

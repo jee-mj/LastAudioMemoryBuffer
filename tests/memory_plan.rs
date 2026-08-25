@@ -1,13 +1,13 @@
 use lamb::error::LambError;
 use lamb::memory_plan::{
     allocation_budget_bytes, required_bytes_with_headroom, ExactArray, Materializable,
-    MaterializedBuffer, SessionMemoryInputs, SessionMemoryPlan,
-    ACTIVITY_DETECTOR_CHANNEL_WORKSPACE_BYTES, ALLOCATOR_HEADER_RESERVE_BYTES,
-    CAPTURE_COMMAND_RESULT_SLOT_BYTES, CAPTURE_QUEUE_SLOT_METADATA_BYTES, FILE_WRITER_SLOT_BYTES,
-    FROZEN_EXPORT_DECISION_SLOT_BYTES, MANIFEST_ENTRY_METADATA_BYTES, MANIFEST_FIXED_PATH_ENTRIES,
-    MANIFEST_JSON_ENTRY_OVERHEAD_BYTES, MANIFEST_JSON_FIXED_OVERHEAD_BYTES,
-    MANIFEST_PATH_ESCAPE_MULTIPLIER, OPERATION_QUEUE_SLOT_BYTES, OUTPUT_PATH_SLOTS_PER_PART,
-    PATH_SLOT_METADATA_BYTES, RING_CHUNK_OBJECT_RESERVE_BYTES, RING_FIXED_METADATA_RESERVE_BYTES,
+    MaterializedBuffer, SessionMemoryInputs, SessionMemoryPlan, ACTIVITY_DETECTOR_STATE_SLOT_BYTES,
+    ALLOCATOR_HEADER_RESERVE_BYTES, CAPTURE_COMMAND_RESULT_SLOT_BYTES,
+    CAPTURE_QUEUE_SLOT_METADATA_BYTES, FILE_WRITER_SLOT_BYTES, FROZEN_EXPORT_DECISION_SLOT_BYTES,
+    MANIFEST_ENTRY_METADATA_BYTES, MANIFEST_FIXED_PATH_ENTRIES, MANIFEST_JSON_ENTRY_OVERHEAD_BYTES,
+    MANIFEST_JSON_FIXED_OVERHEAD_BYTES, MANIFEST_PATH_ESCAPE_MULTIPLIER,
+    OPERATION_QUEUE_SLOT_BYTES, OUTPUT_PATH_SLOTS_PER_PART, PATH_SLOT_METADATA_BYTES,
+    RING_CHUNK_OBJECT_RESERVE_BYTES, RING_FIXED_METADATA_RESERVE_BYTES,
     RUNTIME_METADATA_RESERVE_BYTES, SPLIT_PART_SLOT_BYTES,
 };
 use lamb::sample_ring::{RingConfig, SampleFormat, SampleRing};
@@ -216,11 +216,11 @@ fn plan_components_match_concrete_small_input_formulas() {
     );
     assert_eq!(
         plan.component("frozen_export_decisions").unwrap().bytes,
-        2 * 24
+        allocation(2 * 24)
     );
     assert_eq!(
         plan.component("activity_detector_workspace").unwrap().bytes,
-        2 * 128 + scratch_bytes
+        allocation(2 * 104) + allocation(2 * 24) + allocation(scratch_bytes)
     );
     assert_eq!(
         plan.committed_bytes(),
@@ -234,32 +234,60 @@ fn plan_components_match_concrete_small_input_formulas() {
 
 #[test]
 fn detector_and_frozen_decision_memory_is_channel_bounded_and_included_in_maximum() {
-    let base = SessionMemoryPlan::calculate(inputs()).unwrap();
-    let mut more_channels = inputs();
-    more_channels.channels = 4;
-    let more_channels = SessionMemoryPlan::calculate(more_channels).unwrap();
+    let base_inputs = inputs();
+    let base = SessionMemoryPlan::calculate(base_inputs).unwrap();
+    let mut more_channel_inputs = inputs();
+    more_channel_inputs.channels = 256;
+    let more_channels = SessionMemoryPlan::calculate(more_channel_inputs).unwrap();
+    let allocation_budgets = |values: SessionMemoryInputs| {
+        let channels = u64::from(values.channels);
+        let frozen_decisions = allocation_budget_bytes(channels * 24).unwrap();
+        let detector_states = allocation_budget_bytes(channels * 104).unwrap();
+        let workspace_decisions = allocation_budget_bytes(channels * 24).unwrap();
+        let scratch = allocation_budget_bytes(
+            u64::from(values.chunk_frames) * channels * u64::from(values.sample_bytes),
+        )
+        .unwrap();
+        (
+            frozen_decisions,
+            detector_states,
+            workspace_decisions,
+            scratch,
+        )
+    };
+    let (frozen_decisions, detector_states, workspace_decisions, scratch) =
+        allocation_budgets(base_inputs);
+    let (more_frozen_decisions, more_detector_states, more_workspace_decisions, more_scratch) =
+        allocation_budgets(more_channel_inputs);
 
     assert_eq!(FROZEN_EXPORT_DECISION_SLOT_BYTES, 24);
-    assert_eq!(ACTIVITY_DETECTOR_CHANNEL_WORKSPACE_BYTES, 128);
-    assert_eq!(base.component("frozen_export_decisions").unwrap().bytes, 48);
+    assert_eq!(ACTIVITY_DETECTOR_STATE_SLOT_BYTES, 104);
+    assert_eq!(
+        base.component("frozen_export_decisions").unwrap().bytes,
+        frozen_decisions
+    );
     assert_eq!(
         base.component("activity_detector_workspace").unwrap().bytes,
-        288
+        detector_states + workspace_decisions + scratch
     );
     assert_eq!(
         more_channels
             .component("frozen_export_decisions")
             .unwrap()
             .bytes,
-        96
+        more_frozen_decisions
     );
     assert_eq!(
         more_channels
             .component("activity_detector_workspace")
             .unwrap()
             .bytes,
-        576
+        more_detector_states + more_workspace_decisions + more_scratch
     );
+    assert!(more_frozen_decisions > frozen_decisions);
+    assert!(more_detector_states > detector_states);
+    assert!(more_workspace_decisions > workspace_decisions);
+    assert!(more_scratch > scratch);
     let detector_components = base.component("frozen_export_decisions").unwrap().bytes
         + base.component("activity_detector_workspace").unwrap().bytes;
     assert_eq!(
@@ -276,6 +304,12 @@ fn detector_and_frozen_decision_memory_is_channel_bounded_and_included_in_maximu
     );
     assert!(base.validate_max(Some(base.committed_bytes())).is_ok());
     assert!(base.validate_max(Some(base.committed_bytes() - 1)).is_err());
+
+    let mut overflowing = inputs();
+    overflowing.channels = u32::MAX;
+    overflowing.chunk_frames = u32::MAX;
+    overflowing.sample_bytes = 4;
+    assert!(SessionMemoryPlan::calculate(overflowing).is_err());
 }
 
 #[test]
