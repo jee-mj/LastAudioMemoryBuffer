@@ -1,3 +1,6 @@
+use crate::activity::{
+    ActivityDetectorKind, ChannelExportMode, SilencePolicyPreset, ThresholdSource,
+};
 use crate::error::{io_error, LambError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -23,7 +26,7 @@ pub struct DaemonConfig {
     pub control_socket_path: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -41,6 +44,8 @@ pub struct ProfileConfig {
     pub export: ProfileExportConfig,
     #[serde(default)]
     pub pipewire: PipewireProfileConfig,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub channels: BTreeMap<String, ProfileChannelConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +90,12 @@ pub struct CapturePort {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(
+        rename = "exportMode",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub export_mode: Option<ChannelExportMode>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,7 +104,7 @@ pub struct BufferConfig {
     pub seconds: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProfileExportConfig {
     #[serde(rename = "outputDir", default, skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<PathBuf>,
@@ -101,6 +112,70 @@ pub struct ProfileExportConfig {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<ExportLayoutKind>,
+    #[serde(
+        rename = "directoryPattern",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub directory_pattern: Option<String>,
+    #[serde(
+        rename = "filenamePattern",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub filename_pattern: Option<String>,
+    #[serde(
+        rename = "defaultChannelMode",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_channel_mode: Option<ChannelExportMode>,
+    #[serde(
+        rename = "activityDetector",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub activity_detector: Option<ActivityDetectorKind>,
+    #[serde(
+        rename = "silencePolicy",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub silence_policy: Option<SilencePolicyPreset>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExportLayoutKind {
+    FlatDetailed,
+    TimestampDirectory,
+    Custom,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProfileChannelConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<ActivityThresholdConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivityThresholdConfig {
+    #[serde(rename = "thresholdDbFS")]
+    pub threshold_dbfs: f64,
+    #[serde(rename = "thresholdSource")]
+    pub threshold_source: ThresholdSource,
+    #[serde(rename = "updatedAtUnixSeconds")]
+    pub updated_at_unix_seconds: u64,
+    #[serde(rename = "inputId")]
+    pub input_id: String,
+    #[serde(
+        rename = "calibrationId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub calibration_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

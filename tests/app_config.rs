@@ -1,3 +1,4 @@
+use lamb::activity::{ActivityDetectorKind, ChannelExportMode, ThresholdSource};
 use lamb::app_config::{
     default_config_path_from_env, default_config_text, load_optional_config, parse_config_text,
     write_default_config, AppConfig, ConfigLoadState,
@@ -302,6 +303,7 @@ fn pipewire_profile_rejects_generic_capture_ports() {
         .push(lamb::app_config::CapturePort {
             source: Some("system:capture_1".to_string()),
             name: Some("legacy".to_string()),
+            export_mode: None,
         });
 
     assert_eq!(
@@ -324,5 +326,237 @@ fn pipewire_profile_rejects_generic_capture_sources() {
             .unwrap_err()
             .to_string(),
         "validation error: profile scarlett: capture.ports and capture.sources are only valid for jack profiles"
+    );
+}
+
+#[test]
+fn typed_activity_config_parses_serializes_and_resolves_by_channel_name() {
+    let text = pipewire_profile_text("")
+        .replace(
+            "{ source = \"capture_AUX2\", name = \"percL\" }",
+            "{ source = \"capture_AUX2\", name = \"percL\", exportMode = \"auto\" }",
+        )
+        .replace(
+            "format = \"wav\"",
+            r#"format = "wav"
+defaultChannelMode = "never"
+activityDetector = "windowed-rms-peak"
+
+[profiles.scarlett.channels.percL.activity]
+thresholdDbFS = -63.4
+thresholdSource = "calibrated"
+updatedAtUnixSeconds = 1787616000
+inputId = "input-1"
+calibrationId = "calibration-1""#,
+        );
+    let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
+    let raw = &cfg.profiles["scarlett"];
+
+    assert_eq!(
+        raw.channels["percL"]
+            .activity
+            .as_ref()
+            .unwrap()
+            .threshold_source,
+        ThresholdSource::Calibrated
+    );
+    assert!(toml::to_string(raw)
+        .unwrap()
+        .contains("thresholdDbFS = -63.4"));
+
+    let resolved = profile::resolve_active_profile(&cfg).unwrap().unwrap();
+    assert_eq!(
+        resolved.export_policy.activity.detector,
+        ActivityDetectorKind::WindowedRmsPeak
+    );
+    assert_eq!(
+        resolved.export_policy.activity.channels[0].mode,
+        ChannelExportMode::Auto
+    );
+    assert_eq!(
+        resolved.export_policy.activity.channels[1].mode,
+        ChannelExportMode::Never
+    );
+    assert_eq!(
+        resolved.export_policy.activity.channels[0]
+            .threshold
+            .as_ref()
+            .unwrap()
+            .threshold_dbfs,
+        -63.4
+    );
+}
+
+#[test]
+fn modern_activity_omission_resolves_to_auto_windowed_detector_and_trim() {
+    let resolved = profile::resolve_active_profile(&parsed_pipewire_profile())
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        resolved.export_policy.activity.detector,
+        ActivityDetectorKind::WindowedRmsPeak
+    );
+    assert!(resolved
+        .export_policy
+        .activity
+        .channels
+        .iter()
+        .all(|channel| channel.mode == ChannelExportMode::Auto));
+    assert!(!resolved.export_policy.activity.whole_export_exact_zero_gate);
+    assert!(resolved.export_policy.activity.trim_leading_silence);
+}
+
+#[test]
+fn silence_policy_conflicts_with_profile_wide_activity_fields() {
+    for (field, expected) in [
+        (
+            "defaultChannelMode = \"auto\"",
+            "validation error: profile scarlett: export.silencePolicy conflicts with export.defaultChannelMode",
+        ),
+        (
+            "activityDetector = \"exact-zero\"",
+            "validation error: profile scarlett: export.silencePolicy conflicts with export.activityDetector",
+        ),
+    ] {
+        let text = pipewire_profile_text("").replace(
+            "format = \"wav\"",
+            &format!(
+                "format = \"wav\"\nsilencePolicy = \"per-channel-exact-zero\"\n{field}"
+            ),
+        );
+        let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
+        assert_eq!(
+            profile::resolve_active_profile(&cfg)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn all_channels_preset_allows_per_port_override() {
+    let text = pipewire_profile_text("")
+        .replace(
+            "{ source = \"capture_AUX2\", name = \"percL\" }",
+            "{ source = \"capture_AUX2\", name = \"percL\", exportMode = \"never\" }",
+        )
+        .replace(
+            "format = \"wav\"",
+            "format = \"wav\"\nsilencePolicy = \"all-channels-exact-zero\"",
+        );
+    let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
+    let resolved = profile::resolve_active_profile(&cfg).unwrap().unwrap();
+
+    assert!(resolved.export_policy.activity.whole_export_exact_zero_gate);
+    assert!(!resolved.export_policy.activity.trim_leading_silence);
+    assert_eq!(
+        resolved.export_policy.activity.detector,
+        ActivityDetectorKind::ExactZero
+    );
+    assert_eq!(
+        resolved.export_policy.activity.channels[0].mode,
+        ChannelExportMode::Never
+    );
+    assert_eq!(
+        resolved.export_policy.activity.channels[1].mode,
+        ChannelExportMode::Always
+    );
+}
+
+#[test]
+fn per_channel_exact_zero_preset_resolves_auto_detector_and_trim() {
+    let text = pipewire_profile_text("").replace(
+        "format = \"wav\"",
+        "format = \"wav\"\nsilencePolicy = \"per-channel-exact-zero\"",
+    );
+    let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
+    let resolved = profile::resolve_active_profile(&cfg).unwrap().unwrap();
+
+    assert_eq!(
+        resolved.export_policy.activity.detector,
+        ActivityDetectorKind::ExactZero
+    );
+    assert!(!resolved.export_policy.activity.whole_export_exact_zero_gate);
+    assert!(resolved.export_policy.activity.trim_leading_silence);
+    assert!(resolved
+        .export_policy
+        .activity
+        .channels
+        .iter()
+        .all(|channel| channel.mode == ChannelExportMode::Auto));
+}
+
+#[test]
+fn reserved_activity_detectors_are_rejected_with_stable_errors() {
+    for (detector, expected) in [
+        (
+            "fixed-level",
+            "validation error: profile scarlett: export.activityDetector fixed-level is reserved and not supported",
+        ),
+        (
+            "calibrated-noise-floor",
+            "validation error: profile scarlett: export.activityDetector calibrated-noise-floor is reserved and not supported",
+        ),
+    ] {
+        let text = pipewire_profile_text("").replace(
+            "format = \"wav\"",
+            &format!("format = \"wav\"\nactivityDetector = \"{detector}\""),
+        );
+        let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
+        assert_eq!(
+            profile::resolve_active_profile(&cfg)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn activity_threshold_must_be_finite_and_in_dbfs_range() {
+    for threshold in ["nan", "-120.1", "0.1"] {
+        let text = pipewire_profile_text("").replace(
+            "format = \"wav\"",
+            &format!(
+                r#"format = "wav"
+
+[profiles.scarlett.channels.percL.activity]
+thresholdDbFS = {threshold}
+thresholdSource = "manual"
+updatedAtUnixSeconds = 1
+inputId = "input-1""#
+            ),
+        );
+        let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
+        assert_eq!(
+            profile::resolve_active_profile(&cfg)
+                .unwrap_err()
+                .to_string(),
+            "validation error: profile scarlett: channels.percL.activity.thresholdDbFS must be finite and within [-120.0, 0.0]"
+        );
+    }
+}
+
+#[test]
+fn activity_channel_keys_must_match_one_configured_port_exactly() {
+    let text = pipewire_profile_text("").replace(
+        "format = \"wav\"",
+        r#"format = "wav"
+
+[profiles.scarlett.channels.PERCL.activity]
+thresholdDbFS = -60.0
+thresholdSource = "manual"
+updatedAtUnixSeconds = 1
+inputId = "input-1""#,
+    );
+    let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
+
+    assert_eq!(
+        profile::resolve_active_profile(&cfg)
+            .unwrap_err()
+            .to_string(),
+        "validation error: profile scarlett: channels.PERCL does not match exactly one configured port name"
     );
 }

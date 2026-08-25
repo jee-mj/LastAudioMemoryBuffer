@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod app_config;
 pub mod capture_arena;
 pub mod capture_fake;
@@ -10,6 +11,7 @@ pub mod control_server;
 pub mod daemon;
 pub mod dump;
 pub mod error;
+pub mod export_policy;
 pub mod export_wav;
 pub mod math;
 pub mod memory_plan;

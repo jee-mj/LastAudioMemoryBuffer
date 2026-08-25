@@ -1,4 +1,6 @@
+use lamb::activity::{ActivityDetectorKind, ChannelExportMode};
 use lamb::config::{load_config_file, CapturePortConfig, ExportConfig, LambConfig, MemoryConfig};
+use lamb::export_policy::{ExportCommand, ResolvedLayout};
 use lamb::math::{estimate_ring_bytes, wav_parts_for_channel};
 use std::{fs, path::PathBuf};
 
@@ -219,4 +221,24 @@ fn wav_split_counts_parts_on_frame_boundaries() {
     assert_eq!(parts[0].start_frame, 0);
     assert!(parts[0].frame_count > 0);
     assert_eq!(parts[1].start_frame, parts[0].frame_count);
+}
+
+#[test]
+fn legacy_config_resolves_historical_export_policy_per_command() {
+    let cfg = valid_config();
+
+    let recall = cfg.resolved_export_policy(ExportCommand::Recall).unwrap();
+    assert_eq!(recall.activity.detector, ActivityDetectorKind::ExactZero);
+    assert!(recall.activity.whole_export_exact_zero_gate);
+    assert!(!recall.activity.trim_leading_silence);
+    assert!(recall
+        .activity
+        .channels
+        .iter()
+        .all(|channel| channel.mode == ChannelExportMode::Always));
+    assert_eq!(recall.layout, ResolvedLayout::FlatDetailed);
+
+    let dump = cfg.resolved_export_policy(ExportCommand::Dump).unwrap();
+    assert_eq!(dump.layout, ResolvedLayout::TimestampDirectory);
+    assert_eq!(dump.output_dir, cfg.output_dir);
 }

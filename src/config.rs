@@ -1,4 +1,9 @@
+use crate::activity::{ActivityDetectorKind, ChannelExportMode};
 use crate::error::{io_error, LambError, Result};
+use crate::export_policy::{
+    ChannelActivityPolicy, ExportCommand, ResolvedActivityPolicy, ResolvedExportPolicy,
+    ResolvedLayout,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -228,6 +233,44 @@ impl LambConfig {
             ));
         }
         Ok(())
+    }
+
+    pub fn resolved_export_policy(&self, command: ExportCommand) -> Result<ResolvedExportPolicy> {
+        self.validate_static()?;
+        let channel_names = if self.backend == "pipewire" {
+            self.resolved_capture_ports()?
+                .into_iter()
+                .map(|port| port.name)
+                .collect()
+        } else if let Some(channel_map) = self.channel_map.as_ref().filter(|map| !map.is_empty()) {
+            channel_map.clone()
+        } else {
+            (0..self.channels.unwrap_or(0))
+                .map(|index| format!("ch{:02}", index + 1))
+                .collect()
+        };
+        let channels = channel_names
+            .into_iter()
+            .map(|name| ChannelActivityPolicy {
+                name,
+                mode: ChannelExportMode::Always,
+                threshold: None,
+            })
+            .collect();
+
+        Ok(ResolvedExportPolicy {
+            output_dir: self.output_dir.clone(),
+            layout: match command {
+                ExportCommand::Recall => ResolvedLayout::FlatDetailed,
+                ExportCommand::Dump => ResolvedLayout::TimestampDirectory,
+            },
+            activity: ResolvedActivityPolicy {
+                detector: ActivityDetectorKind::ExactZero,
+                channels,
+                whole_export_exact_zero_gate: true,
+                trim_leading_silence: false,
+            },
+        })
     }
 }
 

@@ -1,20 +1,24 @@
-use crate::app_config::{self, AppConfig, CapturePort, ConfigLoadState, ProfileConfig};
+use crate::activity::{ActivityDetectorKind, ChannelExportMode, SilencePolicyPreset};
+use crate::app_config::{
+    self, AppConfig, CapturePort, ConfigLoadState, ExportLayoutKind, ProfileConfig,
+};
 use crate::capture_pipewire::PipeWireCaptureConfig;
 use crate::config::{normalize_capture_ports, ConfiguredCapturePort};
 use crate::error::{io_error, LambError, Result};
+use crate::export_policy::{
+    ChannelActivityPolicy, ResolvedActivityPolicy, ResolvedExportPolicy, ResolvedLayout,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedProfile {
     pub name: String,
     pub backend: String,
     pub client_name: String,
     pub ports: Vec<ResolvedCapturePort>,
     pub buffer_seconds: u32,
-    pub export_output_dir: PathBuf,
-    pub export_mode: String,
-    pub export_format: String,
+    pub export_policy: ResolvedExportPolicy,
     pub pipewire_config: Option<PipeWireCaptureConfig>,
 }
 
@@ -39,8 +43,7 @@ fn validate_jack_profile(name: &str, profile: &ProfileConfig) -> Result<Resolved
     let client_name = required_string("clientName", profile.client_name.as_deref())?;
     let ports = resolve_capture_ports(name, profile)?;
     let buffer_seconds = validate_buffer_seconds(name, profile)?;
-    let export_output_dir = validate_export_output_dir(name, profile)?;
-    let (export_mode, export_format) = validate_export(name, profile)?;
+    let export_policy = resolve_export_policy(name, profile, &ports)?;
 
     Ok(ResolvedProfile {
         name: name.to_string(),
@@ -48,9 +51,7 @@ fn validate_jack_profile(name: &str, profile: &ProfileConfig) -> Result<Resolved
         client_name,
         ports,
         buffer_seconds,
-        export_output_dir,
-        export_mode,
-        export_format,
+        export_policy,
         pipewire_config: None,
     })
 }
@@ -70,8 +71,7 @@ fn validate_pipewire_profile(name: &str, profile: &ProfileConfig) -> Result<Reso
     let ports = resolve_pipewire_capture_ports(name, profile)?;
 
     let buffer_seconds = validate_buffer_seconds(name, profile)?;
-    let export_output_dir = validate_export_output_dir(name, profile)?;
-    let (export_mode, export_format) = validate_export(name, profile)?;
+    let export_policy = resolve_export_policy(name, profile, &ports)?;
 
     Ok(ResolvedProfile {
         name: name.to_string(),
@@ -79,9 +79,7 @@ fn validate_pipewire_profile(name: &str, profile: &ProfileConfig) -> Result<Reso
         client_name: "lamb".to_string(),
         ports: ports.clone(),
         buffer_seconds,
-        export_output_dir,
-        export_mode,
-        export_format,
+        export_policy,
         pipewire_config: Some(PipeWireCaptureConfig {
             target: pw.target.clone(),
             capture_ports: ports
@@ -160,6 +158,158 @@ fn validate_export(name: &str, profile: &ProfileConfig) -> Result<(String, Strin
         )));
     }
     Ok((mode, format))
+}
+
+fn resolve_export_policy(
+    name: &str,
+    profile: &ProfileConfig,
+    ports: &[ResolvedCapturePort],
+) -> Result<ResolvedExportPolicy> {
+    let output_dir = validate_export_output_dir(name, profile)?;
+    validate_export(name, profile)?;
+
+    if profile.export.silence_policy.is_some() && profile.export.default_channel_mode.is_some() {
+        return Err(LambError::Validation(format!(
+            "profile {name}: export.silencePolicy conflicts with export.defaultChannelMode"
+        )));
+    }
+    if profile.export.silence_policy.is_some() && profile.export.activity_detector.is_some() {
+        return Err(LambError::Validation(format!(
+            "profile {name}: export.silencePolicy conflicts with export.activityDetector"
+        )));
+    }
+
+    let (default_mode, detector, whole_export_exact_zero_gate, trim_leading_silence) =
+        match profile.export.silence_policy {
+            Some(SilencePolicyPreset::AllChannelsExactZero) => (
+                ChannelExportMode::Always,
+                ActivityDetectorKind::ExactZero,
+                true,
+                false,
+            ),
+            Some(SilencePolicyPreset::PerChannelExactZero) => (
+                ChannelExportMode::Auto,
+                ActivityDetectorKind::ExactZero,
+                false,
+                true,
+            ),
+            None => (
+                profile
+                    .export
+                    .default_channel_mode
+                    .unwrap_or(ChannelExportMode::Auto),
+                profile
+                    .export
+                    .activity_detector
+                    .unwrap_or(ActivityDetectorKind::WindowedRmsPeak),
+                false,
+                true,
+            ),
+        };
+
+    let reserved_name = match detector {
+        ActivityDetectorKind::FixedLevel => Some("fixed-level"),
+        ActivityDetectorKind::CalibratedNoiseFloor => Some("calibrated-noise-floor"),
+        ActivityDetectorKind::ExactZero | ActivityDetectorKind::WindowedRmsPeak => None,
+    };
+    if let Some(detector_name) = reserved_name {
+        return Err(LambError::Validation(format!(
+            "profile {name}: export.activityDetector {detector_name} is reserved and not supported"
+        )));
+    }
+
+    for (channel_name, channel) in &profile.channels {
+        if ports
+            .iter()
+            .filter(|port| port.name == *channel_name)
+            .count()
+            != 1
+        {
+            return Err(LambError::Validation(format!(
+                "profile {name}: channels.{channel_name} does not match exactly one configured port name"
+            )));
+        }
+        if let Some(activity) = &channel.activity {
+            if !activity.threshold_dbfs.is_finite()
+                || !(-120.0..=0.0).contains(&activity.threshold_dbfs)
+            {
+                return Err(LambError::Validation(format!(
+                    "profile {name}: channels.{channel_name}.activity.thresholdDbFS must be finite and within [-120.0, 0.0]"
+                )));
+            }
+            if activity.input_id.trim().is_empty() {
+                return Err(LambError::Validation(format!(
+                    "profile {name}: channels.{channel_name}.activity.inputId must be non-empty"
+                )));
+            }
+            if activity
+                .calibration_id
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(LambError::Validation(format!(
+                    "profile {name}: channels.{channel_name}.activity.calibrationId must be non-empty when present"
+                )));
+            }
+        }
+    }
+
+    let channels = ports
+        .iter()
+        .map(|port| ChannelActivityPolicy {
+            name: port.name.clone(),
+            mode: capture_port_export_mode(profile, &port.name).unwrap_or(default_mode),
+            threshold: profile
+                .channels
+                .get(&port.name)
+                .and_then(|channel| channel.activity.clone()),
+        })
+        .collect();
+
+    let layout = match profile
+        .export
+        .layout
+        .unwrap_or(ExportLayoutKind::FlatDetailed)
+    {
+        ExportLayoutKind::FlatDetailed => ResolvedLayout::FlatDetailed,
+        ExportLayoutKind::TimestampDirectory => ResolvedLayout::TimestampDirectory,
+        ExportLayoutKind::Custom => ResolvedLayout::Custom {
+            directory_pattern: profile.export.directory_pattern.clone().ok_or_else(|| {
+                LambError::Validation(format!(
+                    "profile {name}: export.directoryPattern is required for custom layout"
+                ))
+            })?,
+            filename_pattern: profile.export.filename_pattern.clone().ok_or_else(|| {
+                LambError::Validation(format!(
+                    "profile {name}: export.filenamePattern is required for custom layout"
+                ))
+            })?,
+        },
+    };
+
+    Ok(ResolvedExportPolicy {
+        output_dir,
+        layout,
+        activity: ResolvedActivityPolicy {
+            detector,
+            channels,
+            whole_export_exact_zero_gate,
+            trim_leading_silence,
+        },
+    })
+}
+
+fn capture_port_export_mode(
+    profile: &ProfileConfig,
+    channel_name: &str,
+) -> Option<ChannelExportMode> {
+    profile
+        .capture
+        .ports
+        .iter()
+        .chain(profile.pipewire.capture_ports.iter())
+        .find(|port| port.name.as_deref().map(str::trim) == Some(channel_name))
+        .and_then(|port| port.export_mode)
 }
 
 pub fn resolve_active_profile(cfg: &AppConfig) -> Result<Option<ResolvedProfile>> {
@@ -263,6 +413,7 @@ pub fn add_capture_port(cfg: &mut AppConfig, name: &str, source: &str, label: &s
     profile.capture.ports.push(CapturePort {
         source: Some(non_empty_value("source", source)?),
         name: Some(non_empty_value("name", label)?),
+        export_mode: None,
     });
     Ok(())
 }
