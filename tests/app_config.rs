@@ -3,6 +3,7 @@ use lamb::app_config::{
     default_config_path_from_env, default_config_text, load_optional_config, parse_config_text,
     write_default_config, AppConfig, ConfigLoadState,
 };
+use lamb::export_policy::ResolvedLayout;
 use lamb::profile;
 use std::collections::BTreeMap;
 use std::fs;
@@ -405,6 +406,45 @@ fn modern_activity_omission_resolves_to_auto_windowed_detector_and_trim() {
         .all(|channel| channel.mode == ChannelExportMode::Auto));
     assert!(!resolved.export_policy.activity.whole_export_exact_zero_gate);
     assert!(resolved.export_policy.activity.trim_leading_silence);
+}
+
+#[test]
+fn modern_profile_layout_omission_remains_command_default() {
+    let resolved = profile::resolve_active_profile(&parsed_pipewire_profile())
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        resolved.export_policy.layout,
+        ResolvedLayout::CommandDefault
+    );
+}
+
+#[test]
+fn explicit_profile_layouts_remain_explicit() {
+    for (fields, expected) in [
+        ("layout = \"flat-detailed\"", ResolvedLayout::FlatDetailed),
+        (
+            "layout = \"timestamp-directory\"",
+            ResolvedLayout::TimestampDirectory,
+        ),
+        (
+            r#"layout = "custom"
+directoryPattern = "stems"
+filenamePattern = "{channel}.wav""#,
+            ResolvedLayout::Custom {
+                directory_pattern: "stems".to_string(),
+                filename_pattern: "{channel}.wav".to_string(),
+            },
+        ),
+    ] {
+        let text = pipewire_profile_text("")
+            .replace("format = \"wav\"", &format!("format = \"wav\"\n{fields}"));
+        let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
+        let resolved = profile::resolve_active_profile(&cfg).unwrap().unwrap();
+
+        assert_eq!(resolved.export_policy.layout, expected);
+    }
 }
 
 #[test]

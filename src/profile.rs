@@ -266,14 +266,11 @@ fn resolve_export_policy(
         })
         .collect();
 
-    let layout = match profile
-        .export
-        .layout
-        .unwrap_or(ExportLayoutKind::FlatDetailed)
-    {
-        ExportLayoutKind::FlatDetailed => ResolvedLayout::FlatDetailed,
-        ExportLayoutKind::TimestampDirectory => ResolvedLayout::TimestampDirectory,
-        ExportLayoutKind::Custom => ResolvedLayout::Custom {
+    let layout = match profile.export.layout {
+        None => ResolvedLayout::CommandDefault,
+        Some(ExportLayoutKind::FlatDetailed) => ResolvedLayout::FlatDetailed,
+        Some(ExportLayoutKind::TimestampDirectory) => ResolvedLayout::TimestampDirectory,
+        Some(ExportLayoutKind::Custom) => ResolvedLayout::Custom {
             directory_pattern: profile.export.directory_pattern.clone().ok_or_else(|| {
                 LambError::Validation(format!(
                     "profile {name}: export.directoryPattern is required for custom layout"

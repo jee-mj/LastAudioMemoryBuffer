@@ -10,6 +10,7 @@ pub enum ExportCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedLayout {
+    CommandDefault,
     FlatDetailed,
     TimestampDirectory,
     Custom {
