@@ -672,7 +672,7 @@ impl PersistenceWorkspace {
                     maximum_path_bytes: self.config.maximum_path_bytes,
                 };
                 self.plan_policy_paths(&details, policy, &context, decision)?;
-                if let Err(error) = self.preflight_policy_finals(kind) {
+                if let Err(error) = self.preflight_planned_finals(kind) {
                     self.reset_slots();
                     return Err(error);
                 }
@@ -688,6 +688,10 @@ impl PersistenceWorkspace {
         };
         let kind = details.kind;
         if let Err(error) = self.plan_paths(frozen.total_frames(), &details) {
+            self.reset_slots();
+            return Err(error);
+        }
+        if let Err(error) = self.preflight_planned_finals(kind) {
             self.reset_slots();
             return Err(error);
         }
@@ -750,7 +754,7 @@ impl PersistenceWorkspace {
         })
     }
 
-    fn preflight_policy_finals(&self, kind: PersistenceKind) -> Result<()> {
+    fn preflight_planned_finals(&self, kind: PersistenceKind) -> Result<()> {
         match kind {
             PersistenceKind::Recall => {
                 for index in 0..self.output_count {
@@ -762,6 +766,11 @@ impl PersistenceWorkspace {
                 }
             }
             PersistenceKind::Dump => {
+                if self.output_count == 0 {
+                    return Err(LambError::ExportInvariant(
+                        "prepared atomic plan has no outputs",
+                    ));
+                }
                 let final_path = self.paths[self.outputs[0].final_path as usize].as_path();
                 let final_directory = final_path.parent().ok_or(LambError::ExportInvariant(
                     "prepared atomic final path has no parent",

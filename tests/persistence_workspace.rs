@@ -1260,6 +1260,156 @@ fn fileset_existing_nested_final_fails_before_staging_or_wav_open() {
 }
 
 #[test]
+fn legacy_recall_existing_final_fails_before_staging_or_wav_open() {
+    let geometry = Geometry {
+        retention_frames: 2,
+        channels: 1,
+        chunk_frames: 2,
+        split_when_over_bytes: 1_000,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 512,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("output");
+    let staging = root.path().join("staging");
+    let final_path =
+        output.join("lamb-20260818T120000-mic-48000Hz-000000000-000000002-part001.wav");
+    fs::create_dir(&output).unwrap();
+    fs::write(&final_path, b"foreign legacy recall").unwrap();
+    let frozen = freeze(&mut arena, &ingress, &[0.25; 2], 1);
+    let names = ["mic".to_string()];
+    let mut io = CountingIo::default();
+
+    let result = workspace.prepare_with_io(
+        &frozen,
+        PrepareRequest::Recall {
+            staging_root: &staging,
+            output_dir: &output,
+            timestamp: TIMESTAMP,
+            channel_names: &names,
+        },
+        &mut io,
+    );
+
+    assert!(
+        result.is_err(),
+        "legacy Recall collision must reject preparation"
+    );
+    drop(result);
+    assert_eq!(fs::read(&final_path).unwrap(), b"foreign legacy recall");
+    assert!(io.opened.is_empty());
+    assert_eq!(io.headers, 0);
+    assert!(!staging.exists());
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn legacy_dump_existing_final_directory_fails_before_hidden_staging_or_wav_open() {
+    let geometry = Geometry {
+        retention_frames: 2,
+        channels: 1,
+        chunk_frames: 2,
+        split_when_over_bytes: 1_000,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 512,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let final_directory = root.path().join(TIMESTAMP);
+    fs::create_dir(&final_directory).unwrap();
+    fs::write(final_directory.join("foreign"), b"foreign legacy dump").unwrap();
+    let frozen = freeze(&mut arena, &ingress, &[0.25; 2], 1);
+    let names = ["mic".to_string()];
+    let mut io = CountingIo::default();
+
+    let result = workspace.prepare_with_io(
+        &frozen,
+        PrepareRequest::Dump {
+            output_parent: root.path(),
+            timestamp: TIMESTAMP,
+            channel_names: &names,
+        },
+        &mut io,
+    );
+
+    assert!(
+        result.is_err(),
+        "legacy Dump collision must reject preparation"
+    );
+    drop(result);
+    assert_eq!(
+        fs::read(final_directory.join("foreign")).unwrap(),
+        b"foreign legacy dump"
+    );
+    assert!(io.opened.is_empty());
+    assert_eq!(io.headers, 0);
+    assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tmp-lamb-")
+    }));
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn legacy_recall_absolute_symlink_ancestor_fails_before_staging_or_wav_open() {
+    use std::os::unix::fs::symlink;
+
+    let geometry = Geometry {
+        retention_frames: 2,
+        channels: 1,
+        chunk_frames: 2,
+        split_when_over_bytes: 1_000,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 512,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("marker"), b"unchanged legacy target").unwrap();
+    let redirect = root.path().join("redirect");
+    symlink(&target, &redirect).unwrap();
+    let output = redirect.join("output");
+    let staging = root.path().join("staging");
+    let frozen = freeze(&mut arena, &ingress, &[0.25; 2], 1);
+    let names = ["mic".to_string()];
+    let mut io = CountingIo::default();
+
+    let result = workspace.prepare_with_io(
+        &frozen,
+        PrepareRequest::Recall {
+            staging_root: &staging,
+            output_dir: &output,
+            timestamp: TIMESTAMP,
+            channel_names: &names,
+        },
+        &mut io,
+    );
+
+    assert!(
+        result.is_err(),
+        "legacy Recall symlink ancestor must reject preparation"
+    );
+    drop(result);
+    assert_eq!(
+        fs::read(target.join("marker")).unwrap(),
+        b"unchanged legacy target"
+    );
+    assert!(!target.join("output").exists());
+    assert!(io.opened.is_empty());
+    assert_eq!(io.headers, 0);
+    assert!(!staging.exists());
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
 fn atomic_directory_existing_final_fails_before_staging_or_wav_open() {
     let geometry = Geometry {
         retention_frames: 2,

@@ -39,7 +39,7 @@ struct TrustedFileSetRoot {
 }
 
 impl TrustedFileSetRoot {
-    fn open(output_path: &Path) -> Result<Self> {
+    fn open(output_path: &Path, hook: &mut impl PreparedPublicationHook) -> Result<Self> {
         if !output_path.is_absolute() {
             return Err(LambError::Validation(
                 "file-set output root must be absolute".to_string(),
@@ -55,6 +55,9 @@ impl TrustedFileSetRoot {
                 Component::Normal(name) if missing => output_relative.push(name),
                 Component::Normal(name) => match open_directory_at(&directory, name) {
                     Ok(next) => {
+                        directory
+                            .sync_all()
+                            .map_err(|source| io_error(&anchor_path, source))?;
                         directory = next;
                         anchor_path.push(name);
                     }
@@ -74,21 +77,33 @@ impl TrustedFileSetRoot {
         let anchor_metadata = directory
             .metadata()
             .map_err(|source| io_error(&anchor_path, source))?;
+        let mut traversal_path = anchor_path.clone();
         for component in output_relative.components() {
             let Component::Normal(name) = component else {
                 return Err(LambError::ExportInvariant(
                     "trusted output root contains a non-normal component",
                 ));
             };
-            directory = match open_directory_at(&directory, name) {
-                Ok(next) => next,
+            let (next, created) = match open_directory_at(&directory, name) {
+                Ok(next) => (next, false),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     mkdir_at(&directory, name, output_path)?;
-                    open_directory_at(&directory, name)
-                        .map_err(|source| io_error(output_path, source))?
+                    (
+                        open_directory_at(&directory, name)
+                            .map_err(|source| io_error(output_path, source))?,
+                        true,
+                    )
                 }
                 Err(source) => return Err(io_error(output_path, source)),
             };
+            directory
+                .sync_all()
+                .map_err(|source| io_error(&traversal_path, source))?;
+            if created {
+                hook.sync_directory(&traversal_path)?;
+            }
+            traversal_path.push(name);
+            directory = next;
         }
         let output_metadata = directory
             .metadata()
@@ -779,7 +794,7 @@ fn publish_recall_inner(
     staging_identity: (u64, u64),
 ) -> std::result::Result<PublishedOutput, RecallPublishError> {
     let trusted_root =
-        TrustedFileSetRoot::open(output_directory).map_err(RecallPublishError::retryable)?;
+        TrustedFileSetRoot::open(output_directory, hook).map_err(RecallPublishError::retryable)?;
     let mut manifest = TransactionManifest::new_with_directories(slots, directories, path_bytes);
     manifest.version = MANIFEST_VERSION;
     manifest.uid = unsafe { libc::geteuid() };

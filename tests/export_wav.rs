@@ -838,6 +838,43 @@ fn fileset_newly_created_output_root_replacement_is_rejected_before_mutation() {
 }
 
 #[test]
+fn fileset_new_configured_root_syncs_containing_parent_before_manifest() {
+    let containing_parent = Arc::new(std::sync::Mutex::new(None));
+    let setup_parent = Arc::clone(&containing_parent);
+    let mut trace = SyncTrace {
+        setup: Some(Box::new(move |output| {
+            *setup_parent.lock().unwrap() = Some(output.parent().unwrap().to_path_buf());
+            fs::remove_dir(output).unwrap();
+        })),
+        ..Default::default()
+    };
+
+    with_real_capture(
+        ExportCommand::Recall,
+        custom_directory_layout("{timestamp}/nested"),
+        &mut trace,
+        |_, _, _, _, _, _, result| {
+            assert!(matches!(result, PreparedPublication::Published(_)));
+        },
+    );
+
+    let containing_parent = containing_parent.lock().unwrap().clone().unwrap();
+    let parent_sync = trace
+        .events
+        .iter()
+        .position(|event| matches!(event, SyncEvent::Directory(path) if path == &containing_parent))
+        .expect("configured output root creation must sync its containing parent");
+    let manifest_prepared = trace
+        .events
+        .iter()
+        .position(|event| {
+            event == &SyncEvent::Checkpoint(PublicationCheckpoint::RecallManifestPrepared)
+        })
+        .unwrap();
+    assert!(parent_sync < manifest_prepared);
+}
+
+#[test]
 fn fileset_vanished_unjournaled_parent_is_not_recreated_by_deeper_intent() {
     let mut hook = RemoveExistingIntermediateAtManifestPrepared::default();
     with_real_capture(

@@ -2123,6 +2123,7 @@ fn manifest_and_publication_directory_syncs_follow_crash_safe_order() {
     assert_eq!(
         recall_hook.events,
         vec![
+            PublicationEvent::DirectorySync(recall_output.parent().unwrap().to_path_buf()),
             PublicationEvent::DirectorySync(transaction_root.clone()),
             PublicationEvent::Checkpoint(PublicationCheckpoint::RecallManifestPrepared),
             PublicationEvent::DirectorySync(transaction_root.clone()),
