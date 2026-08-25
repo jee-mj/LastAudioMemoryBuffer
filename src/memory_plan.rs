@@ -37,6 +37,7 @@ pub const CAPTURE_COMMAND_RESULT_SLOT_BYTES: u64 = 512;
 // module-cycle-free plan constants to the concrete private detector layouts.
 pub const FROZEN_EXPORT_DECISION_SLOT_BYTES: u64 = 24;
 pub const ACTIVITY_DETECTOR_STATE_SLOT_BYTES: u64 = 104;
+pub const CALIBRATION_SLOT_METADATA_BYTES: u64 = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SessionMemoryInputs {
@@ -55,6 +56,7 @@ pub struct SessionMemoryInputs {
     pub capture_worker_stack_bytes: u64,
     pub io_buffer_bytes_per_channel: u64,
     pub maximum_path_bytes: u64,
+    pub maximum_calibration_seconds: u32,
     pub headroom: f64,
 }
 
@@ -89,6 +91,10 @@ pub struct SessionMemoryPlan {
     path_slots: u64,
     manifest_paths_bytes: u64,
     manifest_directory_slots: u64,
+    calibration_sample_frames: u64,
+    calibration_complete_windows: u64,
+    calibration_window_frames: u64,
+    calibration_hop_frames: u64,
 }
 
 impl SessionMemoryPlan {
@@ -179,6 +185,59 @@ impl SessionMemoryPlan {
         let capture_command_result_slot =
             allocation_budget_bytes(CAPTURE_COMMAND_RESULT_SLOT_BYTES)?;
         let capture_worker_stack = allocation_budget_bytes(inputs.capture_worker_stack_bytes)?;
+        let calibration_sample_frames = checked_mul(
+            "calibration sample frame count overflow",
+            u64::from(inputs.maximum_calibration_seconds),
+            u64::from(inputs.sample_rate),
+        )?;
+        let window_frames = checked_mul(
+            "calibration window geometry overflow",
+            u64::from(inputs.sample_rate),
+            20,
+        )?
+        .div_ceil(1_000)
+        .max(1);
+        let hop_frames = checked_mul(
+            "calibration hop geometry overflow",
+            u64::from(inputs.sample_rate),
+            10,
+        )?
+        .div_ceil(1_000)
+        .max(1);
+        let calibration_complete_windows =
+            if calibration_sample_frames == 0 || calibration_sample_frames < window_frames {
+                0
+            } else {
+                calibration_sample_frames
+                    .checked_sub(window_frames)
+                    .and_then(|remaining| remaining.checked_div(hop_frames))
+                    .and_then(|hops| hops.checked_add(1))
+                    .ok_or_else(|| {
+                        LambError::Validation("calibration window count overflow".to_string())
+                    })?
+            };
+        let calibration_samples_payload = checked_mul(
+            "calibration sample storage overflow",
+            calibration_sample_frames,
+            u64::try_from(size_of::<f32>()).unwrap(),
+        )?;
+        let calibration_rms_payload = checked_mul(
+            "calibration RMS storage overflow",
+            calibration_complete_windows,
+            u64::try_from(size_of::<f32>()).unwrap(),
+        )?;
+        let calibration_peak_payload = calibration_rms_payload;
+        let calibration_allocation = |payload| {
+            if payload == 0 {
+                Ok(0)
+            } else {
+                allocation_budget_bytes(payload)
+            }
+        };
+        let calibration_samples = calibration_allocation(calibration_samples_payload)?;
+        let calibration_rms = calibration_allocation(calibration_rms_payload)?;
+        let calibration_peak = calibration_allocation(calibration_peak_payload)?;
+        let calibration_slot_metadata = allocation_budget_bytes(CALIBRATION_SLOT_METADATA_BYTES)?;
 
         let interleaved_scratch = checked_mul(
             "interleaved scratch sample count overflow",
@@ -414,6 +473,22 @@ impl SessionMemoryPlan {
                 bytes: capture_worker_stack,
             },
             MemoryComponent {
+                name: "calibration_samples",
+                bytes: calibration_samples,
+            },
+            MemoryComponent {
+                name: "calibration_rms",
+                bytes: calibration_rms,
+            },
+            MemoryComponent {
+                name: "calibration_peak",
+                bytes: calibration_peak,
+            },
+            MemoryComponent {
+                name: "calibration_slot_metadata",
+                bytes: calibration_slot_metadata,
+            },
+            MemoryComponent {
                 name: "persistence_workspace",
                 bytes: persistence_workspace,
             },
@@ -512,6 +587,10 @@ impl SessionMemoryPlan {
             path_slots: path_slot_count,
             manifest_paths_bytes: manifest_paths,
             manifest_directory_slots,
+            calibration_sample_frames,
+            calibration_complete_windows,
+            calibration_window_frames: window_frames,
+            calibration_hop_frames: hop_frames,
         })
     }
 
@@ -615,6 +694,21 @@ impl SessionMemoryPlan {
 
     pub fn manifest_directory_slots(&self) -> u64 {
         self.manifest_directory_slots
+    }
+
+    pub fn calibration_sample_frames(&self) -> u64 {
+        self.calibration_sample_frames
+    }
+
+    pub fn calibration_complete_windows(&self) -> u64 {
+        self.calibration_complete_windows
+    }
+
+    pub fn calibration_window_frames(&self) -> u64 {
+        self.calibration_window_frames
+    }
+    pub fn calibration_hop_frames(&self) -> u64 {
+        self.calibration_hop_frames
     }
 
     pub fn validate_max(&self, maximum: Option<u64>) -> Result<()> {
@@ -949,6 +1043,11 @@ fn system_page_size() -> usize {
 }
 
 fn validate_inputs(inputs: SessionMemoryInputs) -> Result<()> {
+    if inputs.maximum_calibration_seconds > 30 {
+        return Err(LambError::Validation(
+            "maximum_calibration_seconds must be <= 30".to_string(),
+        ));
+    }
     for (name, value) in [
         ("retention_frames", inputs.retention_frames),
         ("channels", u64::from(inputs.channels)),

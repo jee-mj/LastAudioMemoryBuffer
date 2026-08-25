@@ -91,6 +91,7 @@ fn plan(geometry: Geometry) -> SessionMemoryPlan {
         capture_worker_stack_bytes: 256 * 1024,
         io_buffer_bytes_per_channel: geometry.io_buffer_bytes_per_channel,
         maximum_path_bytes: geometry.maximum_path_bytes,
+        maximum_calibration_seconds: 0,
         headroom: 1.0,
     })
     .unwrap()

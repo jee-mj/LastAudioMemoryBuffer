@@ -45,8 +45,70 @@ fn inputs() -> SessionMemoryInputs {
         capture_worker_stack_bytes: 2_048,
         io_buffer_bytes_per_channel: 64,
         maximum_path_bytes: 128,
+        maximum_calibration_seconds: 0,
         headroom: 1.0,
     }
+}
+
+#[test]
+fn calibration_memory_reserves_exact_profile_sample_and_window_storage() {
+    // Catches production omitting calibration buffers from memory.max or using
+    // non-overlapping windows. At 1 kHz, 30 seconds is 30_000 mono samples;
+    // 20-ms windows with a 10-ms hop yield 2_999 complete windows.
+    let mut profile = inputs();
+    profile.sample_rate = 1_000;
+    profile.maximum_calibration_seconds = 30;
+    let plan = SessionMemoryPlan::calculate(profile).unwrap();
+
+    assert_eq!(plan.calibration_sample_frames(), 30_000);
+    assert_eq!(plan.calibration_complete_windows(), 2_999);
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    let allocation =
+        |payload: u64| (payload + ALLOCATOR_HEADER_RESERVE_BYTES).div_ceil(page) * page;
+    assert_eq!(
+        plan.component("calibration_samples").unwrap().bytes,
+        allocation(30_000 * 4)
+    );
+    assert_eq!(
+        plan.component("calibration_rms").unwrap().bytes,
+        allocation(2_999 * 4)
+    );
+    assert_eq!(
+        plan.component("calibration_peak").unwrap().bytes,
+        allocation(2_999 * 4)
+    );
+    assert!(plan.committed_bytes() >= allocation(30_000 * 4) + 2 * allocation(2_999 * 4));
+
+    let mut legacy = profile;
+    legacy.maximum_calibration_seconds = 0;
+    let legacy = SessionMemoryPlan::calculate(legacy).unwrap();
+    assert_eq!(legacy.calibration_sample_frames(), 0);
+    assert_eq!(legacy.calibration_complete_windows(), 0);
+}
+
+#[test]
+fn calibration_duration_boundaries_and_detector_v1_ceil_geometry_are_checked() {
+    let mut one_second = inputs();
+    one_second.sample_rate = 44_101;
+    one_second.maximum_calibration_seconds = 1;
+    let one_second = SessionMemoryPlan::calculate(one_second).unwrap();
+    assert_eq!(one_second.calibration_sample_frames(), 44_101);
+    assert_eq!(one_second.calibration_window_frames(), 883);
+    assert_eq!(one_second.calibration_hop_frames(), 442);
+    assert_eq!(one_second.calibration_complete_windows(), 98);
+
+    let mut thirty_seconds = inputs();
+    thirty_seconds.sample_rate = 3;
+    thirty_seconds.maximum_calibration_seconds = 30;
+    let thirty_seconds = SessionMemoryPlan::calculate(thirty_seconds).unwrap();
+    assert_eq!(thirty_seconds.calibration_sample_frames(), 90);
+    assert_eq!(thirty_seconds.calibration_window_frames(), 1);
+    assert_eq!(thirty_seconds.calibration_hop_frames(), 1);
+    assert_eq!(thirty_seconds.calibration_complete_windows(), 90);
+
+    let mut over_maximum = inputs();
+    over_maximum.maximum_calibration_seconds = 31;
+    assert!(SessionMemoryPlan::calculate(over_maximum).is_err());
 }
 
 #[test]

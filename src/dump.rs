@@ -1020,6 +1020,7 @@ mod coordinator_review_tests {
             capture_worker_stack_bytes: 256 * 1024,
             io_buffer_bytes_per_channel: 4 * 1024,
             maximum_path_bytes: 512,
+            maximum_calibration_seconds: 0,
             headroom: 1.0,
         })
         .unwrap();

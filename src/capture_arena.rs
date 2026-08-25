@@ -1,7 +1,7 @@
 use crate::error::{LambError, Result};
 use crate::memory_plan::{
-    ExactArray, MaterializedBuffer, SessionMemoryPlan, CAPTURE_COMMAND_RESULT_SLOT_BYTES,
-    CAPTURE_QUEUE_SLOT_METADATA_BYTES,
+    ExactArray, MaterializedBuffer, SessionMemoryPlan, CALIBRATION_SLOT_METADATA_BYTES,
+    CAPTURE_COMMAND_RESULT_SLOT_BYTES, CAPTURE_QUEUE_SLOT_METADATA_BYTES,
 };
 use crate::sample_ring::{RingConfig, SampleFormat, SampleRing};
 use std::cell::{Cell, UnsafeCell};
@@ -27,6 +27,14 @@ const COMMAND_KIND_RELEASE: u8 = 2;
 const COMMAND_KIND_CLEAR: u8 = 3;
 const COMMAND_KIND_STATUS: u8 = 4;
 const COMMAND_KIND_SHUTDOWN: u8 = 5;
+const CALIBRATION_IDLE: u8 = 0;
+const CALIBRATION_READY: u8 = 1;
+const CALIBRATION_CAPTURING: u8 = 2;
+const CALIBRATION_COMPLETE: u8 = 3;
+const CALIBRATION_LEASED: u8 = 4;
+const CALIBRATION_PREPARING: u8 = 5;
+const CALIBRATION_CANCELLED: u8 = 6;
+const CALIBRATION_FAILED: u8 = 7;
 const PRODUCER_OPEN: u64 = 1 << 63;
 const PRODUCER_COUNT_MASK: u64 = PRODUCER_OPEN - 1;
 const WORKER_IDLE_WAIT: Duration = Duration::from_millis(10);
@@ -97,6 +105,64 @@ pub struct CaptureRuntimeConfig {
     pub slot_frames: u32,
     pub sample_bytes: u32,
     pub worker_stack_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CalibrationCaptureRequest {
+    pub channel: u32,
+    pub frames: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CalibrationCaptureMetadata {
+    pub frames: u64,
+    pub sample_rate: u32,
+    pub complete_windows: u64,
+    /// Frames present in the latest started window when that trailing window is incomplete.
+    pub partial_final_frames: u64,
+    pub dropped_frames: u64,
+    pub usable: bool,
+}
+
+pub struct CalibrationLease<'a> {
+    slot: &'a CalibrationSlot,
+    metadata: CalibrationCaptureMetadata,
+}
+
+impl CalibrationLease<'_> {
+    pub fn samples(&self) -> &[f32] {
+        unsafe { &(*self.slot.samples.get()).as_slice()[..self.metadata.frames as usize] }
+    }
+    pub fn rms(&self) -> &[f32] {
+        unsafe { &(*self.slot.rms.get()).as_slice()[..self.metadata.complete_windows as usize] }
+    }
+    pub fn peak(&self) -> &[f32] {
+        unsafe { &(*self.slot.peak.get()).as_slice()[..self.metadata.complete_windows as usize] }
+    }
+    pub fn sample_rate(&self) -> u32 {
+        self.metadata.sample_rate
+    }
+    pub fn complete_windows(&self) -> u64 {
+        self.metadata.complete_windows
+    }
+    /// Returns the frame count in the latest trailing incomplete window, or zero.
+    pub fn partial_final_frames(&self) -> u64 {
+        self.metadata.partial_final_frames
+    }
+    pub fn metadata(&self) -> CalibrationCaptureMetadata {
+        self.metadata
+    }
+}
+
+impl Drop for CalibrationLease<'_> {
+    fn drop(&mut self) {
+        let _ = self.slot.state.compare_exchange(
+            CALIBRATION_LEASED,
+            CALIBRATION_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 pub struct CaptureIngress {
@@ -179,6 +245,8 @@ struct IngressQueue {
     cumulative_dropped_frames: AtomicU64,
     drop_counter_exhausted: AtomicBool,
     producer_admission: AtomicU64,
+    producer_generation: AtomicU64,
+    producer_generation_exhausted: AtomicBool,
 }
 
 struct WorkerWake {
@@ -189,6 +257,7 @@ struct WorkerWake {
 struct RuntimeShared {
     queue: Arc<IngressQueue>,
     command: Arc<CommandSlot>,
+    calibration: Arc<CalibrationSlot>,
     wake: Arc<WorkerWake>,
     worker_done: AtomicBool,
     final_worker_written_frames: AtomicU64,
@@ -197,7 +266,42 @@ struct RuntimeShared {
     shutdown_reply_pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     #[cfg(test)]
     clear_reply_pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    calibration_start_pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    calibration_before_accept_pause:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    calibration_after_consume_pause:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    calibration_timeout_pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    calibration_wait_pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    calibration_fault_after_start: AtomicBool,
 }
+
+struct CalibrationSlot {
+    state: AtomicU8,
+    request: UnsafeCell<MaybeUninit<CalibrationRequest>>,
+    metadata: UnsafeCell<CalibrationCaptureMetadata>,
+    samples: UnsafeCell<MaterializedBuffer<f32>>,
+    rms: UnsafeCell<MaterializedBuffer<f32>>,
+    peak: UnsafeCell<MaterializedBuffer<f32>>,
+    window_frames: u64,
+    hop_frames: u64,
+    wait_mutex: Mutex<()>,
+    wait_condvar: Condvar,
+}
+
+#[derive(Clone, Copy)]
+struct CalibrationRequest {
+    channel: u32,
+    frames: u64,
+}
+unsafe impl Sync for CalibrationSlot {}
+const _: () = assert!(size_of::<CalibrationSlot>() as u64 <= CALIBRATION_SLOT_METADATA_BYTES);
 
 struct CommandSlot {
     state: AtomicU8,
@@ -326,6 +430,21 @@ struct WorkerState {
     channels: u32,
     sample_rate: u32,
     format: SampleFormat,
+    calibration: Option<CalibrationCapture>,
+}
+
+struct CalibrationCapture {
+    request: CalibrationRequest,
+    first_sequence: u64,
+    dropped_at_acceptance: u64,
+    copied: u64,
+    complete_windows: u64,
+    sums: [f64; 2],
+    peaks: [f32; 2],
+    counts: [u64; 2],
+    starts: [u64; 2],
+    started: [bool; 2],
+    invalid: bool,
 }
 
 impl IngressQueue {
@@ -355,6 +474,8 @@ impl IngressQueue {
             cumulative_dropped_frames: AtomicU64::new(0),
             drop_counter_exhausted: AtomicBool::new(false),
             producer_admission: AtomicU64::new(PRODUCER_OPEN),
+            producer_generation: AtomicU64::new(0),
+            producer_generation_exhausted: AtomicBool::new(false),
         };
         queue.materialize_pages()?;
         Ok(queue)
@@ -501,7 +622,27 @@ impl IngressQueue {
         self.producer_admission.load(Ordering::Acquire) & PRODUCER_COUNT_MASK
     }
 
-    fn consume_next(&self, consume: impl FnOnce(&[f32], u64)) -> bool {
+    fn calibration_boundary(&self) -> Result<Option<(u64, u64)>> {
+        if self.producer_generation_exhausted.load(Ordering::Acquire) {
+            return Err(LambError::CaptureInvariant(
+                "capture producer generation exhausted",
+            ));
+        }
+        let generation = self.producer_generation.load(Ordering::Acquire);
+        if self.admitted_producers() != 0 {
+            return Ok(None);
+        }
+        let first_sequence = self.published_head();
+        let dropped_at_acceptance = self.cumulative_dropped_frames.load(Ordering::Acquire);
+        if self.admitted_producers() != 0
+            || self.producer_generation.load(Ordering::Acquire) != generation
+        {
+            return Ok(None);
+        }
+        Ok(Some((first_sequence, dropped_at_acceptance)))
+    }
+
+    fn consume_next(&self, consume: impl FnOnce(&[f32], u64, u64)) -> bool {
         let consumed = self.consumed_sequence.load(Ordering::Relaxed);
         let published = self.published_sequence.load(Ordering::Acquire);
         if consumed >= published {
@@ -511,7 +652,7 @@ impl IngressQueue {
         let storage = unsafe { &*slot.storage.get() };
         let frames = u64::from(storage.frames);
         let sample_count = storage.frames as usize * self.channels as usize;
-        consume(&storage.samples[..sample_count], frames);
+        consume(&storage.samples[..sample_count], frames, consumed);
         self.consumed_sequence
             .store(consumed + 1, Ordering::Release);
         true
@@ -569,6 +710,18 @@ impl<'a> ProducerAdmission<'a> {
 
 impl Drop for ProducerAdmission<'_> {
     fn drop(&mut self) {
+        if self
+            .queue
+            .producer_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .is_err()
+        {
+            self.queue
+                .producer_generation_exhausted
+                .store(true, Ordering::Release);
+        }
         let previous = self.queue.producer_admission.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(
             previous & PRODUCER_COUNT_MASK > 0,
@@ -670,6 +823,71 @@ impl CommandSlot {
     }
 }
 
+impl CalibrationSlot {
+    fn new(sample_frames: u64, windows: u64, window_frames: u64, hop_frames: u64) -> Result<Self> {
+        let sample_frames = usize::try_from(sample_frames).map_err(|_| {
+            LambError::Validation("calibration sample capacity exceeds usize".to_string())
+        })?;
+        let windows = usize::try_from(windows).map_err(|_| {
+            LambError::Validation("calibration window capacity exceeds usize".to_string())
+        })?;
+        Ok(Self {
+            state: AtomicU8::new(CALIBRATION_IDLE),
+            request: UnsafeCell::new(MaybeUninit::uninit()),
+            metadata: UnsafeCell::new(CalibrationCaptureMetadata {
+                frames: 0,
+                sample_rate: 0,
+                complete_windows: 0,
+                partial_final_frames: 0,
+                dropped_frames: 0,
+                usable: false,
+            }),
+            samples: UnsafeCell::new(MaterializedBuffer::new_zeroed(sample_frames)?),
+            rms: UnsafeCell::new(MaterializedBuffer::new_zeroed(windows)?),
+            peak: UnsafeCell::new(MaterializedBuffer::new_zeroed(windows)?),
+            window_frames,
+            hop_frames,
+            wait_mutex: Mutex::new(()),
+            wait_condvar: Condvar::new(),
+        })
+    }
+
+    fn begin(&self, request: CalibrationRequest) -> Result<()> {
+        self.state
+            .compare_exchange(
+                CALIBRATION_IDLE,
+                CALIBRATION_PREPARING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| LambError::ControlInvariant("calibration already pending"))?;
+        unsafe { (*self.request.get()).write(request) };
+        // The release store publishes the initialized request to the sole worker.
+        self.state.store(CALIBRATION_READY, Ordering::Release);
+        Ok(())
+    }
+
+    fn take_ready(&self) -> Option<CalibrationRequest> {
+        self.state
+            .compare_exchange(
+                CALIBRATION_READY,
+                CALIBRATION_CAPTURING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(unsafe { (*self.request.get()).assume_init_read() })
+    }
+
+    fn samples_capacity(&self) -> u64 {
+        unsafe { (&*self.samples.get()).len() as u64 }
+    }
+
+    fn notify_waiters(&self) {
+        self.wait_condvar.notify_all();
+    }
+}
+
 impl Drop for CommandSlot {
     fn drop(&mut self) {
         match self.state.load(Ordering::Acquire) {
@@ -686,7 +904,7 @@ impl CaptureArena {
         runtime: CaptureRuntimeConfig,
     ) -> Result<(Self, CaptureIngress)> {
         let validation = runtime.clone();
-        Self::allocate_validated(plan, &validation, || Self::allocate_runtime(runtime))
+        Self::allocate_validated(plan, &validation, || Self::allocate_runtime(plan, runtime))
     }
 
     fn allocate_validated<T>(
@@ -698,13 +916,22 @@ impl CaptureArena {
         allocate()
     }
 
-    fn allocate_runtime(runtime: CaptureRuntimeConfig) -> Result<(Self, CaptureIngress)> {
+    fn allocate_runtime(
+        plan: &SessionMemoryPlan,
+        runtime: CaptureRuntimeConfig,
+    ) -> Result<(Self, CaptureIngress)> {
         let runtime_id = NEXT_CAPTURE_RUNTIME_ID
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| LambError::CaptureInvariant("capture runtime identity exhausted"))?;
         let config = runtime.ring;
+        let calibration = Arc::new(CalibrationSlot::new(
+            plan.calibration_sample_frames(),
+            plan.calibration_complete_windows(),
+            plan.calibration_window_frames(),
+            plan.calibration_hop_frames(),
+        )?);
         let queue = Arc::new(IngressQueue::new(
             runtime.queue_slots,
             runtime.slot_frames,
@@ -724,6 +951,7 @@ impl CaptureArena {
         let shared = Arc::new(RuntimeShared {
             queue: Arc::clone(&queue),
             command: Arc::new(CommandSlot::new()),
+            calibration: Arc::clone(&calibration),
             wake: Arc::clone(&wake),
             worker_done: AtomicBool::new(false),
             final_worker_written_frames: AtomicU64::new(0),
@@ -732,6 +960,18 @@ impl CaptureArena {
             shutdown_reply_pause: Mutex::new(None),
             #[cfg(test)]
             clear_reply_pause: Mutex::new(None),
+            #[cfg(test)]
+            calibration_start_pause: Mutex::new(None),
+            #[cfg(test)]
+            calibration_before_accept_pause: Mutex::new(None),
+            #[cfg(test)]
+            calibration_after_consume_pause: Mutex::new(None),
+            #[cfg(test)]
+            calibration_timeout_pause: Mutex::new(None),
+            #[cfg(test)]
+            calibration_wait_pause: Mutex::new(None),
+            #[cfg(test)]
+            calibration_fault_after_start: AtomicBool::new(false),
         });
         let stack_size = usize::try_from(runtime.worker_stack_bytes).map_err(|_| {
             LambError::Validation("capture worker stack size exceeds usize".to_string())
@@ -757,6 +997,7 @@ impl CaptureArena {
                     channels: config.channels,
                     sample_rate: config.sample_rate,
                     format: config.format,
+                    calibration: None,
                 };
                 state.run();
             })
@@ -782,6 +1023,152 @@ impl CaptureArena {
 
     pub fn runtime_id(&self) -> u64 {
         self.runtime_id
+    }
+
+    pub fn calibrate_channel(
+        &self,
+        request: CalibrationCaptureRequest,
+        timeout: Duration,
+    ) -> Result<CalibrationLease<'_>> {
+        let deadline = command_deadline(timeout)?;
+        if request.channel >= self.shared.queue.channels {
+            return Err(LambError::Validation(
+                "calibration channel is out of range".to_string(),
+            ));
+        }
+        if request.frames == 0 || request.frames > self.shared.calibration.samples_capacity() {
+            return Err(LambError::Validation(
+                "calibration frame count is outside startup capacity".to_string(),
+            ));
+        }
+        self.shared.calibration.begin(CalibrationRequest {
+            channel: request.channel,
+            frames: request.frames,
+        })?;
+        self.shared.wake.condvar.notify_one();
+        loop {
+            let state = self.shared.calibration.state.load(Ordering::Acquire);
+            match state {
+                CALIBRATION_COMPLETE => {
+                    if self
+                        .shared
+                        .calibration
+                        .state
+                        .compare_exchange(
+                            CALIBRATION_COMPLETE,
+                            CALIBRATION_LEASED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return Ok(CalibrationLease {
+                            slot: &self.shared.calibration,
+                            metadata: unsafe { *self.shared.calibration.metadata.get() },
+                        });
+                    }
+                }
+                CALIBRATION_FAILED => {
+                    if self
+                        .shared
+                        .calibration
+                        .state
+                        .compare_exchange(
+                            CALIBRATION_FAILED,
+                            CALIBRATION_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return Err(LambError::CaptureInvariant(
+                            "capture worker failed during calibration",
+                        ));
+                    }
+                }
+                CALIBRATION_IDLE => {
+                    return Err(LambError::CaptureInvariant(
+                        "calibration capture was cancelled",
+                    ))
+                }
+                CALIBRATION_READY | CALIBRATION_CAPTURING if Instant::now() >= deadline => {
+                    #[cfg(test)]
+                    Self::run_calibration_pause(&self.shared.calibration_timeout_pause);
+                    let _guard = self.shared.calibration.wait_mutex.lock().map_err(|_| {
+                        LambError::ControlInvariant("calibration wait mutex poisoned")
+                    })?;
+                    let cancelled = match self.shared.calibration.state.load(Ordering::Acquire) {
+                        CALIBRATION_READY => self
+                            .shared
+                            .calibration
+                            .state
+                            .compare_exchange(
+                                CALIBRATION_READY,
+                                CALIBRATION_IDLE,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok(),
+                        CALIBRATION_CAPTURING => self
+                            .shared
+                            .calibration
+                            .state
+                            .compare_exchange(
+                                CALIBRATION_CAPTURING,
+                                CALIBRATION_CANCELLED,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok(),
+                        _ => false,
+                    };
+                    if cancelled {
+                        self.shared.wake.condvar.notify_all();
+                        return Err(LambError::ControlInvariant("calibration timed out"));
+                    }
+                }
+                _ if self.worker_has_exited() => {
+                    let _guard = self.shared.calibration.wait_mutex.lock().map_err(|_| {
+                        LambError::ControlInvariant("calibration wait mutex poisoned")
+                    })?;
+                    match self.shared.calibration.state.load(Ordering::Acquire) {
+                        CALIBRATION_READY | CALIBRATION_CAPTURING | CALIBRATION_CANCELLED => {
+                            self.shared
+                                .calibration
+                                .state
+                                .store(CALIBRATION_IDLE, Ordering::Release);
+                            return Err(LambError::CaptureInvariant(
+                                "capture worker exited during calibration",
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {
+                    #[cfg(test)]
+                    Self::run_calibration_pause(&self.shared.calibration_wait_pause);
+                    let guard = self.shared.calibration.wait_mutex.lock().map_err(|_| {
+                        LambError::ControlInvariant("calibration wait mutex poisoned")
+                    })?;
+                    if self.shared.calibration.state.load(Ordering::Acquire) == state {
+                        let _ = self.shared.calibration.wait_condvar.wait_timeout(
+                            guard,
+                            deadline.saturating_duration_since(Instant::now()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn run_calibration_pause(
+        pause: &Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    ) {
+        if let Some((entered, release)) = pause.lock().ok().and_then(|mut pause| pause.take()) {
+            entered.wait();
+            release.wait();
+        }
     }
 
     pub fn freeze_since(
@@ -1334,7 +1721,7 @@ impl CaptureArena {
     }
 
     fn classify_unconsumed_after_worker(&self) {
-        while self.shared.queue.consume_next(|_, frames| {
+        while self.shared.queue.consume_next(|_, frames, _| {
             let _ = self.shared.queue.add_dropped_frames(frames);
         }) {}
     }
@@ -1411,6 +1798,7 @@ impl FrozenCaptureEpoch {
 impl WorkerState {
     fn run(mut self) {
         loop {
+            self.cancel_calibration_if_requested();
             let command_state = self.shared.command.state.load(Ordering::Acquire);
             if command_state == COMMAND_PREPARING {
                 self.wait_for_work();
@@ -1463,6 +1851,7 @@ impl WorkerState {
             }
             self.wait_for_work();
         }
+        self.fail_calibration();
         self.shared.worker_done.store(true, Ordering::Release);
         self.shared.wake.condvar.notify_all();
     }
@@ -1484,17 +1873,23 @@ impl WorkerState {
     }
 
     fn consume_one(&mut self) -> bool {
+        self.start_calibration_if_ready();
         let mut consumed = false;
         let queue = Arc::clone(&self.shared.queue);
-        queue.consume_next(|samples, frames| {
+        queue.consume_next(|samples, frames, sequence| {
             consumed = true;
-            self.consume_samples(samples, frames);
+            self.consume_samples(samples, frames, sequence);
         });
+        #[cfg(test)]
+        if consumed {
+            CaptureArena::run_calibration_pause(&self.shared.calibration_after_consume_pause);
+        }
         consumed
     }
 
-    fn consume_samples(&mut self, samples: &[f32], frames: u64) {
+    fn consume_samples(&mut self, samples: &[f32], frames: u64, sequence: u64) {
         if self.worker_fault.is_some() {
+            self.fail_calibration();
             let _ = self.shared.queue.add_dropped_frames(frames);
             return;
         }
@@ -1515,6 +1910,232 @@ impl WorkerState {
         }
         self.absolute_head = next_absolute;
         self.worker_written_frames = next_written;
+        self.copy_calibration_samples(samples, frames, sequence);
+    }
+
+    fn start_calibration_if_ready(&mut self) {
+        #[cfg(test)]
+        if self.shared.calibration.state.load(Ordering::Acquire) == CALIBRATION_READY {
+            CaptureArena::run_calibration_pause(&self.shared.calibration_before_accept_pause);
+        }
+        let boundary = match self.shared.queue.calibration_boundary() {
+            Ok(Some(boundary)) => boundary,
+            Ok(None) => return,
+            Err(_) => {
+                self.set_worker_fault("capture producer generation exhausted");
+                return;
+            }
+        };
+        let Some(request) = self.shared.calibration.take_ready() else {
+            return;
+        };
+        #[cfg(test)]
+        CaptureArena::run_calibration_pause(&self.shared.calibration_start_pause);
+        if self.shared.calibration.state.load(Ordering::Acquire) != CALIBRATION_CAPTURING {
+            self.cancel_calibration_if_requested();
+            return;
+        }
+        self.calibration = Some(CalibrationCapture {
+            request,
+            first_sequence: boundary.0,
+            dropped_at_acceptance: boundary.1,
+            copied: 0,
+            complete_windows: 0,
+            sums: [0.0; 2],
+            peaks: [0.0; 2],
+            counts: [0; 2],
+            starts: [0; 2],
+            started: [false; 2],
+            invalid: false,
+        });
+        #[cfg(test)]
+        if self
+            .shared
+            .calibration_fault_after_start
+            .swap(false, Ordering::AcqRel)
+        {
+            self.set_worker_fault("injected calibration worker fault");
+        }
+    }
+
+    fn cancel_calibration_if_requested(&mut self) {
+        if self.shared.calibration.state.load(Ordering::Acquire) == CALIBRATION_CANCELLED {
+            self.calibration = None;
+            let _guard = self
+                .shared
+                .calibration
+                .wait_mutex
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = self.shared.calibration.state.compare_exchange(
+                CALIBRATION_CANCELLED,
+                CALIBRATION_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.shared.calibration.notify_waiters();
+        }
+    }
+
+    fn fail_calibration(&mut self) {
+        self.calibration = None;
+        let _guard = self
+            .shared
+            .calibration
+            .wait_mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            let state = self.shared.calibration.state.load(Ordering::Acquire);
+            let terminal = match state {
+                CALIBRATION_READY | CALIBRATION_CAPTURING => CALIBRATION_FAILED,
+                CALIBRATION_CANCELLED => CALIBRATION_IDLE,
+                _ => break,
+            };
+            if self
+                .shared
+                .calibration
+                .state
+                .compare_exchange(state, terminal, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        self.shared.calibration.notify_waiters();
+    }
+
+    fn set_worker_fault(&mut self, fault: &'static str) {
+        self.worker_fault = Some(fault);
+        self.fail_calibration();
+    }
+
+    fn copy_calibration_samples(&mut self, samples: &[f32], frames: u64, sequence: u64) {
+        let Some(capture) = self.calibration.as_mut() else {
+            return;
+        };
+        if self.shared.calibration.state.load(Ordering::Acquire) == CALIBRATION_CANCELLED {
+            self.calibration = None;
+            let _guard = self
+                .shared
+                .calibration
+                .wait_mutex
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = self.shared.calibration.state.compare_exchange(
+                CALIBRATION_CANCELLED,
+                CALIBRATION_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.shared.calibration.notify_waiters();
+            return;
+        }
+        if sequence < capture.first_sequence {
+            return;
+        }
+        let channel = capture.request.channel as usize;
+        for frame in 0..frames {
+            if capture.copied == capture.request.frames {
+                break;
+            }
+            let sample = samples[frame as usize * self.channels as usize + channel];
+            unsafe {
+                (*self.shared.calibration.samples.get()).as_mut_slice()[capture.copied as usize] =
+                    sample;
+            }
+            if !sample.is_finite() {
+                capture.invalid = true;
+            }
+            let index = capture.copied;
+            let hop = self.shared.calibration.hop_frames;
+            if index % hop == 0 {
+                let accumulator = ((index / hop) % 2) as usize;
+                capture.sums[accumulator] = 0.0;
+                capture.peaks[accumulator] = 0.0;
+                capture.counts[accumulator] = 0;
+                capture.starts[accumulator] = index;
+                capture.started[accumulator] = true;
+            }
+            for accumulator in 0..2 {
+                if capture.started[accumulator]
+                    && capture.counts[accumulator] < self.shared.calibration.window_frames
+                {
+                    capture.sums[accumulator] += f64::from(sample) * f64::from(sample);
+                    capture.peaks[accumulator] = capture.peaks[accumulator].max(sample.abs());
+                    capture.counts[accumulator] += 1;
+                    if capture.counts[accumulator] == self.shared.calibration.window_frames {
+                        let output = capture.complete_windows as usize;
+                        unsafe {
+                            (*self.shared.calibration.rms.get()).as_mut_slice()[output] =
+                                (capture.sums[accumulator] / capture.counts[accumulator] as f64)
+                                    .sqrt() as f32;
+                            (*self.shared.calibration.peak.get()).as_mut_slice()[output] =
+                                capture.peaks[accumulator];
+                        }
+                        capture.complete_windows += 1;
+                        capture.started[accumulator] = false;
+                    }
+                }
+            }
+            capture.copied += 1;
+        }
+        if capture.copied == capture.request.frames {
+            self.finish_calibration();
+        }
+    }
+
+    fn finish_calibration(&mut self) {
+        let capture = self.calibration.take().expect("calibration must be active");
+        let dropped = self
+            .shared
+            .queue
+            .cumulative_dropped_frames
+            .load(Ordering::Acquire)
+            .saturating_sub(capture.dropped_at_acceptance);
+        let partial = (0..capture.counts.len())
+            .filter(|accumulator| {
+                capture.started[*accumulator]
+                    && capture.counts[*accumulator] > 0
+                    && capture.counts[*accumulator] < self.shared.calibration.window_frames
+            })
+            .max_by_key(|accumulator| capture.starts[*accumulator])
+            .map(|accumulator| capture.counts[accumulator])
+            .unwrap_or(0);
+        unsafe {
+            *self.shared.calibration.metadata.get() = CalibrationCaptureMetadata {
+                frames: capture.copied,
+                sample_rate: self.sample_rate,
+                complete_windows: capture.complete_windows,
+                partial_final_frames: partial,
+                dropped_frames: dropped,
+                usable: !capture.invalid && dropped == 0 && capture.complete_windows > 0,
+            };
+        }
+        let _guard = self
+            .shared
+            .calibration
+            .wait_mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match self.shared.calibration.state.compare_exchange(
+            CALIBRATION_CAPTURING,
+            CALIBRATION_COMPLETE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(CALIBRATION_CANCELLED) => {
+                let _ = self.shared.calibration.state.compare_exchange(
+                    CALIBRATION_CANCELLED,
+                    CALIBRATION_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            Err(_) => {}
+        }
+        self.shared.calibration.notify_waiters();
     }
 
     fn drop_worker_frames(&mut self, frames: u64) {
@@ -1524,11 +2145,11 @@ impl WorkerState {
             .add_cumulative_dropped_frames(frames)
             .is_err()
         {
-            self.worker_fault = Some("capture worker drop counter exhausted");
+            self.set_worker_fault("capture worker drop counter exhausted");
             return;
         }
         let Some(total) = self.worker_dropped_frames.checked_add(frames) else {
-            self.worker_fault = Some("capture worker drop counter exhausted");
+            self.set_worker_fault("capture worker drop counter exhausted");
             return;
         };
         self.worker_dropped_frames = total;
@@ -1953,6 +2574,7 @@ mod tests {
             capture_worker_stack_bytes: 256 * 1024,
             io_buffer_bytes_per_channel: 4 * 1024,
             maximum_path_bytes: 512,
+            maximum_calibration_seconds: 0,
             headroom: 1.0,
         })
         .unwrap()
@@ -2060,13 +2682,13 @@ mod tests {
         assert_eq!(queue.enqueued_frames.load(Ordering::Acquire), 6);
         assert_eq!(queue.dropped_frames.load(Ordering::Acquire), 2);
         let mut blocks = Vec::new();
-        assert!(queue.consume_next(|samples, frames| {
+        assert!(queue.consume_next(|samples, frames, _| {
             blocks.push((samples.to_vec(), frames));
         }));
-        assert!(queue.consume_next(|samples, frames| {
+        assert!(queue.consume_next(|samples, frames, _| {
             blocks.push((samples.to_vec(), frames));
         }));
-        assert!(!queue.consume_next(|_, _| {}));
+        assert!(!queue.consume_next(|_, _, _| {}));
         assert_eq!(blocks, [(vec![0.0, 1.0, 2.0], 3), (vec![3.0, 4.0, 5.0], 3)]);
     }
 
@@ -2589,6 +3211,7 @@ mod tests {
         let shared = Arc::new(RuntimeShared {
             queue,
             command: Arc::new(CommandSlot::new()),
+            calibration: Arc::new(CalibrationSlot::new(0, 0, 1, 1).unwrap()),
             wake: Arc::new(WorkerWake {
                 mutex: Mutex::new(()),
                 condvar: Condvar::new(),
@@ -2598,6 +3221,12 @@ mod tests {
             final_worker_dropped_frames: AtomicU64::new(0),
             shutdown_reply_pause: Mutex::new(None),
             clear_reply_pause: Mutex::new(None),
+            calibration_start_pause: Mutex::new(None),
+            calibration_before_accept_pause: Mutex::new(None),
+            calibration_after_consume_pause: Mutex::new(None),
+            calibration_timeout_pause: Mutex::new(None),
+            calibration_wait_pause: Mutex::new(None),
+            calibration_fault_after_start: AtomicBool::new(false),
         });
         let epochs = [
             Arc::new(SampleRing::new(ring_config()).unwrap()),
@@ -2619,6 +3248,7 @@ mod tests {
             channels: 1,
             sample_rate: 48_000,
             format: SampleFormat::F32Le,
+            calibration: None,
         };
 
         assert!(worker.consume_one());
@@ -2635,6 +3265,7 @@ mod tests {
         let shared = Arc::new(RuntimeShared {
             queue,
             command: Arc::new(CommandSlot::new()),
+            calibration: Arc::new(CalibrationSlot::new(0, 0, 1, 1).unwrap()),
             wake: Arc::new(WorkerWake {
                 mutex: Mutex::new(()),
                 condvar: Condvar::new(),
@@ -2644,6 +3275,12 @@ mod tests {
             final_worker_dropped_frames: AtomicU64::new(0),
             shutdown_reply_pause: Mutex::new(None),
             clear_reply_pause: Mutex::new(None),
+            calibration_start_pause: Mutex::new(None),
+            calibration_before_accept_pause: Mutex::new(None),
+            calibration_after_consume_pause: Mutex::new(None),
+            calibration_timeout_pause: Mutex::new(None),
+            calibration_wait_pause: Mutex::new(None),
+            calibration_fault_after_start: AtomicBool::new(false),
         });
         let mut worker = WorkerState {
             shared,
@@ -2664,6 +3301,7 @@ mod tests {
             channels: 1,
             sample_rate: 48_000,
             format: SampleFormat::F32Le,
+            calibration: None,
         };
 
         assert!(worker.consume_one());
@@ -2679,6 +3317,7 @@ mod tests {
         let shared = Arc::new(RuntimeShared {
             queue,
             command: Arc::new(CommandSlot::new()),
+            calibration: Arc::new(CalibrationSlot::new(0, 0, 1, 1).unwrap()),
             wake: Arc::new(WorkerWake {
                 mutex: Mutex::new(()),
                 condvar: Condvar::new(),
@@ -2688,6 +3327,12 @@ mod tests {
             final_worker_dropped_frames: AtomicU64::new(0),
             shutdown_reply_pause: Mutex::new(None),
             clear_reply_pause: Mutex::new(None),
+            calibration_start_pause: Mutex::new(None),
+            calibration_before_accept_pause: Mutex::new(None),
+            calibration_after_consume_pause: Mutex::new(None),
+            calibration_timeout_pause: Mutex::new(None),
+            calibration_wait_pause: Mutex::new(None),
+            calibration_fault_after_start: AtomicBool::new(false),
         });
         let mut worker = WorkerState {
             shared,
@@ -2708,6 +3353,7 @@ mod tests {
             channels: 1,
             sample_rate: 48_000,
             format: SampleFormat::F32Le,
+            calibration: None,
         };
 
         assert!(worker.consume_one());
@@ -2731,6 +3377,7 @@ mod tests {
         let shared = Arc::new(RuntimeShared {
             queue: Arc::clone(&queue),
             command: Arc::new(CommandSlot::new()),
+            calibration: Arc::new(CalibrationSlot::new(0, 0, 1, 1).unwrap()),
             wake: Arc::new(WorkerWake {
                 mutex: Mutex::new(()),
                 condvar: Condvar::new(),
@@ -2740,6 +3387,12 @@ mod tests {
             final_worker_dropped_frames: AtomicU64::new(0),
             shutdown_reply_pause: Mutex::new(None),
             clear_reply_pause: Mutex::new(None),
+            calibration_start_pause: Mutex::new(None),
+            calibration_before_accept_pause: Mutex::new(None),
+            calibration_after_consume_pause: Mutex::new(None),
+            calibration_timeout_pause: Mutex::new(None),
+            calibration_wait_pause: Mutex::new(None),
+            calibration_fault_after_start: AtomicBool::new(false),
         });
         let mut worker = WorkerState {
             shared,
@@ -2760,6 +3413,7 @@ mod tests {
             channels: 1,
             sample_rate: 48_000,
             format: SampleFormat::F32Le,
+            calibration: None,
         };
 
         assert!(worker.consume_one());
@@ -2768,5 +3422,641 @@ mod tests {
         assert_eq!(queue.dropped_frames.load(Ordering::Acquire), 1);
         assert_eq!(worker.worker_written_frames, 0);
         assert_eq!(worker.worker_dropped_frames, 0);
+    }
+
+    fn calibration_runtime(
+        sample_rate: u32,
+        seconds: u32,
+        queue_slots: u32,
+        slot_frames: u32,
+    ) -> (Arc<CaptureArena>, CaptureIngress) {
+        calibration_runtime_channels(1, sample_rate, seconds, queue_slots, slot_frames)
+    }
+
+    fn calibration_runtime_channels(
+        channels: u32,
+        sample_rate: u32,
+        seconds: u32,
+        queue_slots: u32,
+        slot_frames: u32,
+    ) -> (Arc<CaptureArena>, CaptureIngress) {
+        let plan = calibration_plan(channels, sample_rate, seconds, queue_slots, slot_frames);
+        let chunk_frames = slot_frames.max(1);
+        let retention_frames = u64::from(sample_rate.max(chunk_frames));
+        let (arena, ingress) = CaptureArena::new(
+            &plan,
+            CaptureRuntimeConfig {
+                ring: RingConfig {
+                    channels,
+                    sample_rate,
+                    format: SampleFormat::F32Le,
+                    chunk_frames,
+                    chunk_count: retention_frames.div_ceil(u64::from(chunk_frames)) as u32,
+                    max_active_snapshots: 1,
+                },
+                queue_slots,
+                slot_frames,
+                sample_bytes: 4,
+                worker_stack_bytes: 256 * 1024,
+            },
+        )
+        .unwrap();
+        (Arc::new(arena), ingress)
+    }
+
+    fn calibration_plan(
+        channels: u32,
+        sample_rate: u32,
+        seconds: u32,
+        queue_slots: u32,
+        slot_frames: u32,
+    ) -> SessionMemoryPlan {
+        let chunk_frames = slot_frames.max(1);
+        let retention_frames = u64::from(sample_rate.max(chunk_frames));
+        SessionMemoryPlan::calculate(SessionMemoryInputs {
+            retention_frames,
+            channels,
+            sample_rate,
+            sample_format: SampleFormat::F32Le,
+            chunk_frames,
+            max_active_snapshots: 1,
+            sample_bytes: 4,
+            split_when_over_bytes: 1_000_000,
+            control_queue_capacity: 2,
+            worker_stack_bytes: 64 * 1024,
+            capture_queue_slots: queue_slots,
+            capture_slot_frames: slot_frames,
+            capture_worker_stack_bytes: 256 * 1024,
+            io_buffer_bytes_per_channel: 4 * 1024,
+            maximum_path_bytes: 512,
+            maximum_calibration_seconds: seconds,
+            headroom: 1.0,
+        })
+        .unwrap()
+    }
+
+    fn install_pause(
+        target: &Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+    ) -> (Arc<Barrier>, Arc<Barrier>) {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *target.lock().unwrap() = Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    fn wait_for_calibration_state(arena: &CaptureArena, expected: u8) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let actual = arena.shared.calibration.state.load(Ordering::Acquire);
+            if actual == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "calibration state did not reach {expected} before deadline; actual state was {actual}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn wait_for_consumed_sequence(arena: &CaptureArena, expected: u64) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let actual = arena.shared.queue.consumed_head();
+            if actual >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "capture queue did not consume sequence {expected} before deadline; actual sequence was {actual}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn capture_after_worker_acceptance(
+        arena: &Arc<CaptureArena>,
+        ingress: &CaptureIngress,
+        samples: &[f32],
+    ) -> (
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        CalibrationCaptureMetadata,
+        [usize; 3],
+    ) {
+        let (entered, release) = install_pause(&arena.shared.calibration_start_pause);
+        let request_arena = Arc::clone(arena);
+        let frames = samples.len() as u64;
+        let capture = thread::spawn(move || {
+            let lease = request_arena
+                .calibrate_channel(CalibrationCaptureRequest { channel: 0, frames }, DEADLINE)
+                .unwrap();
+            let addresses = [
+                lease.samples().as_ptr() as usize,
+                lease.rms().as_ptr() as usize,
+                lease.peak().as_ptr() as usize,
+            ];
+            (
+                lease.samples().to_vec(),
+                lease.rms().to_vec(),
+                lease.peak().to_vec(),
+                lease.metadata(),
+                addresses,
+            )
+        });
+        entered.wait();
+        ingress.try_push_interleaved(samples, 1).unwrap();
+        release.wait();
+        capture.join().unwrap()
+    }
+
+    #[test]
+    fn calibration_rejects_invalid_channel_zero_frames_and_over_capacity() {
+        let (arena, _ingress) = calibration_runtime(20, 1, 2, 20);
+        for request in [
+            CalibrationCaptureRequest {
+                channel: 1,
+                frames: 1,
+            },
+            CalibrationCaptureRequest {
+                channel: 0,
+                frames: 0,
+            },
+            CalibrationCaptureRequest {
+                channel: 0,
+                frames: 21,
+            },
+        ] {
+            assert!(arena.calibrate_channel(request, DEADLINE).is_err());
+        }
+    }
+
+    #[test]
+    fn calibration_observes_only_future_frames_from_the_selected_channel() {
+        let (arena, ingress) = calibration_runtime_channels(2, 1_000, 1, 4, 20);
+        ingress
+            .try_push_interleaved(&[90.0, 90.0, 91.0, 91.0], 2)
+            .unwrap();
+        let before = arena.status(DEADLINE).unwrap();
+        assert_eq!(before.worker_written_frames, 2);
+
+        let (entered, release) = install_pause(&arena.shared.calibration_start_pause);
+        let request_arena = Arc::clone(&arena);
+        let capture = thread::spawn(move || {
+            let lease = request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 1,
+                        frames: 20,
+                    },
+                    DEADLINE,
+                )
+                .unwrap();
+            lease.samples().to_vec()
+        });
+        entered.wait();
+        let future = (1..=20)
+            .flat_map(|frame| [-(frame as f32), frame as f32])
+            .collect::<Vec<_>>();
+        ingress.try_push_interleaved(&future, 2).unwrap();
+        release.wait();
+        assert_eq!(
+            capture.join().unwrap(),
+            (1..=20).map(|frame| frame as f32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn worker_acceptance_excludes_pre_boundary_audio_and_drop_delta() {
+        let (arena, ingress) = calibration_runtime(1_000, 1, 1, 10);
+        let (before_entered, before_release) =
+            install_pause(&arena.shared.calibration_before_accept_pause);
+        let (accepted_entered, accepted_release) =
+            install_pause(&arena.shared.calibration_start_pause);
+        let (consumed_entered, consumed_release) =
+            install_pause(&arena.shared.calibration_after_consume_pause);
+        let request_arena = Arc::clone(&arena);
+        let capture = thread::spawn(move || {
+            let lease = request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 10,
+                    },
+                    DEADLINE,
+                )
+                .unwrap();
+            (lease.samples().to_vec(), lease.metadata())
+        });
+
+        before_entered.wait();
+        let pre_acceptance = ingress.try_push_interleaved(&[9.0; 20], 1).unwrap();
+        assert_eq!(pre_acceptance.enqueued_frames, 10);
+        assert_eq!(pre_acceptance.dropped_frames, 10);
+        before_release.wait();
+        accepted_entered.wait();
+        accepted_release.wait();
+        consumed_entered.wait();
+        ingress.try_push_interleaved(&[0.25; 10], 1).unwrap();
+        consumed_release.wait();
+
+        let (samples, metadata) = capture.join().unwrap();
+        assert_eq!(samples, [0.25; 10]);
+        assert_eq!(metadata.dropped_frames, 0);
+    }
+
+    #[test]
+    fn calibration_accepts_one_second_and_configured_thirty_second_boundaries() {
+        let (arena, ingress) = calibration_runtime(3, 30, 2, 90);
+        let one_second = capture_after_worker_acceptance(&arena, &ingress, &[0.25; 3]);
+        assert_eq!(one_second.3.frames, 3);
+        assert!(one_second.3.usable);
+        let thirty_seconds = capture_after_worker_acceptance(&arena, &ingress, &[0.5; 90]);
+        assert_eq!(thirty_seconds.3.frames, 90);
+        assert!(thirty_seconds.3.usable);
+    }
+
+    #[test]
+    fn calibration_complete_and_incomplete_windows_use_checked_ceil_geometry() {
+        let (normal, normal_ingress) = calibration_runtime(1_000, 1, 4, 25);
+        let (_, rms, peak, metadata, _) =
+            capture_after_worker_acceptance(&normal, &normal_ingress, &[1.0; 25]);
+        assert_eq!(rms, [1.0]);
+        assert_eq!(peak, [1.0]);
+        assert_eq!(metadata.complete_windows, 1);
+        assert_eq!(metadata.partial_final_frames, 5);
+        assert!(metadata.usable);
+
+        let (odd, odd_ingress) = calibration_runtime(441, 1, 4, 14);
+        let (_, rms, peak, metadata, _) =
+            capture_after_worker_acceptance(&odd, &odd_ingress, &[0.5; 14]);
+        assert_eq!(rms, [0.5, 0.5]);
+        assert_eq!(peak, [0.5, 0.5]);
+        assert_eq!(metadata.complete_windows, 2);
+        assert_eq!(metadata.partial_final_frames, 4);
+        assert!(metadata.usable);
+
+        let (_, rms, peak, metadata, _) =
+            capture_after_worker_acceptance(&odd, &odd_ingress, &[0.25; 8]);
+        assert!(rms.is_empty());
+        assert!(peak.is_empty());
+        assert_eq!(metadata.complete_windows, 0);
+        assert_eq!(metadata.partial_final_frames, 3);
+        assert!(!metadata.usable);
+    }
+
+    #[test]
+    fn calibration_buffers_keep_addresses_across_sequential_leases() {
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let first = capture_after_worker_acceptance(&arena, &ingress, &[0.25; 20]);
+        let second = capture_after_worker_acceptance(&arena, &ingress, &[0.5; 20]);
+        assert_eq!(first.4, second.4);
+    }
+
+    #[test]
+    fn calibration_preserves_active_and_frozen_capture_state() {
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        ingress.try_push_interleaved(&[0.1; 10], 1).unwrap();
+        let mut frozen = arena.freeze_since(None, DEADLINE).unwrap().unwrap();
+        let frozen_range = frozen.absolute_range();
+        let mut before = [0.0; 10];
+        frozen
+            .copy_interleaved_range_into(frozen_range.clone(), &mut before)
+            .unwrap();
+        let active_before = arena.active_absolute_range(DEADLINE).unwrap();
+
+        let result = capture_after_worker_acceptance(&arena, &ingress, &[0.2; 20]);
+        assert_eq!(result.0, [0.2; 20]);
+        assert_eq!(frozen.absolute_range(), frozen_range);
+        let mut after = [0.0; 10];
+        frozen
+            .copy_interleaved_range_into(frozen_range, &mut after)
+            .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            arena.active_absolute_range(DEADLINE).unwrap().start,
+            active_before.start
+        );
+        assert_eq!(
+            arena.active_absolute_range(DEADLINE).unwrap().end,
+            active_before.end + 20
+        );
+        arena.release_frozen(&mut frozen, DEADLINE).unwrap();
+    }
+
+    #[test]
+    fn calibration_does_not_advance_dump_coordinator_persistence_cursor() {
+        use crate::activity::FrozenExportDecision;
+        use crate::dump::{DumpCoordinator, FrameRange};
+        use crate::persistence_workspace::{
+            PersistenceWorkspace, PersistenceWorkspaceConfig, PrepareRequest,
+        };
+
+        let plan = calibration_plan(1, 1_000, 1, 4, 20);
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let mut workspace = PersistenceWorkspace::new(
+            &plan,
+            PersistenceWorkspaceConfig {
+                retention_frames: 1_000,
+                channels: 1,
+                sample_rate: 1_000,
+                sample_format: SampleFormat::F32Le,
+                chunk_frames: 20,
+                sample_bytes: 4,
+                split_when_over_bytes: 1_000_000,
+                io_buffer_bytes_per_channel: 4 * 1024,
+                maximum_path_bytes: 512,
+            },
+        )
+        .unwrap();
+        let coordinator =
+            DumpCoordinator::with_frozen_decision(FrozenExportDecision::new(&plan).unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let names = vec!["mic".to_string()];
+
+        ingress.try_push_interleaved(&[0.1; 10], 1).unwrap();
+        let first = coordinator
+            .persist(
+                &arena,
+                &mut workspace,
+                PrepareRequest::Recall {
+                    staging_root: &root.path().join("staging-a"),
+                    output_dir: &root.path().join("output"),
+                    timestamp: "20260826T120000",
+                    channel_names: &names,
+                },
+                DEADLINE,
+            )
+            .unwrap();
+        assert_eq!(first.range(), Some(FrameRange { start: 0, end: 10 }));
+
+        let calibration = capture_after_worker_acceptance(&arena, &ingress, &[0.2; 20]);
+        assert!(calibration.3.usable);
+
+        let next = coordinator
+            .persist(
+                &arena,
+                &mut workspace,
+                PrepareRequest::Recall {
+                    staging_root: &root.path().join("staging-b"),
+                    output_dir: &root.path().join("output"),
+                    timestamp: "20260826T120001",
+                    channel_names: &names,
+                },
+                DEADLINE,
+            )
+            .unwrap();
+        assert_eq!(next.range(), Some(FrameRange { start: 10, end: 30 }));
+    }
+
+    #[test]
+    fn timeout_cancellation_blocks_reuse_until_worker_stops_writing_then_recovers() {
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let (entered, release) = install_pause(&arena.shared.calibration_start_pause);
+        let request_arena = Arc::clone(&arena);
+        let timed_out = thread::spawn(move || {
+            request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    Duration::from_millis(20),
+                )
+                .map(|_| ())
+        });
+        entered.wait();
+        assert!(timed_out.join().unwrap().is_err());
+        assert_eq!(
+            arena.shared.calibration.state.load(Ordering::Acquire),
+            CALIBRATION_CANCELLED
+        );
+        assert!(arena
+            .calibrate_channel(
+                CalibrationCaptureRequest {
+                    channel: 0,
+                    frames: 20,
+                },
+                DEADLINE,
+            )
+            .is_err());
+        release.wait();
+        wait_for_calibration_state(&arena, CALIBRATION_IDLE);
+        let result = capture_after_worker_acceptance(&arena, &ingress, &[0.5; 20]);
+        assert!(result.3.usable);
+    }
+
+    #[test]
+    fn concurrent_second_calibration_is_rejected_after_first_is_accepted() {
+        let (arena, _ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let (entered, release) = install_pause(&arena.shared.calibration_start_pause);
+        let request_arena = Arc::clone(&arena);
+        let first = thread::spawn(move || {
+            request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    Duration::from_millis(20),
+                )
+                .map(|_| ())
+        });
+        entered.wait();
+        assert!(matches!(
+            arena.calibrate_channel(
+                CalibrationCaptureRequest {
+                    channel: 0,
+                    frames: 20,
+                },
+                DEADLINE,
+            ),
+            Err(LambError::ControlInvariant("calibration already pending"))
+        ));
+        assert!(first.join().unwrap().is_err());
+        release.wait();
+    }
+
+    #[test]
+    fn ordinary_status_remains_available_while_calibration_waits_for_frames() {
+        let (arena, _ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let (entered, release) = install_pause(&arena.shared.calibration_start_pause);
+        let request_arena = Arc::clone(&arena);
+        let calibration = thread::spawn(move || {
+            request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    Duration::from_millis(100),
+                )
+                .map(|_| ())
+        });
+        entered.wait();
+        release.wait();
+        wait_for_calibration_state(&arena, CALIBRATION_CAPTURING);
+        assert!(arena.status(Duration::from_millis(50)).is_ok());
+        assert!(calibration.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn ingress_drop_delta_marks_calibration_unusable() {
+        let (arena, ingress) = calibration_runtime(1_000, 1, 1, 10);
+        let (entered, release) = install_pause(&arena.shared.calibration_start_pause);
+        let request_arena = Arc::clone(&arena);
+        let capture = thread::spawn(move || {
+            let lease = request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    DEADLINE,
+                )
+                .unwrap();
+            lease.metadata()
+        });
+        entered.wait();
+        let outcome = ingress.try_push_interleaved(&[0.5; 20], 1).unwrap();
+        assert_eq!(outcome.dropped_frames, 10);
+        release.wait();
+        wait_for_consumed_sequence(&arena, 1);
+        ingress.try_push_interleaved(&[0.5; 10], 1).unwrap();
+        let metadata = capture.join().unwrap();
+        assert_eq!(metadata.dropped_frames, 10);
+        assert!(!metadata.usable);
+    }
+
+    #[test]
+    fn each_non_finite_class_marks_calibration_unusable() {
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut samples = [0.5; 20];
+            samples[7] = non_finite;
+            let result = capture_after_worker_acceptance(&arena, &ingress, &samples);
+            assert!(!result.3.usable, "{non_finite:?}");
+        }
+    }
+
+    #[test]
+    fn completion_wins_when_timeout_observed_stale_capturing_state() {
+        let (arena, ingress) = calibration_runtime(20, 1, 2, 1);
+        let (start_entered, start_release) = install_pause(&arena.shared.calibration_start_pause);
+        let (timeout_entered, timeout_release) =
+            install_pause(&arena.shared.calibration_timeout_pause);
+        let request_arena = Arc::clone(&arena);
+        let capture = thread::spawn(move || {
+            let lease = request_arena.calibrate_channel(
+                CalibrationCaptureRequest {
+                    channel: 0,
+                    frames: 1,
+                },
+                Duration::from_millis(20),
+            )?;
+            Ok::<_, LambError>(lease.samples().to_vec())
+        });
+        start_entered.wait();
+        ingress.try_push_interleaved(&[0.75], 1).unwrap();
+        timeout_entered.wait();
+        start_release.wait();
+        wait_for_calibration_state(&arena, CALIBRATION_COMPLETE);
+        timeout_release.wait();
+        assert_eq!(capture.join().unwrap().unwrap(), [0.75]);
+    }
+
+    #[test]
+    fn completion_notification_cannot_be_lost_before_wait_begins() {
+        let (arena, ingress) = calibration_runtime(20, 1, 2, 1);
+        let (start_entered, start_release) = install_pause(&arena.shared.calibration_start_pause);
+        let (wait_entered, wait_release) = install_pause(&arena.shared.calibration_wait_pause);
+        let request_arena = Arc::clone(&arena);
+        let (sent, received) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            sent.send(
+                request_arena
+                    .calibrate_channel(
+                        CalibrationCaptureRequest {
+                            channel: 0,
+                            frames: 1,
+                        },
+                        DEADLINE,
+                    )
+                    .map(|lease| lease.samples().to_vec()),
+            )
+            .unwrap();
+        });
+        start_entered.wait();
+        wait_entered.wait();
+        ingress.try_push_interleaved(&[0.5], 1).unwrap();
+        start_release.wait();
+        wait_for_calibration_state(&arena, CALIBRATION_COMPLETE);
+        wait_release.wait();
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap()
+                .unwrap(),
+            [0.5]
+        );
+    }
+
+    #[test]
+    fn worker_runtime_exit_wakes_calibration_and_releases_terminal_slot() {
+        let (arena, _ingress) = calibration_runtime(1_000, 1, 2, 20);
+        let (entered, release) = install_pause(&arena.shared.calibration_start_pause);
+        let request_arena = Arc::clone(&arena);
+        let capture = thread::spawn(move || {
+            request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    DEADLINE,
+                )
+                .map(|_| ())
+        });
+        entered.wait();
+        arena.shared.command.begin(COMMAND_KIND_SHUTDOWN).unwrap();
+        unsafe {
+            arena.shared.command.publish(WorkerCommand::Shutdown {
+                target_sequence: arena.shared.queue.consumed_head(),
+            });
+        }
+        release.wait();
+        arena.shared.wake.condvar.notify_all();
+        assert!(capture.join().unwrap().is_err());
+        assert_eq!(
+            arena.shared.calibration.state.load(Ordering::Acquire),
+            CALIBRATION_IDLE
+        );
+    }
+
+    #[test]
+    fn worker_fault_wakes_calibration_after_writer_ownership_is_relinquished() {
+        let (arena, _ingress) = calibration_runtime(1_000, 1, 2, 20);
+        arena
+            .shared
+            .calibration_fault_after_start
+            .store(true, Ordering::Release);
+        let result = arena.calibrate_channel(
+            CalibrationCaptureRequest {
+                channel: 0,
+                frames: 20,
+            },
+            DEADLINE,
+        );
+        assert!(matches!(
+            result,
+            Err(LambError::CaptureInvariant(
+                "capture worker failed during calibration"
+            ))
+        ));
+        assert_eq!(
+            arena.shared.calibration.state.load(Ordering::Acquire),
+            CALIBRATION_IDLE
+        );
     }
 }

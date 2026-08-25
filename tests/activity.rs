@@ -72,6 +72,7 @@ fn plan(channels: u32, sample_rate: u32) -> SessionMemoryPlan {
         capture_worker_stack_bytes: 1_024,
         io_buffer_bytes_per_channel: 64,
         maximum_path_bytes: 128,
+        maximum_calibration_seconds: 0,
         headroom: 1.0,
     })
     .unwrap()
@@ -146,6 +147,7 @@ fn frozen_runtime(
         capture_worker_stack_bytes: 1_024,
         io_buffer_bytes_per_channel: 64,
         maximum_path_bytes: 128,
+        maximum_calibration_seconds: 0,
         headroom: 1.0,
     })
     .unwrap();

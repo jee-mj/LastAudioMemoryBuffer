@@ -324,6 +324,7 @@ fn with_real_capture(
         capture_worker_stack_bytes: 64 * 1024,
         io_buffer_bytes_per_channel: 6,
         maximum_path_bytes: 512,
+        maximum_calibration_seconds: 0,
         headroom: 1.0,
     })
     .unwrap();
@@ -912,6 +913,7 @@ fn prepared_timestamp_directory_publishes_canonical_filenames() {
         capture_worker_stack_bytes: 64 * 1024,
         io_buffer_bytes_per_channel: 6,
         maximum_path_bytes: 512,
+        maximum_calibration_seconds: 0,
         headroom: 1.0,
     })
     .unwrap();
@@ -1023,6 +1025,7 @@ fn nested_sparse_file_set_publishes_exact_dense_wavs_and_syncs_each_parent() {
         capture_worker_stack_bytes: 64 * 1024,
         io_buffer_bytes_per_channel: 9,
         maximum_path_bytes: 512,
+        maximum_calibration_seconds: 0,
         headroom: 1.0,
     })
     .unwrap();

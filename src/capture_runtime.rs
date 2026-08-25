@@ -17,6 +17,7 @@ pub struct CaptureRuntimeParams {
     pub split_when_over_bytes: u64,
     pub io_buffer_bytes_per_channel: u64,
     pub maximum_path_bytes: u64,
+    pub maximum_calibration_seconds: u32,
     pub capture_queue_slots: u32,
     pub capture_worker_stack_bytes: u64,
     pub control_queue_capacity: u32,
@@ -67,6 +68,7 @@ impl CaptureRuntime {
             capture_worker_stack_bytes: params.capture_worker_stack_bytes,
             io_buffer_bytes_per_channel: params.io_buffer_bytes_per_channel,
             maximum_path_bytes: params.maximum_path_bytes,
+            maximum_calibration_seconds: params.maximum_calibration_seconds,
             headroom: params.headroom,
         })?;
         plan.validate_max(params.memory_max)?;
