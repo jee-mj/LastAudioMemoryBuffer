@@ -149,6 +149,35 @@ enum PersistenceOutcomeResponseWire {
     },
 }
 
+fn written_export_range(
+    start_frame: u64,
+    end_frame: u64,
+    export_start_frame: Option<u64>,
+    export_frames: Option<u64>,
+) -> std::result::Result<(u64, u64), &'static str> {
+    if end_frame < start_frame {
+        return Err("written consumed range end precedes start");
+    }
+    match (export_start_frame, export_frames) {
+        (None, None) => Ok((start_frame, end_frame - start_frame)),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("written export range requires both export_start_frame and export_frames")
+        }
+        (Some(export_start_frame), Some(export_frames)) => {
+            if export_start_frame < start_frame {
+                return Err("written export range starts before consumed range");
+            }
+            let export_end = export_start_frame
+                .checked_add(export_frames)
+                .ok_or("written export range end overflow")?;
+            if export_end != end_frame {
+                return Err("written export range does not end at consumed range end");
+            }
+            Ok((export_start_frame, export_frames))
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for PersistenceOutcomeResponse {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -168,21 +197,29 @@ impl<'de> Deserialize<'de> for PersistenceOutcomeResponse {
                     capture_dropped_frames,
                     output_directory,
                     files,
-                } => Self::Written {
-                    start_frame,
-                    end_frame,
-                    frames,
-                    export_start_frame: export_start_frame.unwrap_or(start_frame),
-                    export_frames: export_frames
-                        .unwrap_or_else(|| end_frame.saturating_sub(start_frame)),
-                    duration_seconds,
-                    lost_frames,
-                    retention_lost_frames,
-                    cleared_frames,
-                    capture_dropped_frames,
-                    output_directory,
-                    files,
-                },
+                } => {
+                    let (export_start_frame, export_frames) = written_export_range(
+                        start_frame,
+                        end_frame,
+                        export_start_frame,
+                        export_frames,
+                    )
+                    .map_err(<D::Error as serde::de::Error>::custom)?;
+                    Self::Written {
+                        start_frame,
+                        end_frame,
+                        frames,
+                        export_start_frame,
+                        export_frames,
+                        duration_seconds,
+                        lost_frames,
+                        retention_lost_frames,
+                        cleared_frames,
+                        capture_dropped_frames,
+                        output_directory,
+                        files,
+                    }
+                }
                 PersistenceOutcomeResponseWire::SkippedSilent {
                     start_frame,
                     end_frame,
@@ -655,5 +692,47 @@ mod tests {
                 files: vec![],
             }
         );
+    }
+
+    #[test]
+    fn written_json_rejects_only_export_start_frame() {
+        let payload = r#"{"kind":"written","start_frame":100,"end_frame":250,"frames":150,"export_start_frame":120,"duration_seconds":1.5,"lost_frames":0,"output_directory":"/tmp/out","files":[]}"#;
+        let error = serde_json::from_str::<PersistenceOutcomeResponse>(payload).unwrap_err();
+        assert!(error.to_string().contains("both"), "{error}");
+    }
+
+    #[test]
+    fn written_json_rejects_only_export_frames() {
+        let payload = r#"{"kind":"written","start_frame":100,"end_frame":250,"frames":150,"export_frames":130,"duration_seconds":1.5,"lost_frames":0,"output_directory":"/tmp/out","files":[]}"#;
+        let error = serde_json::from_str::<PersistenceOutcomeResponse>(payload).unwrap_err();
+        assert!(error.to_string().contains("both"), "{error}");
+    }
+
+    #[test]
+    fn written_json_rejects_export_start_before_consumed_range() {
+        let payload = r#"{"kind":"written","start_frame":100,"end_frame":250,"frames":150,"export_start_frame":99,"export_frames":151,"duration_seconds":1.5,"lost_frames":0,"output_directory":"/tmp/out","files":[]}"#;
+        let error = serde_json::from_str::<PersistenceOutcomeResponse>(payload).unwrap_err();
+        assert!(error.to_string().contains("starts before"), "{error}");
+    }
+
+    #[test]
+    fn written_json_rejects_export_range_add_overflow() {
+        let payload = r#"{"kind":"written","start_frame":0,"end_frame":1,"frames":1,"export_start_frame":18446744073709551615,"export_frames":1,"duration_seconds":1.0,"lost_frames":0,"output_directory":"/tmp/out","files":[]}"#;
+        let error = serde_json::from_str::<PersistenceOutcomeResponse>(payload).unwrap_err();
+        assert!(error.to_string().contains("overflow"), "{error}");
+    }
+
+    #[test]
+    fn written_json_rejects_export_range_not_ending_at_consumed_end() {
+        let payload = r#"{"kind":"written","start_frame":100,"end_frame":250,"frames":150,"export_start_frame":120,"export_frames":129,"duration_seconds":1.5,"lost_frames":0,"output_directory":"/tmp/out","files":[]}"#;
+        let error = serde_json::from_str::<PersistenceOutcomeResponse>(payload).unwrap_err();
+        assert!(error.to_string().contains("does not end"), "{error}");
+    }
+
+    #[test]
+    fn written_json_rejects_reversed_consumed_range() {
+        let payload = r#"{"kind":"written","start_frame":250,"end_frame":100,"frames":0,"duration_seconds":0.0,"lost_frames":0,"output_directory":"/tmp/out","files":[]}"#;
+        let error = serde_json::from_str::<PersistenceOutcomeResponse>(payload).unwrap_err();
+        assert!(error.to_string().contains("consumed range"), "{error}");
     }
 }
