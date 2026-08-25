@@ -1645,6 +1645,24 @@ mod tests {
         layout: crate::export_policy::ResolvedLayout,
         samples: &[f32],
     ) -> IdleDaemonContext {
+        test_app_context_with_policy(root, test_policy_with_layout(output_dir, layout), samples)
+    }
+
+    fn test_app_context_with_policy(
+        root: &Path,
+        policy: ResolvedExportPolicy,
+        samples: &[f32],
+    ) -> IdleDaemonContext {
+        let channel_count = u32::try_from(policy.activity.channels.len()).unwrap();
+        assert!(channel_count > 0, "test policy must contain a channel");
+        let channel_count_usize = usize::try_from(channel_count).unwrap();
+        assert_eq!(
+            samples.len() % channel_count_usize,
+            0,
+            "interleaved samples must contain complete frames"
+        );
+        let frame_count = u64::try_from(samples.len() / channel_count_usize).unwrap();
+        let output_dir = policy.output_dir().to_path_buf();
         fs::create_dir_all(&output_dir).unwrap();
         let params = CaptureRuntimeParams {
             seconds: 1,
@@ -1659,15 +1677,17 @@ mod tests {
             control_queue_capacity: 2,
             worker_stack_bytes: 64 * 1024,
         };
-        let (runtime, ingress) = CaptureRuntime::build(params, 100, 1).unwrap();
-        ingress.try_push_interleaved(samples, 1).unwrap();
+        let (runtime, ingress) = CaptureRuntime::build(params, 100, channel_count).unwrap();
+        ingress
+            .try_push_interleaved(samples, channel_count)
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while runtime
             .arena
             .status(std::time::Duration::from_secs(1))
             .unwrap()
             .worker_written_frames
-            < samples.len() as u64
+            < frame_count
         {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1679,9 +1699,9 @@ mod tests {
                 runtime.frozen_export_decision,
             )),
             sample_rate: 100,
-            channel_count: 1,
+            channel_count,
             profile_name: "configured-profile".to_string(),
-            policy: Mutex::new(test_policy_with_layout(output_dir, layout)),
+            policy: Mutex::new(policy),
         });
         IdleDaemonContext {
             config_path: root.join("lamb.toml"),
@@ -1920,6 +1940,73 @@ mod tests {
             outcome => panic!("expected silent skip, got {outcome:?}"),
         }
         assert_eq!(fs::read_dir(&silent_output).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn app_written_response_reports_only_existing_retained_channel_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("sparse-output");
+        let policy = ResolvedExportPolicy::new(
+            output_dir.clone(),
+            crate::export_policy::ResolvedLayout::FlatDetailed,
+            crate::export_policy::ResolvedActivityPolicy {
+                detector: crate::activity::ActivityDetectorKind::ExactZero,
+                channels: vec![
+                    crate::export_policy::ChannelActivityPolicy {
+                        name: "mic".to_string(),
+                        mode: crate::activity::ChannelExportMode::Always,
+                        threshold: None,
+                    },
+                    crate::export_policy::ChannelActivityPolicy {
+                        name: "omitted".to_string(),
+                        mode: crate::activity::ChannelExportMode::Never,
+                        threshold: None,
+                    },
+                ],
+                whole_export_exact_zero_gate: false,
+                trim_leading_silence: false,
+            },
+        )
+        .unwrap();
+        let ctx = test_app_context_with_policy(temp.path(), policy, &[0.25, 0.75, -0.5, 0.5]);
+
+        let response = handle_app_dump(&ctx);
+
+        assert!(response.ok, "app dump failed: {}", response.message);
+        let files = match response.persistence_outcome {
+            Some(PersistenceOutcomeResponse::Written {
+                start_frame,
+                end_frame,
+                frames,
+                export_start_frame,
+                export_frames,
+                output_directory,
+                files,
+                ..
+            }) => {
+                assert_eq!((start_frame, end_frame, frames), (0, 2, 2));
+                assert_eq!((export_start_frame, export_frames), (0, 2));
+                assert_eq!(output_directory, output_dir);
+                files
+            }
+            outcome => panic!("expected sparse written response, got {outcome:?}"),
+        };
+        assert_eq!(files.len(), 1, "only mic should be reported: {files:?}");
+        let retained = &files[0];
+        assert_eq!(retained.parent(), Some(output_dir.as_path()));
+        assert!(retained.is_file());
+        let retained_name = retained.file_name().unwrap().to_string_lossy();
+        assert!(retained_name.starts_with("lamb-"), "{retained_name}");
+        assert!(
+            retained_name.contains("-mic-100Hz-000000000-000000002-part001.wav"),
+            "{retained_name}"
+        );
+        assert!(!retained_name.contains("omitted"), "{retained_name}");
+        let artifacts: Vec<_> = fs::read_dir(&output_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(artifacts, files);
     }
 
     fn poisoned_runtime_context() -> IdleDaemonContext {

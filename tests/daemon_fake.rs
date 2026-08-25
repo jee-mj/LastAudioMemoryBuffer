@@ -131,6 +131,14 @@ fn assert_persistence_commands_share_cursor(first: ControlRequest, second: Contr
             assert!(files
                 .iter()
                 .all(|path| path.starts_with(&out) && path.is_file()));
+            if matches!(first, ControlRequest::Recall) {
+                assert!(
+                    files
+                        .iter()
+                        .all(|path| path.parent() == Some(out.as_path())),
+                    "CommandDefault recall files must be direct children of outputDir: {files:?}"
+                );
+            }
             end_frame
         }
         outcome => panic!("first command should write captured audio, got {outcome:?}"),
