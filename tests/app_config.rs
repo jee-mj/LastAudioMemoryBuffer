@@ -3,7 +3,7 @@ use lamb::app_config::{
     default_config_path_from_env, default_config_text, load_optional_config, parse_config_text,
     write_default_config, AppConfig, ConfigLoadState,
 };
-use lamb::export_policy::{ExportCommand, PublicationStrategy, ResolvedLayout};
+use lamb::export_policy::{ExportCommand, PublicationStrategy, ResolvedLayout, ValidatedPattern};
 use lamb::profile;
 use std::collections::BTreeMap;
 use std::fs;
@@ -447,8 +447,8 @@ fn explicit_profile_layouts_remain_explicit() {
 directoryPattern = "stems"
 filenamePattern = "{channel}.wav""#,
             ResolvedLayout::Custom {
-                directory_pattern: "stems".to_string(),
-                filename_pattern: "{channel}.wav".to_string(),
+                directory_pattern: ValidatedPattern::parse("stems").unwrap(),
+                filename_pattern: ValidatedPattern::parse("{channel}.wav").unwrap(),
             },
         ),
     ] {

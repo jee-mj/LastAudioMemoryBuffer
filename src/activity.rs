@@ -282,6 +282,17 @@ impl DetectorWorkspace {
             *decision = FrozenChannelDecision::empty();
         }
     }
+
+    pub fn allocation_addresses(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.states.as_slice().as_ptr() as usize,
+            self.states.len(),
+            self.scratch.as_slice().as_ptr() as usize,
+            self.scratch.len(),
+            self.decisions.as_slice().as_ptr() as usize,
+            self.decisions.len(),
+        )
+    }
 }
 
 pub trait ActivityDetector {

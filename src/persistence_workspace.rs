@@ -1,6 +1,13 @@
+use crate::activity::{
+    classify_frozen_epoch, ChannelDisposition, DetectorWorkspace, FrozenExportDecision,
+};
 use crate::capture_arena::FrozenCaptureEpoch;
 use crate::dump::PublishedOutput;
 use crate::error::{io_error, LambError, Result};
+use crate::export_policy::{
+    render_policy_output_into, validate_rendered_output_path, ExportCommand, PublicationStrategy,
+    RenderContext, ResolvedExportPolicy,
+};
 use crate::export_wav::{
     f32_to_s24_bytes, validate_filename_component, write_wav_basename, WavBasename,
 };
@@ -51,6 +58,16 @@ pub struct PersistenceWorkspaceConfig {
 }
 
 pub enum PrepareRequest<'a> {
+    /// Canonical policy-shaped preparation request.  The caller owns the frozen
+    /// decision; a valid decision is deliberately reused on retries.
+    Policy {
+        command: ExportCommand,
+        policy: &'a ResolvedExportPolicy,
+        profile: &'a str,
+        staging_root: &'a Path,
+        timestamp: &'a str,
+        decision: &'a mut FrozenExportDecision,
+    },
     Recall {
         staging_root: &'a Path,
         output_dir: &'a Path,
@@ -107,11 +124,18 @@ impl<'a> From<PrepareRequest<'a>> for RequestDetails<'a> {
                 channel_names,
                 staging_prefix: ".tmp-lamb-",
             },
+            PrepareRequest::Policy { .. } => {
+                unreachable!("canonical policy requests are handled before legacy adaptation")
+            }
         }
     }
 }
 
 pub trait WavIo {
+    fn open(&mut self, path: &Path) -> io::Result<File> {
+        OpenOptions::new().write(true).create_new(true).open(path)
+    }
+
     fn write_all(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()>;
     fn flush(&mut self, file: &mut File) -> io::Result<()>;
     fn sync_all(&mut self, file: &File) -> io::Result<()>;
@@ -157,6 +181,12 @@ impl WavIo for FileWavIo {
 pub struct WorkspaceAllocationAddresses {
     scratch: usize,
     scratch_len: usize,
+    detector_states: usize,
+    detector_state_slots: usize,
+    detector_scratch: usize,
+    detector_scratch_len: usize,
+    detector_decisions: usize,
+    detector_decision_slots: usize,
     pcm_hash: usize,
     pcm_buffers: usize,
     pcm_buffer_len: usize,
@@ -167,6 +197,10 @@ pub struct WorkspaceAllocationAddresses {
     paths_hash: usize,
     path_slots: usize,
     path_capacity: usize,
+    render_directory: usize,
+    render_directory_capacity: usize,
+    render_filename: usize,
+    render_filename_capacity: usize,
     manifest_entries: usize,
     manifest_entry_slots: usize,
     manifest_paths: usize,
@@ -202,6 +236,7 @@ struct WriterSlot {
     file: Option<File>,
     output_index: usize,
     frames_written: u64,
+    output_end: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +287,7 @@ impl WriterSlot {
             file: None,
             output_index: 0,
             frames_written: 0,
+            output_end: 0,
         }
     }
 }
@@ -293,6 +329,11 @@ impl ReusablePath {
 
     fn as_path(&self) -> &Path {
         Path::new(std::ffi::OsStr::from_bytes(self.as_bytes()))
+    }
+
+    fn as_str(&self) -> Result<&str> {
+        std::str::from_utf8(self.as_bytes())
+            .map_err(|_| LambError::ExportInvariant("workspace rendered path is not UTF-8"))
     }
 
     fn set_path(&mut self, path: &Path) -> Result<()> {
@@ -347,10 +388,13 @@ const _: () = assert!(
 pub struct PersistenceWorkspace {
     config: PersistenceWorkspaceConfig,
     interleaved_scratch: MaterializedBuffer<f32>,
+    detector: DetectorWorkspace,
     channel_pcm: ExactArray<MaterializedBuffer<u8>>,
     writers: ExactArray<WriterSlot>,
     outputs: ExactArray<OutputFileSlot>,
     paths: ExactArray<ReusablePath>,
+    render_directory: ReusablePath,
+    render_filename: ReusablePath,
     manifest_entries: ExactArray<ManifestEntrySlot>,
     manifest_paths: MaterializedBuffer<u8>,
     manifest_serialization: MaterializedBuffer<u8>,
@@ -454,12 +498,15 @@ impl PersistenceWorkspace {
         Ok(Self {
             config,
             interleaved_scratch: MaterializedBuffer::new_zeroed(scratch_len)?,
+            detector: DetectorWorkspace::new(plan)?,
             channel_pcm: ExactArray::try_from_fn(channels, |_| {
                 MaterializedBuffer::new_zeroed(pcm_len)
             })?,
             writers: ExactArray::try_from_fn(channels, |_| Ok(WriterSlot::empty()))?,
             outputs: ExactArray::try_from_fn(output_slots, |_| Ok(OutputFileSlot::EMPTY))?,
             paths: ExactArray::try_from_fn(path_slots, |_| ReusablePath::new(path_capacity))?,
+            render_directory: ReusablePath::new(path_capacity)?,
+            render_filename: ReusablePath::new(path_capacity)?,
             manifest_entries: ExactArray::try_from_fn(output_slots, |_| {
                 Ok(ManifestEntrySlot::default())
             })?,
@@ -474,6 +521,14 @@ impl PersistenceWorkspace {
     }
 
     pub fn allocation_addresses(&self) -> WorkspaceAllocationAddresses {
+        let (
+            detector_states,
+            detector_state_slots,
+            detector_scratch,
+            detector_scratch_len,
+            detector_decisions,
+            detector_decision_slots,
+        ) = self.detector.allocation_addresses();
         let pcm_hash = self.channel_pcm.iter().fold(0_usize, |hash, buffer| {
             mix_address(hash, buffer.as_slice().as_ptr() as usize, buffer.len())
         });
@@ -487,6 +542,12 @@ impl PersistenceWorkspace {
         WorkspaceAllocationAddresses {
             scratch: self.interleaved_scratch.as_slice().as_ptr() as usize,
             scratch_len: self.interleaved_scratch.len(),
+            detector_states,
+            detector_state_slots,
+            detector_scratch,
+            detector_scratch_len,
+            detector_decisions,
+            detector_decision_slots,
             pcm_hash,
             pcm_buffers: self.channel_pcm.len(),
             pcm_buffer_len: self.channel_pcm.first().map_or(0, |buffer| buffer.len()),
@@ -497,6 +558,10 @@ impl PersistenceWorkspace {
             paths_hash,
             path_slots: self.paths.len(),
             path_capacity: self.paths.first().map_or(0, ReusablePath::capacity),
+            render_directory: self.render_directory.bytes.as_slice().as_ptr() as usize,
+            render_directory_capacity: self.render_directory.capacity(),
+            render_filename: self.render_filename.bytes.as_slice().as_ptr() as usize,
+            render_filename_capacity: self.render_filename.capacity(),
             manifest_entries: self.manifest_entries.as_slice().as_ptr() as usize,
             manifest_entry_slots: self.manifest_entries.len(),
             manifest_paths: self.manifest_paths.as_slice().as_ptr() as usize,
@@ -525,7 +590,69 @@ impl PersistenceWorkspace {
         self.retry_pending_cleanup()?;
         self.reset_slots();
         validate_frozen(&self.config, frozen)?;
-        let details = RequestDetails::from(request);
+        let details = match request {
+            PrepareRequest::Policy {
+                command,
+                policy,
+                profile,
+                staging_root,
+                timestamp,
+                decision,
+            } => {
+                validate_policy_geometry(&self.config, frozen, policy, decision)?;
+                if !decision.valid() {
+                    classify_frozen_epoch(frozen, &policy.activity, &mut self.detector, decision)?;
+                }
+                let all_never = decision.channels().iter().all(|channel| {
+                    matches!(channel.mode, crate::activity::ChannelExportMode::Never)
+                });
+                if all_never {
+                    return Ok(PreparedPersistence::SkippedByPolicy);
+                }
+                if !decision
+                    .channels()
+                    .iter()
+                    .any(|channel| channel.disposition == ChannelDisposition::Retain)
+                {
+                    return Ok(PreparedPersistence::SkippedSilent);
+                }
+                let kind = match policy.layout.publication_strategy(command) {
+                    PublicationStrategy::FileSet => PersistenceKind::Recall,
+                    PublicationStrategy::AtomicDirectory => PersistenceKind::Dump,
+                };
+                let details = RequestDetails {
+                    kind,
+                    staging_parent: staging_root,
+                    final_parent: &policy.output_dir,
+                    timestamp,
+                    channel_names: &[],
+                    staging_prefix: if kind == PersistenceKind::Dump {
+                        ".tmp-lamb-"
+                    } else {
+                        ""
+                    },
+                };
+                let context = RenderContext {
+                    command,
+                    profile,
+                    timestamp,
+                    sample_rate: self.config.sample_rate,
+                    export_start_frame: decision.export_range().start,
+                    export_end_frame: decision.export_range().end,
+                    split_when_over_bytes: self.config.split_when_over_bytes,
+                    maximum_path_bytes: self.config.maximum_path_bytes,
+                };
+                self.plan_policy_paths(&details, policy, &context, decision)?;
+                return self.finish_policy_prepare(
+                    frozen,
+                    decision.export_range(),
+                    kind,
+                    staging_root,
+                    io,
+                );
+            }
+            legacy => RequestDetails::from(legacy),
+        };
         let kind = details.kind;
         if let Err(error) = self.plan_paths(frozen.total_frames(), &details) {
             self.reset_slots();
@@ -553,6 +680,263 @@ impl PersistenceWorkspace {
             PersistenceKind::Recall => PreparedPersistence::Recall { staging },
             PersistenceKind::Dump => PreparedPersistence::Dump { staging },
         })
+    }
+
+    fn finish_policy_prepare<'a>(
+        &'a mut self,
+        frozen: &FrozenCaptureEpoch,
+        export_range: std::ops::Range<u64>,
+        kind: PersistenceKind,
+        staging_parent: &Path,
+        io: &mut impl WavIo,
+    ) -> Result<PreparedPersistence<'a>> {
+        if let Err(error) = self.create_staging(&RequestDetails {
+            kind,
+            staging_parent,
+            final_parent: staging_parent,
+            timestamp: "",
+            channel_names: &[],
+            staging_prefix: if kind == PersistenceKind::Dump {
+                ".tmp-lamb-"
+            } else {
+                ""
+            },
+        }) {
+            if self.pending_cleanup.is_none() {
+                self.reset_slots();
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.stream_selected_wavs(frozen, export_range, io) {
+            return Err(self.error_after_cleanup(error));
+        }
+        let staging = OwnedTransactionArtifacts { workspace: self };
+        Ok(match kind {
+            PersistenceKind::Recall => PreparedPersistence::FileSet { staging },
+            PersistenceKind::Dump => PreparedPersistence::AtomicDirectory { staging },
+        })
+    }
+
+    fn plan_policy_paths(
+        &mut self,
+        details: &RequestDetails<'_>,
+        policy: &ResolvedExportPolicy,
+        context: &RenderContext<'_>,
+        decision: &FrozenExportDecision,
+    ) -> Result<()> {
+        let part_count = wav_part_count(
+            context.export_end_frame - context.export_start_frame,
+            WAV_BYTES_PER_SAMPLE as u32,
+            self.config.split_when_over_bytes,
+        )?;
+        let retained = decision
+            .channels()
+            .iter()
+            .filter(|channel| channel.disposition == ChannelDisposition::Retain)
+            .count();
+        let output_count = retained
+            .checked_mul(
+                usize::try_from(part_count)
+                    .map_err(|_| LambError::ExportInvariant("workspace part count overflow"))?,
+            )
+            .ok_or(LambError::ExportInvariant(
+                "selected range output count overflow",
+            ))?;
+        if output_count > self.outputs.len() {
+            return Err(LambError::ExportInvariant(
+                "selected range exceeds workspace output slots",
+            ));
+        }
+        self.output_count = output_count;
+        self.paths[STAGING_PARENT_PATH].set_path(details.staging_parent)?;
+        self.paths[FINAL_ROOT_PATH].set_path(&policy.output_dir)?;
+        set_transaction_path(
+            &mut self.paths[TRANSACTION_ROOT_PATH],
+            details.staging_parent,
+            details.staging_prefix,
+        )?;
+        let mut index = 0usize;
+        for (channel_index, channel) in decision.channels().iter().enumerate() {
+            if channel.disposition != ChannelDisposition::Retain {
+                continue;
+            }
+            let name = policy
+                .activity
+                .channels
+                .get(channel_index)
+                .ok_or(LambError::ExportInvariant(
+                    "decision channel is absent from policy",
+                ))?
+                .name
+                .as_str();
+            for zero_part in 0..part_count {
+                let part = zero_part
+                    .checked_add(1)
+                    .ok_or(LambError::ExportInvariant("workspace part overflow"))?;
+                let frames_per_part =
+                    (self.config.split_when_over_bytes - WAV_HEADER_BYTES) / WAV_BYTES_PER_SAMPLE;
+                let start_frame = context
+                    .export_start_frame
+                    .checked_add(
+                        zero_part
+                            .checked_mul(frames_per_part)
+                            .ok_or(LambError::ExportInvariant("workspace part start overflow"))?,
+                    )
+                    .ok_or(LambError::ExportInvariant("workspace part start overflow"))?;
+                let end_frame = (start_frame + frames_per_part).min(context.export_end_frame);
+                let mut suffix = [0_u8; 24];
+                let part_suffix = if part_count == 1 {
+                    ""
+                } else {
+                    suffix[..5].copy_from_slice(b"-part");
+                    let mut value = part;
+                    let mut digits = 1usize;
+                    while value >= 10 {
+                        value /= 10;
+                        digits += 1;
+                    }
+                    let width = digits.max(3);
+                    value = part;
+                    for position in (0..width).rev() {
+                        suffix[5 + position] = b'0' + (value % 10) as u8;
+                        value /= 10;
+                    }
+                    std::str::from_utf8(&suffix[..5 + width])
+                        .map_err(|_| LambError::ExportInvariant("part suffix is not UTF-8"))?
+                };
+                let staged_index = index * OUTPUT_PATH_SLOTS_PER_PART as usize;
+                self.render_directory.clear();
+                self.render_filename.clear();
+                render_policy_output_into(
+                    policy,
+                    context,
+                    name,
+                    part,
+                    part_suffix,
+                    start_frame,
+                    end_frame,
+                    &mut self.render_directory,
+                    &mut self.render_filename,
+                )?;
+                let rendered_directory = self.render_directory.as_str()?;
+                let rendered_filename = self.render_filename.as_str()?;
+                let final_index = OUTPUT_PATH_START + staged_index + FINAL_PATH_OFFSET;
+                self.paths[final_index].set_path(&policy.output_dir)?;
+                if !rendered_directory.is_empty() {
+                    self.paths[final_index].push_separator()?;
+                    self.paths[final_index].push_bytes(rendered_directory.as_bytes())?;
+                }
+                self.paths[final_index].push_separator()?;
+                self.paths[final_index].push_bytes(rendered_filename.as_bytes())?;
+                validate_rendered_output_path(
+                    &policy.output_dir,
+                    rendered_directory,
+                    rendered_filename,
+                    self.paths[final_index].as_path(),
+                    context.maximum_path_bytes,
+                )?;
+                let staged_path = OUTPUT_PATH_START + staged_index + STAGED_PATH_OFFSET;
+                self.render_directory
+                    .set_path(self.paths[TRANSACTION_ROOT_PATH].as_path())?;
+                self.paths[staged_path].set_path(self.render_directory.as_path())?;
+                self.paths[staged_path].push_separator()?;
+                write!(&mut self.paths[staged_path], "output-{index:08}").map_err(|_| {
+                    LambError::ExportInvariant("staged name exceeds workspace capacity")
+                })?;
+                self.outputs[index] = OutputFileSlot {
+                    start_frame,
+                    frame_count: end_frame - start_frame,
+                    channel: channel_index as u32,
+                    part: zero_part as u32,
+                    staged_path: staged_path as u32,
+                    final_path: final_index as u32,
+                };
+                for prior in 0..index {
+                    let previous = self.paths[self.outputs[prior].final_path as usize].as_bytes();
+                    let current = self.paths[final_index].as_bytes();
+                    if previous == current {
+                        return Err(LambError::Validation(
+                            "duplicate rendered export path".to_string(),
+                        ));
+                    }
+                    if (current.starts_with(previous) && current.get(previous.len()) == Some(&b'/'))
+                        || (previous.starts_with(current)
+                            && previous.get(current.len()) == Some(&b'/'))
+                    {
+                        return Err(LambError::Validation(
+                            "rendered export file/parent path conflict".to_string(),
+                        ));
+                    }
+                }
+                index += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn stream_selected_wavs(
+        &mut self,
+        frozen: &FrozenCaptureEpoch,
+        export_range: std::ops::Range<u64>,
+        io: &mut impl WavIo,
+    ) -> Result<()> {
+        let mut next = 0usize;
+        for channel in 0..self.writers.len() {
+            if next == self.output_count || self.outputs[next].channel as usize != channel {
+                continue;
+            }
+            let first = next;
+            while next < self.output_count && self.outputs[next].channel as usize == channel {
+                next += 1;
+            }
+            open_writer(
+                &mut self.writers[channel],
+                first,
+                next,
+                &self.outputs,
+                &self.paths,
+                self.config.sample_rate,
+                io,
+            )?;
+        }
+        let channels = self.config.channels as usize;
+        let mut cursor = export_range.start;
+        while cursor < export_range.end {
+            let copied = frozen.copy_interleaved_range_into(
+                cursor..export_range.end,
+                self.interleaved_scratch.as_mut_slice(),
+            )? as usize;
+            if copied == 0 {
+                return Err(LambError::ExportInvariant("frozen read made no progress"));
+            }
+            let samples = &self.interleaved_scratch.as_slice()[..copied * channels];
+            for channel in 0..self.writers.len() {
+                if self.writers[channel].file.is_none() {
+                    continue;
+                }
+                write_channel_block(
+                    samples,
+                    copied,
+                    channels,
+                    channel,
+                    &mut self.channel_pcm[channel],
+                    &mut self.writers[channel],
+                    &self.outputs,
+                    &self.paths,
+                    self.config.sample_rate,
+                    0,
+                    io,
+                )?;
+            }
+            cursor += copied as u64;
+        }
+        for channel in 0..self.writers.len() {
+            if self.writers[channel].file.is_none() {
+                continue;
+            }
+            finalize_writer(&mut self.writers[channel], &self.outputs, &self.paths, io)?;
+        }
+        Ok(())
     }
 
     fn plan_paths(&mut self, total_frames: u64, details: &RequestDetails<'_>) -> Result<()> {
@@ -761,6 +1145,7 @@ impl PersistenceWorkspace {
             open_writer(
                 &mut self.writers[channel],
                 output_index,
+                output_index + parts_per_channel,
                 &self.outputs,
                 &self.paths,
                 self.config.sample_rate,
@@ -1103,6 +1488,14 @@ impl PersistenceWorkspace {
 
 pub enum PreparedPersistence<'a> {
     Silent,
+    SkippedSilent,
+    SkippedByPolicy,
+    FileSet {
+        staging: OwnedTransactionArtifacts<'a>,
+    },
+    AtomicDirectory {
+        staging: OwnedTransactionArtifacts<'a>,
+    },
     Recall {
         staging: OwnedTransactionArtifacts<'a>,
     },
@@ -1114,15 +1507,21 @@ pub enum PreparedPersistence<'a> {
 impl PreparedPersistence<'_> {
     pub fn files(&self) -> Option<FilePlan<'_>> {
         match self {
-            Self::Silent => None,
-            Self::Recall { staging } | Self::Dump { staging } => Some(staging.files()),
+            Self::Silent | Self::SkippedSilent | Self::SkippedByPolicy => None,
+            Self::Recall { staging }
+            | Self::Dump { staging }
+            | Self::FileSet { staging }
+            | Self::AtomicDirectory { staging } => Some(staging.files()),
         }
     }
 
     pub fn staging_directory(&self) -> Option<&Path> {
         match self {
-            Self::Silent => None,
-            Self::Recall { staging } | Self::Dump { staging } => {
+            Self::Silent | Self::SkippedSilent | Self::SkippedByPolicy => None,
+            Self::Recall { staging }
+            | Self::Dump { staging }
+            | Self::FileSet { staging }
+            | Self::AtomicDirectory { staging } => {
                 Some(staging.workspace.paths[TRANSACTION_ROOT_PATH].as_path())
             }
         }
@@ -1336,7 +1735,7 @@ impl PreparedFile<'_> {
     }
 
     pub fn part(&self) -> u32 {
-        self.slot().part
+        self.slot().part + 1
     }
 
     pub fn start_frame(&self) -> u64 {
@@ -1395,6 +1794,24 @@ fn validate_frozen(config: &PersistenceWorkspaceConfig, frozen: &FrozenCaptureEp
     Ok(())
 }
 
+fn validate_policy_geometry(
+    config: &PersistenceWorkspaceConfig,
+    frozen: &FrozenCaptureEpoch,
+    policy: &ResolvedExportPolicy,
+    decision: &FrozenExportDecision,
+) -> Result<()> {
+    if policy.activity.channels.len() != config.channels as usize
+        || decision.channels().len() != config.channels as usize
+        || frozen.channels() != config.channels
+        || frozen.sample_rate() != config.sample_rate
+    {
+        return Err(LambError::ExportInvariant(
+            "export policy does not match frozen geometry",
+        ));
+    }
+    Ok(())
+}
+
 fn set_transaction_path(path: &mut ReusablePath, parent: &Path, prefix: &str) -> Result<()> {
     path.set_path(parent)?;
     path.push_separator()?;
@@ -1424,6 +1841,7 @@ fn write_output_path(path: &mut ReusablePath, parent: &Path, name: WavBasename<'
 fn open_writer(
     writer: &mut WriterSlot,
     output_index: usize,
+    output_end: usize,
     outputs: &[OutputFileSlot],
     paths: &[ReusablePath],
     sample_rate: u32,
@@ -1433,11 +1851,7 @@ fn open_writer(
         .get(output_index)
         .ok_or(LambError::ExportInvariant("WAV output slot is missing"))?;
     let path = paths[output.staged_path as usize].as_path();
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|source| io_error(path, source))?;
+    let mut file = io.open(path).map_err(|source| io_error(path, source))?;
     let header = wav_header(output.frame_count, sample_rate)?;
     if let Err(source) = io.write_all(&mut file, &header) {
         drop(file);
@@ -1447,6 +1861,7 @@ fn open_writer(
     writer.file = Some(file);
     writer.output_index = output_index;
     writer.frames_written = 0;
+    writer.output_end = output_end;
     Ok(())
 }
 
@@ -1461,7 +1876,7 @@ fn write_channel_block(
     outputs: &[OutputFileSlot],
     paths: &[ReusablePath],
     sample_rate: u32,
-    parts_per_channel: usize,
+    _parts_per_channel: usize,
     io: &mut impl WavIo,
 ) -> Result<()> {
     let mut frame_offset = 0;
@@ -1488,12 +1903,17 @@ fn write_channel_block(
 
         if writer.frames_written == output.frame_count {
             finalize_writer(writer, outputs, paths, io)?;
-            let channel_end = (channel + 1)
-                .checked_mul(parts_per_channel)
-                .ok_or(LambError::ExportInvariant("WAV channel end overflow"))?;
             let next = writer.output_index + 1;
-            if next < channel_end {
-                open_writer(writer, next, outputs, paths, sample_rate, io)?;
+            if next < writer.output_end {
+                open_writer(
+                    writer,
+                    next,
+                    writer.output_end,
+                    outputs,
+                    paths,
+                    sample_rate,
+                    io,
+                )?;
             }
         }
     }

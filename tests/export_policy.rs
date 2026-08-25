@@ -7,10 +7,10 @@ use lamb::export_policy::{
 use std::path::{Path, PathBuf};
 
 fn policy(layout: ResolvedLayout, output_dir: &str, channels: &[&str]) -> ResolvedExportPolicy {
-    ResolvedExportPolicy {
-        output_dir: PathBuf::from(output_dir),
+    ResolvedExportPolicy::new(
+        PathBuf::from(output_dir),
         layout,
-        activity: ResolvedActivityPolicy {
+        ResolvedActivityPolicy {
             detector: ActivityDetectorKind::ExactZero,
             channels: channels
                 .iter()
@@ -23,7 +23,8 @@ fn policy(layout: ResolvedLayout, output_dir: &str, channels: &[&str]) -> Resolv
             whole_export_exact_zero_gate: false,
             trim_leading_silence: false,
         },
-    }
+    )
+    .unwrap()
 }
 
 fn context(command: ExportCommand) -> RenderContext<'static> {
@@ -68,8 +69,11 @@ fn parser_accepts_exact_token_set_and_formatter_uses_all_values() {
 fn custom_preview_renders_nested_paths_absolute_ranges_and_split_metadata() {
     let policy = policy(
         ResolvedLayout::Custom {
-            directory_pattern: "{profile}/{channel}/{part}".to_string(),
-            filename_pattern: "{timestamp}-{startFrame}-{endFrame}{partSuffix}.wav".to_string(),
+            directory_pattern: ValidatedPattern::parse("{profile}/{channel}/{part}").unwrap(),
+            filename_pattern: ValidatedPattern::parse(
+                "{timestamp}-{startFrame}-{endFrame}{partSuffix}.wav",
+            )
+            .unwrap(),
         },
         "/exports",
         &["left", "right"],
@@ -99,8 +103,8 @@ fn unsplit_output_has_one_based_part_and_empty_suffix() {
     context.split_when_over_bytes = 1_000_000;
     let policy = policy(
         ResolvedLayout::Custom {
-            directory_pattern: String::new(),
-            filename_pattern: "{channel}{partSuffix}.wav".to_string(),
+            directory_pattern: ValidatedPattern::parse("").unwrap(),
+            filename_pattern: ValidatedPattern::parse("{channel}{partSuffix}.wav").unwrap(),
         },
         "/exports",
         &["left"],
@@ -147,8 +151,8 @@ fn publication_strategy_depends_on_effective_layout_not_timestamp_token() {
     );
     assert_eq!(
         ResolvedLayout::Custom {
-            directory_pattern: "{timestamp}".to_string(),
-            filename_pattern: "{channel}.wav".to_string(),
+            directory_pattern: ValidatedPattern::parse("{timestamp}").unwrap(),
+            filename_pattern: ValidatedPattern::parse("{channel}.wav").unwrap(),
         }
         .publication_strategy(ExportCommand::Dump),
         PublicationStrategy::FileSet
@@ -187,8 +191,8 @@ fn parser_rejects_malformed_or_unknown_tokens() {
 
 fn custom(directory: &str, filename: &str) -> ResolvedLayout {
     ResolvedLayout::Custom {
-        directory_pattern: directory.to_string(),
-        filename_pattern: filename.to_string(),
+        directory_pattern: ValidatedPattern::parse(directory).unwrap(),
+        filename_pattern: ValidatedPattern::parse(filename).unwrap(),
     }
 }
 

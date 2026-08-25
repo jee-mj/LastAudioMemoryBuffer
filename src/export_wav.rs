@@ -345,11 +345,16 @@ pub fn publish_prepared_with_hook(
     hook: &mut impl PreparedPublicationHook,
 ) -> PreparedPublication {
     match prepared {
-        PreparedPersistence::Silent => PreparedPublication::RetryableFailure(
+        PreparedPersistence::Silent
+        | PreparedPersistence::SkippedSilent
+        | PreparedPersistence::SkippedByPolicy => PreparedPublication::RetryableFailure(
             LambError::ExportInvariant("silent persistence has no prepared artifacts"),
         ),
-        PreparedPersistence::Recall { staging } => publish_prepared_recall(staging, hook),
-        PreparedPersistence::Dump { staging } => publish_prepared_dump(staging, hook),
+        PreparedPersistence::Recall { staging } | PreparedPersistence::FileSet { staging } => {
+            publish_prepared_recall(staging, hook)
+        }
+        PreparedPersistence::Dump { staging }
+        | PreparedPersistence::AtomicDirectory { staging } => publish_prepared_dump(staging, hook),
     }
 }
 

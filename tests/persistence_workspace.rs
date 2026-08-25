@@ -1,5 +1,13 @@
+use lamb::activity::{
+    ActivityDetectorKind, ActivityResult, ChannelDisposition, ChannelExportMode,
+    FrozenExportDecision,
+};
 use lamb::capture_arena::{CaptureArena, CaptureIngress, CaptureRuntimeConfig, FrozenCaptureEpoch};
 use lamb::error::LambError;
+use lamb::export_policy::{
+    ChannelActivityPolicy, ExportCommand, ResolvedActivityPolicy, ResolvedExportPolicy,
+    ResolvedLayout, ValidatedPattern,
+};
 use lamb::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
 use lamb::persistence_workspace::{
     CleanupIo, PendingCleanup, PersistenceWorkspace, PersistenceWorkspaceConfig, PrepareRequest,
@@ -10,7 +18,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -149,6 +157,280 @@ fn wav_bytes(path: &Path) -> Vec<u8> {
 fn s24(bytes: &[u8]) -> i32 {
     let sign = if bytes[2] & 0x80 == 0 { 0 } else { 0xff };
     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], sign])
+}
+
+fn exact_zero_policy(output_dir: &Path, modes: &[ChannelExportMode]) -> ResolvedExportPolicy {
+    activity_policy(output_dir, modes, ResolvedLayout::FlatDetailed, false)
+}
+
+fn activity_policy(
+    output_dir: &Path,
+    modes: &[ChannelExportMode],
+    layout: ResolvedLayout,
+    trim_leading_silence: bool,
+) -> ResolvedExportPolicy {
+    ResolvedExportPolicy::new(
+        output_dir.to_path_buf(),
+        layout,
+        ResolvedActivityPolicy {
+            detector: ActivityDetectorKind::ExactZero,
+            channels: modes
+                .iter()
+                .enumerate()
+                .map(|(index, &mode)| ChannelActivityPolicy {
+                    name: format!("channel-{index}"),
+                    mode,
+                    threshold: None,
+                })
+                .collect(),
+            whole_export_exact_zero_gate: false,
+            trim_leading_silence,
+        },
+    )
+    .unwrap()
+}
+
+fn custom_layout(directory: &str, filename: &str) -> ResolvedLayout {
+    ResolvedLayout::Custom {
+        directory_pattern: ValidatedPattern::parse(directory).unwrap(),
+        filename_pattern: ValidatedPattern::parse(filename).unwrap(),
+    }
+}
+
+#[test]
+fn policy_prepare_retains_only_active_channels_in_original_order() {
+    let geometry = Geometry {
+        retention_frames: 4,
+        channels: 4,
+        chunk_frames: 2,
+        split_when_over_bytes: 1_000,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 512,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let policy = exact_zero_policy(root.path(), &[ChannelExportMode::Auto; 4]);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let frozen = freeze(
+        &mut arena,
+        &ingress,
+        &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.25, 0.0],
+        4,
+    );
+
+    let prepared = workspace
+        .prepare(
+            &frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "test",
+                staging_root: &root.path().join("staging"),
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+        )
+        .unwrap();
+
+    let files = prepared.files().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files.get(0).unwrap().channel(), 2);
+}
+
+#[test]
+fn policy_prepare_distinguishes_policy_and_silent_skips_and_keeps_non_finite() {
+    for (modes, samples, expected_policy_skip) in [
+        (
+            [ChannelExportMode::Never, ChannelExportMode::Never],
+            [0.0, 0.0, 0.0, 0.0],
+            true,
+        ),
+        (
+            [ChannelExportMode::Auto, ChannelExportMode::Auto],
+            [0.0, -0.0, 0.0, -0.0],
+            false,
+        ),
+        (
+            [ChannelExportMode::Auto, ChannelExportMode::Auto],
+            [f32::NAN, 0.0, 0.0, f32::INFINITY],
+            false,
+        ),
+    ] {
+        let geometry = Geometry {
+            retention_frames: 2,
+            channels: 2,
+            chunk_frames: 2,
+            split_when_over_bytes: 1_000,
+            io_buffer_bytes_per_channel: 6,
+            maximum_path_bytes: 512,
+        };
+        let (mut arena, ingress, plan) = runtime(geometry);
+        let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let policy = exact_zero_policy(root.path(), &modes);
+        let mut decision = FrozenExportDecision::new(&plan).unwrap();
+        let frozen = freeze(&mut arena, &ingress, &samples, 2);
+        let prepared = workspace
+            .prepare(
+                &frozen,
+                PrepareRequest::Policy {
+                    command: ExportCommand::Recall,
+                    policy: &policy,
+                    profile: "test",
+                    staging_root: &root.path().join("staging"),
+                    timestamp: TIMESTAMP,
+                    decision: &mut decision,
+                },
+            )
+            .unwrap();
+        if expected_policy_skip {
+            assert!(matches!(prepared, PreparedPersistence::SkippedByPolicy));
+        } else if samples.iter().all(|sample| *sample == 0.0) {
+            assert!(matches!(prepared, PreparedPersistence::SkippedSilent));
+        } else {
+            assert_eq!(prepared.files().unwrap().len(), 2);
+        }
+    }
+}
+
+#[test]
+fn real_exact_zero_retention_matrix_preserves_original_channel_order_and_ambiguity() {
+    struct Case {
+        modes: [ChannelExportMode; 4],
+        samples: [f32; 8],
+        expected_channels: &'static [u32],
+        expected_skip: Option<bool>,
+    }
+    let cases = [
+        Case {
+            modes: [ChannelExportMode::Auto; 4],
+            samples: [0.5, 0.000_001, 0.0, -0.0, 0.25, 0.0, 0.0, -0.0],
+            expected_channels: &[0, 1],
+            expected_skip: None,
+        },
+        Case {
+            modes: [ChannelExportMode::Auto; 4],
+            samples: [0.0, 0.0, 0.0, 0.25, 0.0, -0.0, 0.0, 0.0],
+            expected_channels: &[3],
+            expected_skip: None,
+        },
+        Case {
+            modes: [ChannelExportMode::Auto; 4],
+            samples: [0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0],
+            expected_channels: &[],
+            expected_skip: Some(false),
+        },
+        Case {
+            modes: [ChannelExportMode::Never; 4],
+            samples: [1.0; 8],
+            expected_channels: &[],
+            expected_skip: Some(true),
+        },
+        Case {
+            modes: [
+                ChannelExportMode::Never,
+                ChannelExportMode::Auto,
+                ChannelExportMode::Never,
+                ChannelExportMode::Auto,
+            ],
+            samples: [1.0, 0.0, 1.0, -0.0, 1.0, 0.0, 1.0, -0.0],
+            expected_channels: &[],
+            expected_skip: Some(false),
+        },
+        Case {
+            modes: [
+                ChannelExportMode::Never,
+                ChannelExportMode::Always,
+                ChannelExportMode::Never,
+                ChannelExportMode::Never,
+            ],
+            samples: [1.0, 0.0, 1.0, 1.0, 1.0, -0.0, 1.0, 1.0],
+            expected_channels: &[1],
+            expected_skip: None,
+        },
+    ];
+
+    for case in cases {
+        let geometry = Geometry {
+            retention_frames: 2,
+            channels: 4,
+            chunk_frames: 2,
+            split_when_over_bytes: 1_000,
+            io_buffer_bytes_per_channel: 6,
+            maximum_path_bytes: 512,
+        };
+        let (mut arena, ingress, plan) = runtime(geometry);
+        let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let policy = exact_zero_policy(root.path(), &case.modes);
+        let mut decision = FrozenExportDecision::new(&plan).unwrap();
+        let frozen = freeze(&mut arena, &ingress, &case.samples, 4);
+        let prepared = workspace
+            .prepare(
+                &frozen,
+                PrepareRequest::Policy {
+                    command: ExportCommand::Recall,
+                    policy: &policy,
+                    profile: "matrix",
+                    staging_root: &root.path().join("staging"),
+                    timestamp: TIMESTAMP,
+                    decision: &mut decision,
+                },
+            )
+            .unwrap();
+        match case.expected_skip {
+            Some(true) => assert!(matches!(prepared, PreparedPersistence::SkippedByPolicy)),
+            Some(false) => assert!(matches!(prepared, PreparedPersistence::SkippedSilent)),
+            None => {
+                let files = prepared.files().unwrap();
+                let actual: Vec<_> = (0..files.len())
+                    .map(|index| files.get(index).unwrap().channel())
+                    .collect();
+                assert_eq!(actual, case.expected_channels);
+            }
+        }
+        drop(prepared);
+        arena.shutdown(DEADLINE).unwrap();
+    }
+
+    for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let geometry = Geometry {
+            retention_frames: 1,
+            channels: 1,
+            chunk_frames: 1,
+            split_when_over_bytes: 1_000,
+            io_buffer_bytes_per_channel: 3,
+            maximum_path_bytes: 512,
+        };
+        let (mut arena, ingress, plan) = runtime(geometry);
+        let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let policy = exact_zero_policy(root.path(), &[ChannelExportMode::Auto]);
+        let mut decision = FrozenExportDecision::new(&plan).unwrap();
+        let frozen = freeze(&mut arena, &ingress, &[non_finite], 1);
+        let prepared = workspace
+            .prepare(
+                &frozen,
+                PrepareRequest::Policy {
+                    command: ExportCommand::Recall,
+                    policy: &policy,
+                    profile: "matrix",
+                    staging_root: &root.path().join("staging"),
+                    timestamp: TIMESTAMP,
+                    decision: &mut decision,
+                },
+            )
+            .unwrap();
+        assert_eq!(prepared.files().unwrap().get(0).unwrap().channel(), 0);
+        assert_eq!(decision.channels()[0].result, ActivityResult::Ambiguous);
+        assert_eq!(
+            decision.channels()[0].disposition,
+            ChannelDisposition::Retain
+        );
+        drop(prepared);
+        arena.shutdown(DEADLINE).unwrap();
+    }
 }
 
 #[test]
@@ -583,11 +865,19 @@ impl CleanupIo for InjectedCleanupIo {
 #[derive(Default)]
 struct CountingIo {
     writes: usize,
+    headers: usize,
+    opened: Vec<PathBuf>,
 }
 
 impl WavIo for CountingIo {
+    fn open(&mut self, path: &Path) -> io::Result<File> {
+        self.opened.push(path.to_path_buf());
+        File::options().write(true).create_new(true).open(path)
+    }
+
     fn write_all(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
         self.writes += 1;
+        self.headers += usize::from(bytes.len() == 44 && bytes.starts_with(b"RIFF"));
         file.write_all(bytes)
     }
 
@@ -597,6 +887,264 @@ impl WavIo for CountingIo {
 
     fn sync_all(&mut self, file: &File) -> io::Result<()> {
         file.sync_all()
+    }
+}
+
+#[test]
+fn sparse_split_opens_only_dense_retained_channel_part_outputs() {
+    let geometry = Geometry {
+        retention_frames: 6,
+        channels: 4,
+        chunk_frames: 3,
+        split_when_over_bytes: 50,
+        io_buffer_bytes_per_channel: 9,
+        maximum_path_bytes: 512,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let policy = activity_policy(
+        &root.path().join("output"),
+        &[
+            ChannelExportMode::Auto,
+            ChannelExportMode::Never,
+            ChannelExportMode::Auto,
+            ChannelExportMode::Auto,
+        ],
+        custom_layout("nested/{channel}", "part-{part}.wav"),
+        false,
+    );
+    let samples = [
+        0.5, 1.0, 0.25, 0.0, 0.4, 1.0, 0.2, -0.0, 0.3, 1.0, 0.1, 0.0, 0.2, 1.0, 0.05, -0.0, 0.1,
+        1.0, 0.025, 0.0, 0.05, 1.0, 0.0125, -0.0,
+    ];
+    let frozen = freeze(&mut arena, &ingress, &samples, 4);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut io = CountingIo::default();
+    let prepared = workspace
+        .prepare_with_io(
+            &frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "split",
+                staging_root: &root.path().join("staging"),
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+            &mut io,
+        )
+        .unwrap();
+
+    let files = prepared.files().unwrap();
+    assert_eq!(files.len(), 6);
+    let channels: Vec<_> = (0..files.len())
+        .map(|index| files.get(index).unwrap().channel())
+        .collect();
+    let parts: Vec<_> = (0..files.len())
+        .map(|index| files.get(index).unwrap().part())
+        .collect();
+    assert_eq!(channels, [0, 0, 0, 2, 2, 2]);
+    assert_eq!(parts, [1, 2, 3, 1, 2, 3]);
+    assert_eq!(io.opened.len(), files.len());
+    assert_eq!(io.headers, files.len());
+    let mut planned_paths: Vec<_> = (0..files.len())
+        .map(|index| files.get(index).unwrap().staged_path().to_path_buf())
+        .collect();
+    planned_paths.sort();
+    io.opened.sort();
+    assert_eq!(io.opened, planned_paths);
+    for index in 0..files.len() {
+        let file = files.get(index).unwrap();
+        assert_eq!(file.start_frame(), u64::from((index % 3) as u32 * 2));
+        assert_eq!(file.frame_count(), 2);
+        assert!(file.staged_path().exists());
+    }
+    assert_eq!(
+        decision
+            .channels()
+            .iter()
+            .filter(|channel| channel.disposition == ChannelDisposition::Omit)
+            .count(),
+        2
+    );
+    drop(prepared);
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn common_crop_wavs_preserve_staggered_onsets_and_untrimmed_tail() {
+    const SAMPLE_RATE: usize = 48_000;
+    const PREROLL: usize = 2 * SAMPLE_RATE;
+    const TOTAL_FRAMES: usize = PREROLL + 10;
+    const MIC_ONSET: usize = PREROLL + 3;
+    const GUITAR_ONSET: usize = PREROLL + 6;
+    const CROP_START: u64 = 3;
+    const ENCODED_FRAMES: u64 = TOTAL_FRAMES as u64 - CROP_START;
+
+    let geometry = Geometry {
+        retention_frames: TOTAL_FRAMES as u64,
+        channels: 2,
+        chunk_frames: TOTAL_FRAMES as u32,
+        split_when_over_bytes: 1_000_000,
+        io_buffer_bytes_per_channel: 12_288,
+        maximum_path_bytes: 512,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let policy = activity_policy(
+        &root.path().join("output"),
+        &[ChannelExportMode::Auto; 2],
+        custom_layout("crop", "{channel}.wav"),
+        true,
+    );
+    let mut samples = vec![0.0; TOTAL_FRAMES * 2];
+    samples[MIC_ONSET * 2] = 0.5;
+    samples[GUITAR_ONSET * 2 + 1] = -0.5;
+    let frozen = freeze(&mut arena, &ingress, &samples, 2);
+    let consumed_range = frozen.absolute_range();
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let prepared = workspace
+        .prepare(
+            &frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "crop",
+                staging_root: &root.path().join("staging"),
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(consumed_range, 0..TOTAL_FRAMES as u64);
+    assert_eq!(decision.export_range(), CROP_START..TOTAL_FRAMES as u64);
+    assert!(consumed_range.end - consumed_range.start > ENCODED_FRAMES);
+    let files = prepared.files().unwrap();
+    assert_eq!(files.len(), 2);
+    let expected_onsets = [PREROLL as u64, (PREROLL + 3) as u64];
+    for (index, expected_onset) in expected_onsets.into_iter().enumerate() {
+        let file = files.get(index).unwrap();
+        assert_eq!(file.start_frame(), CROP_START);
+        assert_eq!(file.frame_count(), ENCODED_FRAMES);
+        let bytes = wav_bytes(file.staged_path());
+        assert_eq!(
+            u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            ENCODED_FRAMES as u32 * 3
+        );
+        let decoded: Vec<_> = bytes[44..].chunks_exact(3).map(s24).collect();
+        assert_eq!(decoded.len(), ENCODED_FRAMES as usize);
+        assert!(decoded[..expected_onset as usize]
+            .iter()
+            .all(|sample| *sample == 0));
+        assert_ne!(decoded[expected_onset as usize], 0);
+        assert!(decoded[expected_onset as usize + 1..]
+            .iter()
+            .all(|sample| *sample == 0));
+        assert_eq!(decoded.last(), Some(&0), "tail after evidence was trimmed");
+    }
+    assert_eq!(expected_onsets[1] - expected_onsets[0], 3);
+    drop(prepared);
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn canonical_preflight_blocks_staging_and_open_then_reuses_frozen_decision_on_retry() {
+    assert!(ValidatedPattern::parse("{channel").is_err());
+    assert!(ValidatedPattern::parse("{unknown}.wav").is_err());
+
+    for failure in 0..3 {
+        let split = failure != 1;
+        let geometry = Geometry {
+            retention_frames: 4,
+            channels: 2,
+            chunk_frames: 4,
+            split_when_over_bytes: if split { 50 } else { 1_000 },
+            io_buffer_bytes_per_channel: 12,
+            maximum_path_bytes: 128,
+        };
+        let (mut arena, ingress, plan) = runtime(geometry);
+        let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+        let staging = root.path().join("staging");
+        let failing_layout = match failure {
+            0 => custom_layout("", "same.wav"),
+            1 => custom_layout("", "{part}.wav"),
+            2 => custom_layout("", &format!("{}.wav", "x".repeat(120))),
+            _ => unreachable!(),
+        };
+        let failing_policy =
+            activity_policy(&output, &[ChannelExportMode::Auto; 2], failing_layout, true);
+        let samples = [0.0, 0.0, 0.5, 0.0, 0.0, 0.25, 0.0, 0.0];
+        let frozen = freeze(&mut arena, &ingress, &samples, 2);
+        let mut decision = FrozenExportDecision::new(&plan).unwrap();
+        let mut failing_io = CountingIo::default();
+        let result = workspace.prepare_with_io(
+            &frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &failing_policy,
+                profile: "preflight",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+            &mut failing_io,
+        );
+        assert!(
+            result.is_err(),
+            "preflight case {failure} unexpectedly succeeded"
+        );
+        drop(result);
+        assert!(decision.valid());
+        let frozen_range = decision.export_range();
+        let frozen_channels = decision.channels().to_vec();
+        assert!(
+            !staging.exists(),
+            "case {failure} created staging before failure"
+        );
+        assert_eq!(failing_io.opened.len(), 0, "case {failure} opened a WAV");
+        assert_eq!(failing_io.headers, 0, "case {failure} wrote a WAV header");
+
+        let corrected = activity_policy(
+            &output,
+            &[ChannelExportMode::Never; 2],
+            custom_layout("nested/{profile}/{channel}", "part-{part}.wav"),
+            false,
+        );
+        let mut retry_io = CountingIo::default();
+        let prepared = workspace
+            .prepare_with_io(
+                &frozen,
+                PrepareRequest::Policy {
+                    command: ExportCommand::Recall,
+                    policy: &corrected,
+                    profile: "preflight",
+                    staging_root: &staging,
+                    timestamp: TIMESTAMP,
+                    decision: &mut decision,
+                },
+                &mut retry_io,
+            )
+            .unwrap();
+        assert_eq!(decision.export_range(), frozen_range);
+        assert_eq!(decision.channels(), frozen_channels);
+        let files = prepared.files().unwrap();
+        assert_eq!(files.len(), if split { 4 } else { 2 });
+        assert_eq!(retry_io.opened.len(), files.len());
+        assert_eq!(retry_io.headers, files.len());
+        for index in 0..files.len() {
+            let file = files.get(index).unwrap();
+            assert!(file
+                .final_path()
+                .starts_with(output.join("nested/preflight")));
+            assert!(matches!(file.channel(), 0 | 1));
+        }
+        drop(prepared);
+        arena.shutdown(DEADLINE).unwrap();
     }
 }
 
@@ -1262,16 +1810,20 @@ fn measured_prepare(frames: u64) -> (usize, usize) {
     let root = tempfile::tempdir().unwrap();
     let staging = root.path().join("staging");
     let output = root.path().join("output");
+    let policy = exact_zero_policy(&output, &[ChannelExportMode::Auto]);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
 
     let (_, count, bytes) = allocation_count_during(|| {
         let prepared = workspace
             .prepare(
                 &frozen,
-                PrepareRequest::Recall {
+                PrepareRequest::Policy {
+                    command: ExportCommand::Recall,
+                    policy: &policy,
+                    profile: "test",
                     staging_root: &staging,
-                    output_dir: &output,
                     timestamp: TIMESTAMP,
-                    channel_names: &[],
+                    decision: &mut decision,
                 },
             )
             .unwrap();
@@ -1299,8 +1851,82 @@ fn bounded_operation_allocations_do_not_scale_with_selected_frame_count() {
     );
     assert!(
         maximum.1 <= 114,
-        "bounded OS/path allocation bytes changed: {maximum:?}"
+        "bounded OS/path allocations changed: {maximum:?}"
     );
+}
+
+#[test]
+fn startup_addresses_and_operation_allocations_are_stable_across_sparse_maximum_outputs() {
+    let geometry = Geometry {
+        retention_frames: 32,
+        channels: 4,
+        chunk_frames: 32,
+        split_when_over_bytes: 50,
+        io_buffer_bytes_per_channel: 24,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let startup = workspace.allocation_addresses();
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    let output = root.path().join("output");
+    let policy = exact_zero_policy(&output, &[ChannelExportMode::Auto; 4]);
+
+    let mut small_decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut small_samples = vec![0.0; 2 * 4];
+    small_samples[0] = 0.25;
+    let mut small_frozen = freeze(&mut arena, &ingress, &small_samples, 4);
+    let (small_prepared, small_count, small_bytes) = allocation_count_during(|| {
+        workspace
+            .prepare(
+                &small_frozen,
+                PrepareRequest::Policy {
+                    command: ExportCommand::Recall,
+                    policy: &policy,
+                    profile: "allocation",
+                    staging_root: &staging,
+                    timestamp: TIMESTAMP,
+                    decision: &mut small_decision,
+                },
+            )
+            .unwrap()
+    });
+    assert_eq!(small_prepared.files().unwrap().len(), 1);
+    drop(small_prepared);
+    assert_eq!(workspace.allocation_addresses(), startup);
+    arena.release_frozen(&mut small_frozen, DEADLINE).unwrap();
+
+    let mut maximum_decision = FrozenExportDecision::new(&plan).unwrap();
+    let maximum_samples = vec![0.25; 32 * 4];
+    let maximum_frozen = freeze(&mut arena, &ingress, &maximum_samples, 4);
+    let (maximum_prepared, maximum_count, maximum_bytes) = allocation_count_during(|| {
+        workspace
+            .prepare(
+                &maximum_frozen,
+                PrepareRequest::Policy {
+                    command: ExportCommand::Recall,
+                    policy: &policy,
+                    profile: "allocation",
+                    staging_root: &staging,
+                    timestamp: TIMESTAMP,
+                    decision: &mut maximum_decision,
+                },
+            )
+            .unwrap()
+    });
+    assert_eq!(maximum_prepared.files().unwrap().len(), 64);
+    drop(maximum_prepared);
+    assert_eq!(workspace.allocation_addresses(), startup);
+    assert_eq!(
+        (maximum_count, maximum_bytes),
+        (small_count, small_bytes),
+        "operation allocations scaled from sparse/small to dense/maximum"
+    );
+    assert!(maximum_count <= 2, "unexpected fixed allocation count");
+    assert!(maximum_bytes <= 64, "unexpected fixed allocated bytes");
+    arena.shutdown(DEADLINE).unwrap();
 }
 
 struct BlockingIo {

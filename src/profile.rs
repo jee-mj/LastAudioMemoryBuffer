@@ -7,6 +7,7 @@ use crate::config::{normalize_capture_ports, ConfiguredCapturePort};
 use crate::error::{io_error, LambError, Result};
 use crate::export_policy::{
     ChannelActivityPolicy, ResolvedActivityPolicy, ResolvedExportPolicy, ResolvedLayout,
+    ValidatedPattern,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -271,29 +272,33 @@ fn resolve_export_policy(
         Some(ExportLayoutKind::FlatDetailed) => ResolvedLayout::FlatDetailed,
         Some(ExportLayoutKind::TimestampDirectory) => ResolvedLayout::TimestampDirectory,
         Some(ExportLayoutKind::Custom) => ResolvedLayout::Custom {
-            directory_pattern: profile.export.directory_pattern.clone().ok_or_else(|| {
-                LambError::Validation(format!(
-                    "profile {name}: export.directoryPattern is required for custom layout"
-                ))
-            })?,
-            filename_pattern: profile.export.filename_pattern.clone().ok_or_else(|| {
-                LambError::Validation(format!(
-                    "profile {name}: export.filenamePattern is required for custom layout"
-                ))
-            })?,
+            directory_pattern: ValidatedPattern::parse(
+                &profile.export.directory_pattern.clone().ok_or_else(|| {
+                    LambError::Validation(format!(
+                        "profile {name}: export.directoryPattern is required for custom layout"
+                    ))
+                })?,
+            )?,
+            filename_pattern: ValidatedPattern::parse(
+                &profile.export.filename_pattern.clone().ok_or_else(|| {
+                    LambError::Validation(format!(
+                        "profile {name}: export.filenamePattern is required for custom layout"
+                    ))
+                })?,
+            )?,
         },
     };
 
-    Ok(ResolvedExportPolicy {
+    ResolvedExportPolicy::new(
         output_dir,
         layout,
-        activity: ResolvedActivityPolicy {
+        ResolvedActivityPolicy {
             detector,
             channels,
             whole_export_exact_zero_gate,
             trim_leading_silence,
         },
-    })
+    )
 }
 
 fn capture_port_export_mode(

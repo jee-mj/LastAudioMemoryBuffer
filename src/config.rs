@@ -258,19 +258,19 @@ impl LambConfig {
             })
             .collect();
 
-        Ok(ResolvedExportPolicy {
-            output_dir: self.output_dir.clone(),
-            layout: match command {
+        ResolvedExportPolicy::new(
+            self.output_dir.clone(),
+            match command {
                 ExportCommand::Recall => ResolvedLayout::FlatDetailed,
                 ExportCommand::Dump => ResolvedLayout::TimestampDirectory,
             },
-            activity: ResolvedActivityPolicy {
+            ResolvedActivityPolicy {
                 detector: ActivityDetectorKind::ExactZero,
                 channels,
                 whole_export_exact_zero_gate: true,
                 trim_leading_silence: false,
             },
-        })
+        )
     }
 }
 

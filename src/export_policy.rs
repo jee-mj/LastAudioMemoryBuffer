@@ -3,7 +3,6 @@ use crate::app_config::ActivityThresholdConfig;
 use crate::error::{LambError, Result};
 use crate::math::wav_parts_for_channel;
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,8 +17,8 @@ pub enum ResolvedLayout {
     FlatDetailed,
     TimestampDirectory,
     Custom {
-        directory_pattern: String,
-        filename_pattern: String,
+        directory_pattern: ValidatedPattern,
+        filename_pattern: ValidatedPattern,
     },
 }
 
@@ -217,7 +216,7 @@ pub struct RenderedOutput {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn render_output_into(
+pub fn render_output_to(
     pattern: &ValidatedPattern,
     context: &RenderContext<'_>,
     channel: &str,
@@ -225,14 +224,21 @@ pub fn render_output_into(
     part_suffix: &str,
     start_frame: u64,
     end_frame: u64,
-    output: &mut String,
+    output: &mut impl std::fmt::Write,
 ) -> Result<()> {
-    output.clear();
     for segment in &pattern.segments {
         match segment {
-            PatternSegment::Literal(value) => output.push_str(value),
-            PatternSegment::Token(PatternToken::Timestamp) => output.push_str(context.timestamp),
-            PatternSegment::Token(PatternToken::Channel) => output.push_str(channel),
+            PatternSegment::Literal(value) => output
+                .write_str(value)
+                .map_err(|_| validation("could not render literal"))?,
+            PatternSegment::Token(PatternToken::Timestamp) => {
+                output
+                    .write_str(context.timestamp)
+                    .map_err(|_| validation("could not render timestamp token"))?
+            }
+            PatternSegment::Token(PatternToken::Channel) => output
+                .write_str(channel)
+                .map_err(|_| validation("could not render channel token"))?,
             PatternSegment::Token(PatternToken::SampleRate) => {
                 write!(output, "{}", context.sample_rate)
                     .map_err(|_| validation("could not render sample-rate token"))?;
@@ -248,8 +254,12 @@ pub fn render_output_into(
             PatternSegment::Token(PatternToken::Part) => {
                 write!(output, "{part}").map_err(|_| validation("could not render part token"))?;
             }
-            PatternSegment::Token(PatternToken::PartSuffix) => output.push_str(part_suffix),
-            PatternSegment::Token(PatternToken::Profile) => output.push_str(context.profile),
+            PatternSegment::Token(PatternToken::PartSuffix) => output
+                .write_str(part_suffix)
+                .map_err(|_| validation("could not render part suffix token"))?,
+            PatternSegment::Token(PatternToken::Profile) => output
+                .write_str(context.profile)
+                .map_err(|_| validation("could not render profile token"))?,
             PatternSegment::ZeroPaddedToken(PatternToken::StartFrame, width) => {
                 write!(output, "{start_frame:0width$}")
                     .map_err(|_| validation("could not render start-frame token"))?;
@@ -268,6 +278,87 @@ pub fn render_output_into(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_output_into(
+    pattern: &ValidatedPattern,
+    context: &RenderContext<'_>,
+    channel: &str,
+    part: u64,
+    part_suffix: &str,
+    start_frame: u64,
+    end_frame: u64,
+    output: &mut String,
+) -> Result<()> {
+    output.clear();
+    render_output_to(
+        pattern,
+        context,
+        channel,
+        part,
+        part_suffix,
+        start_frame,
+        end_frame,
+        output,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_policy_output_into(
+    policy: &ResolvedExportPolicy,
+    context: &RenderContext<'_>,
+    channel: &str,
+    part: u64,
+    part_suffix: &str,
+    start_frame: u64,
+    end_frame: u64,
+    directory: &mut impl std::fmt::Write,
+    filename: &mut impl std::fmt::Write,
+) -> Result<()> {
+    let (directory_pattern, filename_pattern) = policy.patterns(context.command);
+    validate_context_values(directory_pattern, filename_pattern, context)?;
+    validate_component_value(channel, "channel")?;
+    validate_pattern_capacity(
+        directory_pattern,
+        filename_pattern,
+        &policy.output_dir,
+        context,
+        channel,
+    )?;
+    render_output_to(
+        directory_pattern,
+        context,
+        channel,
+        part,
+        part_suffix,
+        start_frame,
+        end_frame,
+        directory,
+    )?;
+    render_output_to(
+        filename_pattern,
+        context,
+        channel,
+        part,
+        part_suffix,
+        start_frame,
+        end_frame,
+        filename,
+    )?;
+    Ok(())
+}
+
+pub fn validate_rendered_output_path(
+    output_dir: &Path,
+    directory: &str,
+    filename: &str,
+    final_path: &Path,
+    maximum_bytes: u64,
+) -> Result<()> {
+    validate_rendered_directory(directory)?;
+    validate_filename(filename)?;
+    validate_final_path(output_dir, final_path, maximum_bytes)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -290,6 +381,48 @@ pub struct ResolvedExportPolicy {
     pub output_dir: PathBuf,
     pub layout: ResolvedLayout,
     pub activity: ResolvedActivityPolicy,
+    patterns: ResolvedPatternSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPatternSet {
+    recall_directory: ValidatedPattern,
+    recall_filename: ValidatedPattern,
+    dump_directory: ValidatedPattern,
+    dump_filename: ValidatedPattern,
+}
+
+impl ResolvedExportPolicy {
+    pub fn new(
+        output_dir: PathBuf,
+        layout: ResolvedLayout,
+        activity: ResolvedActivityPolicy,
+    ) -> Result<Self> {
+        let (recall_directory, recall_filename) =
+            patterns_for_layout(&layout, ExportCommand::Recall)?;
+        let (dump_directory, dump_filename) = patterns_for_layout(&layout, ExportCommand::Dump)?;
+        Ok(Self {
+            output_dir,
+            layout,
+            activity,
+            patterns: ResolvedPatternSet {
+                recall_directory,
+                recall_filename,
+                dump_directory,
+                dump_filename,
+            },
+        })
+    }
+
+    fn patterns(&self, command: ExportCommand) -> (&ValidatedPattern, &ValidatedPattern) {
+        match command {
+            ExportCommand::Recall => (
+                &self.patterns.recall_directory,
+                &self.patterns.recall_filename,
+            ),
+            ExportCommand::Dump => (&self.patterns.dump_directory, &self.patterns.dump_filename),
+        }
+    }
 }
 
 pub fn preview_export_paths(
@@ -305,9 +438,8 @@ pub fn preview_export_paths(
         return Err(validation("maximum path bytes must be nonzero"));
     }
 
-    let (directory_pattern, filename_pattern) =
-        patterns_for_layout(&policy.layout, context.command)?;
-    validate_context_values(&directory_pattern, &filename_pattern, context)?;
+    let (directory_pattern, filename_pattern) = policy.patterns(context.command);
+    validate_context_values(directory_pattern, filename_pattern, context)?;
     let total_frames = context.export_end_frame - context.export_start_frame;
     let parts = wav_parts_for_channel(total_frames, 3, context.split_when_over_bytes)?;
     let part_count = u64::try_from(parts.len())
@@ -331,8 +463,8 @@ pub fn preview_export_paths(
             .as_str();
         validate_component_value(channel, "channel")?;
         validate_pattern_capacity(
-            &directory_pattern,
-            &filename_pattern,
+            directory_pattern,
+            filename_pattern,
             &policy.output_dir,
             context,
             channel,
@@ -358,7 +490,7 @@ pub fn preview_export_paths(
             let mut rendered_directory = String::new();
             let mut filename = String::new();
             render_output_into(
-                &directory_pattern,
+                directory_pattern,
                 context,
                 channel,
                 part,
@@ -368,7 +500,7 @@ pub fn preview_export_paths(
                 &mut rendered_directory,
             )?;
             render_output_into(
-                &filename_pattern,
+                filename_pattern,
                 context,
                 channel,
                 part,
@@ -436,10 +568,7 @@ fn patterns_for_layout(
             else {
                 return Err(validation("custom layout resolution is inconsistent"));
             };
-            Ok((
-                ValidatedPattern::parse(directory_pattern)?,
-                ValidatedPattern::parse(filename_pattern)?,
-            ))
+            Ok((directory_pattern.clone(), filename_pattern.clone()))
         }
     }
 }
@@ -605,4 +734,39 @@ fn validate_no_file_parent_conflicts(outputs: &[RenderedOutput]) -> Result<()> {
 
 fn validation(message: impl Into<String>) -> LambError {
     LambError::Validation(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rendered(final_path: &str) -> RenderedOutput {
+        RenderedOutput {
+            channel_index: 0,
+            channel: "channel".to_string(),
+            part: 1,
+            part_count: 1,
+            part_suffix: String::new(),
+            start_frame: 0,
+            end_frame: 1,
+            relative_directory: PathBuf::new(),
+            filename: "file.wav".to_string(),
+            final_path: PathBuf::from(final_path),
+        }
+    }
+
+    #[test]
+    fn file_parent_collision_checker_rejects_both_path_orders() {
+        for paths in [
+            [rendered("/exports/a"), rendered("/exports/a/b.wav")],
+            [rendered("/exports/a/b.wav"), rendered("/exports/a")],
+        ] {
+            assert!(validate_no_file_parent_conflicts(&paths).is_err());
+        }
+        assert!(validate_no_file_parent_conflicts(&[
+            rendered("/exports/a.wav"),
+            rendered("/exports/a.wav.b")
+        ])
+        .is_ok());
+    }
 }
