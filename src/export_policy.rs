@@ -89,6 +89,7 @@ impl PatternToken {
 enum PatternSegment {
     Literal(String),
     Token(PatternToken),
+    ZeroPaddedToken(PatternToken, usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,9 +141,20 @@ impl ValidatedPattern {
     }
 
     fn contains(&self, wanted: PatternToken) -> bool {
-        self.segments
-            .iter()
-            .any(|segment| matches!(segment, PatternSegment::Token(token) if *token == wanted))
+        self.segments.iter().any(|segment| {
+            matches!(segment, PatternSegment::Token(token) | PatternSegment::ZeroPaddedToken(token, _) if *token == wanted)
+        })
+    }
+
+    fn with_zero_padding(mut self, widths: &[(PatternToken, usize)]) -> Self {
+        for segment in &mut self.segments {
+            if let PatternSegment::Token(token) = segment {
+                if let Some((_, width)) = widths.iter().find(|(candidate, _)| candidate == token) {
+                    *segment = PatternSegment::ZeroPaddedToken(*token, *width);
+                }
+            }
+        }
+        self
     }
 
     fn maximum_rendered_bytes(&self, context: &RenderContext<'_>, channel: &str) -> Result<u64> {
@@ -157,6 +169,19 @@ impl ValidatedPattern {
                 | PatternSegment::Token(PatternToken::Part) => 20,
                 PatternSegment::Token(PatternToken::PartSuffix) => 25,
                 PatternSegment::Token(PatternToken::Profile) => context.profile.len() as u64,
+                PatternSegment::ZeroPaddedToken(token, width) => {
+                    let ordinary_width = match token {
+                        PatternToken::SampleRate => 10,
+                        PatternToken::StartFrame | PatternToken::EndFrame | PatternToken::Part => {
+                            20
+                        }
+                        PatternToken::Timestamp => context.timestamp.len() as u64,
+                        PatternToken::Channel => channel.len() as u64,
+                        PatternToken::PartSuffix => 25,
+                        PatternToken::Profile => context.profile.len() as u64,
+                    };
+                    ordinary_width.max(*width as u64)
+                }
             };
             length
                 .checked_add(segment_length)
@@ -225,6 +250,21 @@ pub fn render_output_into(
             }
             PatternSegment::Token(PatternToken::PartSuffix) => output.push_str(part_suffix),
             PatternSegment::Token(PatternToken::Profile) => output.push_str(context.profile),
+            PatternSegment::ZeroPaddedToken(PatternToken::StartFrame, width) => {
+                write!(output, "{start_frame:0width$}")
+                    .map_err(|_| validation("could not render start-frame token"))?;
+            }
+            PatternSegment::ZeroPaddedToken(PatternToken::EndFrame, width) => {
+                write!(output, "{end_frame:0width$}")
+                    .map_err(|_| validation("could not render end-frame token"))?;
+            }
+            PatternSegment::ZeroPaddedToken(PatternToken::Part, width) => {
+                write!(output, "{part:0width$}")
+                    .map_err(|_| validation("could not render part token"))?;
+            }
+            PatternSegment::ZeroPaddedToken(_, _) => {
+                return Err(validation("unsupported zero-padded export token"));
+            }
         }
     }
     Ok(())
@@ -338,12 +378,6 @@ pub fn preview_export_paths(
                 &mut filename,
             )?;
 
-            if policy.layout.effective_layout(context.command) == EffectiveLayout::FlatDetailed {
-                filename = format!(
-                    "lamb-{}-{channel}-{}Hz-{start_frame:09}-{end_frame:09}-part{part:03}.wav",
-                    context.timestamp, context.sample_rate
-                );
-            }
             validate_rendered_directory(&rendered_directory)?;
             validate_filename(&filename)?;
             let relative_directory = PathBuf::from(&rendered_directory);
@@ -382,8 +416,13 @@ fn patterns_for_layout(
         EffectiveLayout::FlatDetailed => Ok((
             ValidatedPattern::parse("")?,
             ValidatedPattern::parse(
-                "lamb-{timestamp}-{channel}-{sampleRate}Hz-{startFrame}-{endFrame}-{part}.wav",
-            )?,
+                "lamb-{timestamp}-{channel}-{sampleRate}Hz-{startFrame}-{endFrame}-part{part}.wav",
+            )?
+            .with_zero_padding(&[
+                (PatternToken::StartFrame, 9),
+                (PatternToken::EndFrame, 9),
+                (PatternToken::Part, 3),
+            ]),
         )),
         EffectiveLayout::TimestampDirectory => Ok((
             ValidatedPattern::parse("{timestamp}")?,
@@ -454,7 +493,13 @@ fn validate_output_dir(path: &Path) -> Result<()> {
     let text = path
         .to_str()
         .ok_or_else(|| validation("export outputDir must be valid UTF-8"))?;
-    if text.contains('\0') || text.contains("//") || (text.len() > 1 && text.ends_with('/')) {
+    if text.contains('\0')
+        || text.contains("//")
+        || (text.len() > 1 && text.ends_with('/'))
+        || text
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+    {
         return Err(validation("export outputDir must be lexically canonical"));
     }
     for component in path.components() {

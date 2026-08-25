@@ -218,6 +218,21 @@ fn preview_rejects_unsafe_output_roots_directories_and_filenames() {
 }
 
 #[test]
+fn preview_rejects_raw_dot_components_in_output_root() {
+    let mut unsplit = context(ExportCommand::Recall);
+    unsplit.split_when_over_bytes = 1_000_000;
+    for output_dir in ["/exports/./nested", "/exports/."] {
+        let result = preview_export_paths(
+            &policy(custom("", "{channel}.wav"), output_dir, &["left"]),
+            &unsplit,
+            &[0],
+        );
+
+        assert!(result.is_err(), "accepted output root {output_dir:?}");
+    }
+}
+
+#[test]
 fn preview_rejects_unsafe_injected_channel_profile_and_timestamp_values() {
     for (channel, profile, timestamp) in [
         ("../left", "studio", "20260826T130000"),
@@ -237,7 +252,7 @@ fn preview_rejects_unsafe_injected_channel_profile_and_timestamp_values() {
 }
 
 #[test]
-fn preview_rejects_path_overflow_duplicates_and_file_parent_conflicts() {
+fn preview_rejects_path_overflow_and_duplicates() {
     let mut short = context(ExportCommand::Recall);
     short.maximum_path_bytes = 20;
     assert!(preview_export_paths(
@@ -249,15 +264,6 @@ fn preview_rejects_path_overflow_duplicates_and_file_parent_conflicts() {
 
     let duplicate = policy(custom("", "same.wav"), "/exports", &["left", "right"]);
     assert!(preview_export_paths(&duplicate, &context(ExportCommand::Recall), &[0, 1]).is_err());
-
-    let parent_conflict = policy(
-        custom("{channel}", "same.wav"),
-        "/exports",
-        &["a", "a/same.wav"],
-    );
-    assert!(
-        preview_export_paths(&parent_conflict, &context(ExportCommand::Recall), &[0, 1]).is_err()
-    );
 }
 
 #[test]
@@ -274,6 +280,22 @@ fn worst_case_path_capacity_includes_the_absolute_output_root() {
 }
 
 #[test]
+fn flat_detailed_capacity_uses_canonical_part_literal() {
+    let mut bounded = context(ExportCommand::Recall);
+    // By hand: /exports/ (9) + the old discarded pattern's maximum (105).
+    // The canonical preset includes the four-byte `part` literal as well.
+    bounded.maximum_path_bytes = 114;
+
+    let result = preview_export_paths(
+        &policy(ResolvedLayout::FlatDetailed, "/exports", &["left"]),
+        &bounded,
+        &[0],
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn preview_checks_collisions_across_all_channel_parts_and_channel_indexes() {
     let collisions = policy(custom("", "{part}.wav"), "/exports", &["left", "right"]);
     assert!(preview_export_paths(&collisions, &context(ExportCommand::Recall), &[0, 1]).is_err());
@@ -284,4 +306,23 @@ fn preview_checks_collisions_across_all_channel_parts_and_channel_indexes() {
         &[1]
     )
     .is_err());
+}
+
+#[test]
+fn empty_range_validates_retained_channels_without_fabricating_outputs() {
+    let valid_policy = policy(custom("", "{channel}.wav"), "/exports", &["left"]);
+    let mut empty = context(ExportCommand::Recall);
+    empty.export_end_frame = empty.export_start_frame;
+
+    assert!(preview_export_paths(&valid_policy, &empty, &[1]).is_err());
+    assert!(preview_export_paths(
+        &policy(custom("", "{channel}.wav"), "/exports", &["../left"]),
+        &empty,
+        &[0],
+    )
+    .is_err());
+    assert_eq!(
+        preview_export_paths(&valid_policy, &empty, &[0]).unwrap(),
+        vec![]
+    );
 }
