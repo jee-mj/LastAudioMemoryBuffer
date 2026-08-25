@@ -123,7 +123,9 @@ fn recall_splits_every_channel_on_the_same_frame_boundaries() {
 
     let frame_counts: Vec<_> = published
         .files
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|channel_parts| {
             channel_parts
                 .iter()

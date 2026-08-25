@@ -344,7 +344,9 @@ fn fake_publication(name: &str) -> PublishedOutput {
 fn wav_s24_samples(path: &std::path::Path) -> Vec<i32> {
     let bytes = std::fs::read(path).unwrap();
     bytes[44..]
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|sample| {
             i32::from_le_bytes([
                 sample[0],
