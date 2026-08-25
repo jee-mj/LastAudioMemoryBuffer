@@ -236,6 +236,22 @@ impl LambConfig {
     }
 
     pub fn resolved_export_policy(&self, command: ExportCommand) -> Result<ResolvedExportPolicy> {
+        self.resolved_export_policy_with_layout(match command {
+            ExportCommand::Recall => ResolvedLayout::FlatDetailed,
+            ExportCommand::Dump => ResolvedLayout::TimestampDirectory,
+        })
+    }
+
+    /// Resolves the one legacy session policy. CommandDefault retains the
+    /// historical recall/dump layouts while sharing activity and output root.
+    pub fn resolved_session_export_policy(&self) -> Result<ResolvedExportPolicy> {
+        self.resolved_export_policy_with_layout(ResolvedLayout::CommandDefault)
+    }
+
+    fn resolved_export_policy_with_layout(
+        &self,
+        layout: ResolvedLayout,
+    ) -> Result<ResolvedExportPolicy> {
         self.validate_static()?;
         let channel_names = if self.backend == "pipewire" {
             self.resolved_capture_ports()?
@@ -260,10 +276,7 @@ impl LambConfig {
 
         ResolvedExportPolicy::new(
             self.output_dir.clone(),
-            match command {
-                ExportCommand::Recall => ResolvedLayout::FlatDetailed,
-                ExportCommand::Dump => ResolvedLayout::TimestampDirectory,
-            },
+            layout,
             ResolvedActivityPolicy {
                 detector: ActivityDetectorKind::ExactZero,
                 channels,

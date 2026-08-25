@@ -649,9 +649,14 @@ impl PersistenceWorkspace {
                     PublicationStrategy::FileSet => PersistenceKind::Recall,
                     PublicationStrategy::AtomicDirectory => PersistenceKind::Dump,
                 };
+                let policy_staging_parent = if kind == PersistenceKind::Dump {
+                    policy.output_dir()
+                } else {
+                    staging_root
+                };
                 let details = RequestDetails {
                     kind,
-                    staging_parent: staging_root,
+                    staging_parent: policy_staging_parent,
                     final_parent: policy.output_dir(),
                     timestamp,
                     channel_names: &[],
@@ -676,11 +681,15 @@ impl PersistenceWorkspace {
                     self.reset_slots();
                     return Err(error);
                 }
+                if kind == PersistenceKind::Dump {
+                    fs::create_dir_all(staging_root)
+                        .map_err(|source| io_error(staging_root, source))?;
+                }
                 return self.finish_policy_prepare(
                     frozen,
                     decision.export_range(),
                     kind,
-                    staging_root,
+                    policy_staging_parent,
                     io,
                 );
             }
@@ -1556,11 +1565,21 @@ impl PersistenceWorkspace {
         };
         let transaction_root = self.paths[TRANSACTION_ROOT_PATH].as_path().to_path_buf();
         let final_root = self.paths[FINAL_ROOT_PATH].as_path().to_path_buf();
-        let output_parent = self.paths[FINAL_ROOT_PATH]
-            .as_path()
-            .parent()
-            .unwrap_or_else(|| self.paths[FINAL_ROOT_PATH].as_path())
-            .to_path_buf();
+        let output_parent = if completed.kind == PersistenceKind::Dump {
+            self.outputs
+                .first()
+                .and_then(|output| self.paths.get(output.final_path as usize))
+                .and_then(|path| path.as_path().parent())
+                .and_then(Path::parent)
+                .unwrap_or_else(|| self.paths[FINAL_ROOT_PATH].as_path())
+                .to_path_buf()
+        } else {
+            self.paths[FINAL_ROOT_PATH]
+                .as_path()
+                .parent()
+                .unwrap_or_else(|| self.paths[FINAL_ROOT_PATH].as_path())
+                .to_path_buf()
+        };
         let manifest_path = match completed.kind {
             PersistenceKind::Recall => transaction_root.join("manifest.json"),
             PersistenceKind::Dump => {

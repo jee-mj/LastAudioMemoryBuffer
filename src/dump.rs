@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -8,6 +8,7 @@ use crate::capture_arena::{
     CaptureArena, CaptureClearAccounting, CaptureClearRecovery, FrozenCaptureEpoch,
 };
 use crate::error::{LambError, Result};
+use crate::export_policy::{ExportCommand, ResolvedExportPolicy};
 use crate::export_wav::{publish_prepared, PreparedPublication};
 use crate::persistence_workspace::{
     IndeterminatePublication, PersistenceWorkspace, PrepareRequest, PreparedPersistence,
@@ -33,6 +34,25 @@ pub struct PublishedOutput {
 pub enum DecisionPreparation {
     Continue,
     SkippedSilent,
+}
+
+enum CoordinatorPrepareRequest<'a> {
+    Direct(PrepareRequest<'a>),
+    Policy {
+        command: ExportCommand,
+        policy: &'a ResolvedExportPolicy,
+        profile: &'a str,
+        staging_root: &'a Path,
+        timestamp: &'a str,
+    },
+}
+
+pub struct PolicyPersistenceRequest<'a> {
+    pub command: ExportCommand,
+    pub policy: &'a ResolvedExportPolicy,
+    pub profile: &'a str,
+    pub staging_root: &'a Path,
+    pub timestamp: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +261,32 @@ impl DumpCoordinator {
         )
     }
 
+    /// Persists using the coordinator-owned frozen decision, so callers only
+    /// provide command context and the stable session policy.
+    pub fn persist_policy(
+        &self,
+        arena: &CaptureArena,
+        workspace: &mut PersistenceWorkspace,
+        request: PolicyPersistenceRequest<'_>,
+        timeout: Duration,
+    ) -> Result<DumpOutcome> {
+        self.persist_request_with_decision_preparation_and_publisher(
+            arena,
+            workspace,
+            CoordinatorPrepareRequest::Policy {
+                command: request.command,
+                policy: request.policy,
+                profile: request.profile,
+                staging_root: request.staging_root,
+                timestamp: request.timestamp,
+            },
+            timeout,
+            timeout,
+            |_, _| Ok(DecisionPreparation::Continue),
+            publish_prepared,
+        )
+    }
+
     pub fn persist_with_release_timeout(
         &self,
         arena: &CaptureArena,
@@ -288,6 +334,32 @@ impl DumpCoordinator {
         arena: &CaptureArena,
         workspace: &mut PersistenceWorkspace,
         request: PrepareRequest<'_>,
+        timeout: Duration,
+        release_timeout: Duration,
+        prepare_decision: P,
+        publisher: F,
+    ) -> Result<DumpOutcome>
+    where
+        P: FnOnce(&FrozenCaptureEpoch, &mut FrozenExportDecision) -> Result<DecisionPreparation>,
+        F: FnOnce(PreparedPersistence<'_>) -> PreparedPublication,
+    {
+        self.persist_request_with_decision_preparation_and_publisher(
+            arena,
+            workspace,
+            CoordinatorPrepareRequest::Direct(request),
+            timeout,
+            release_timeout,
+            prepare_decision,
+            publisher,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_request_with_decision_preparation_and_publisher<P, F>(
+        &self,
+        arena: &CaptureArena,
+        workspace: &mut PersistenceWorkspace,
+        request: CoordinatorPrepareRequest<'_>,
         timeout: Duration,
         release_timeout: Duration,
         prepare_decision: P,
@@ -385,8 +457,8 @@ impl DumpCoordinator {
         let (
             range,
             retention_lost_frames,
-            decision_export_range,
-            skipped_by_policy,
+            mut decision_export_range,
+            mut skipped_by_policy,
             skipped_silent,
         ) = {
             let transaction = state.frozen.as_mut().ok_or(LambError::ControlInvariant(
@@ -437,11 +509,47 @@ impl DumpCoordinator {
         } else {
             let transaction = state
                 .frozen
-                .as_ref()
+                .as_mut()
                 .expect("frozen transaction remains prepared");
-            let prepared = workspace.prepare(&transaction.frozen, request)?;
+            let prepared = match request {
+                CoordinatorPrepareRequest::Direct(request) => {
+                    workspace.prepare(&transaction.frozen, request)?
+                }
+                CoordinatorPrepareRequest::Policy {
+                    command,
+                    policy,
+                    profile,
+                    staging_root,
+                    timestamp,
+                } => workspace.prepare(
+                    &transaction.frozen,
+                    PrepareRequest::Policy {
+                        command,
+                        policy,
+                        profile,
+                        staging_root,
+                        timestamp,
+                        decision: &mut transaction.decision,
+                    },
+                )?,
+            };
+            if transaction.decision.valid() {
+                decision_export_range = transaction.decision.export_range();
+                if decision_export_range.start < range.start
+                    || decision_export_range.end != range.end
+                    || decision_export_range.start > decision_export_range.end
+                {
+                    return Err(LambError::ExportInvariant(
+                        "frozen export range is outside the consumed range",
+                    ));
+                }
+            }
             match prepared {
-                PreparedPersistence::Silent => None,
+                PreparedPersistence::Silent | PreparedPersistence::SkippedSilent => None,
+                PreparedPersistence::SkippedByPolicy => {
+                    skipped_by_policy = true;
+                    None
+                }
                 prepared => match publisher(prepared) {
                     PreparedPublication::Published(published) => Some(published),
                     PreparedPublication::RetryableFailure(error) => return Err(error),

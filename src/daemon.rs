@@ -13,9 +13,10 @@ use crate::capture_runtime::{
 use crate::config::{self, LambConfig};
 use crate::control::{ControlRequest, ControlResponse, DaemonStatus, PersistenceOutcomeResponse};
 use crate::control_server::{spawn_operation_worker, EnqueueError, OperationLane};
-use crate::dump::{DumpCoordinator, DumpOutcome};
+use crate::dump::{DumpCoordinator, DumpOutcome, PolicyPersistenceRequest};
 use crate::error::{io_error, LambError, Result};
-use crate::persistence_workspace::{PersistenceWorkspace, PrepareRequest};
+use crate::export_policy::{ExportCommand, ResolvedExportPolicy};
+use crate::persistence_workspace::PersistenceWorkspace;
 use crate::profile;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -37,18 +38,33 @@ struct CaptureSession {
     workspace: Mutex<PersistenceWorkspace>,
     coordinator: Arc<DumpCoordinator>,
     sample_rate: u32,
-    channel_names: Vec<String>,
-    output_dir: PathBuf,
+    channel_count: u32,
+    profile_name: String,
+    policy: Mutex<ResolvedExportPolicy>,
 }
 
 impl CaptureSession {
-    fn persist(&self, request: PrepareRequest<'_>) -> Result<DumpOutcome> {
+    fn persist(&self, command: ExportCommand, timestamp: &str) -> Result<DumpOutcome> {
+        let policy = self
+            .policy
+            .lock()
+            .map_err(|_| LambError::Control("session export policy lock poisoned".to_string()))?;
         let mut workspace = self
             .workspace
             .lock()
             .map_err(|_| LambError::Control("persistence workspace lock poisoned".to_string()))?;
-        self.coordinator
-            .persist(&self.arena, &mut workspace, request, PERSIST_TIMEOUT)
+        self.coordinator.persist_policy(
+            &self.arena,
+            &mut workspace,
+            PolicyPersistenceRequest {
+                command,
+                policy: &policy,
+                profile: &self.profile_name,
+                staging_root: Path::new(APP_STAGING_ROOT),
+                timestamp,
+            },
+            PERSIST_TIMEOUT,
+        )
     }
 
     fn clear(&self) -> Result<()> {
@@ -64,18 +80,17 @@ impl CaptureSession {
     /// using the reserved manifest arenas of this session's workspace, and
     /// logs a summary plus an operator-visible warning for every failed or
     /// indeterminate recovery.
-    fn recover_startup(
-        &self,
-        staging_root: &Path,
-        recall_output: &Path,
-        dump_parent: &Path,
-    ) -> crate::recovery::RecoveryScanSummary {
+    fn recover_startup(&self, staging_root: &Path) -> crate::recovery::RecoveryScanSummary {
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut workspace = self
             .workspace
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut summary = workspace.recover_recall_staging(staging_root, recall_output);
-        summary.merge(workspace.recover_dumps(dump_parent));
+        let mut summary = workspace.recover_recall_staging(staging_root, policy.output_dir());
+        summary.merge(workspace.recover_dumps(policy.output_dir()));
         log_recovery_summary(&summary);
         summary
     }
@@ -128,12 +143,6 @@ fn app_runtime_params(profile: &profile::ResolvedProfile) -> CaptureRuntimeParam
         control_queue_capacity: DEFAULT_CONTROL_QUEUE_CAPACITY,
         worker_stack_bytes: DEFAULT_WORKER_STACK_BYTES,
     }
-}
-
-fn app_dump_dir() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".cache/lamb/out"))
 }
 
 pub fn run_from_config_path(path: &Path) -> Result<()> {
@@ -226,7 +235,7 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
     let mut resolved_target = None;
     let mut fake_capture = None;
     let mut pipewire_capture = None;
-    let (sample_rate, channel_names, runtime) = match cfg.backend.as_str() {
+    let (sample_rate, _channel_names, runtime) = match cfg.backend.as_str() {
         "fake" => {
             let channels = cfg.channels.unwrap_or(2);
             let (runtime, ingress) = CaptureRuntime::build(params, cfg.sample_rate, channels)?;
@@ -268,6 +277,7 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
     fs::set_permissions(&cfg.control_socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|source| io_error(&cfg.control_socket_path, source))?;
 
+    let policy = cfg.resolved_session_export_policy()?;
     let session = CaptureSession {
         arena: Arc::new(runtime.arena),
         workspace: Mutex::new(runtime.workspace),
@@ -275,14 +285,11 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
             runtime.frozen_export_decision,
         )),
         sample_rate,
-        channel_names,
-        output_dir: cfg.output_dir.clone(),
+        channel_count: cfg.channels.unwrap_or(2),
+        profile_name: "legacy".to_string(),
+        policy: Mutex::new(policy),
     };
-    let _recovery = session.recover_startup(
-        Path::new(APP_STAGING_ROOT),
-        &cfg.output_dir,
-        &cfg.output_dir,
-    );
+    let _recovery = session.recover_startup(Path::new(APP_STAGING_ROOT));
     let ctx = Arc::new(DaemonContext {
         cfg,
         session,
@@ -760,7 +767,7 @@ fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
                 last_error,
                 resolved,
                 session.sample_rate,
-                session.channel_names.len() as u32,
+                session.channel_count,
                 "F32LE".to_string(),
                 capacity,
                 retained,
@@ -945,22 +952,13 @@ fn set_last_error(ctx: &DaemonContext, message: String) {
 
 fn handle_dump(ctx: &DaemonContext) -> ControlResponse {
     let timestamp = iso8601_compact_label();
-    let result = ctx.session.persist(PrepareRequest::Dump {
-        output_parent: &ctx.cfg.output_dir,
-        timestamp: &timestamp,
-        channel_names: &ctx.session.channel_names,
-    });
+    let result = ctx.session.persist(ExportCommand::Dump, &timestamp);
     legacy_persistence_response(ctx, result)
 }
 
 fn handle_recall(ctx: &DaemonContext) -> ControlResponse {
     let timestamp = iso8601_compact_label();
-    let result = ctx.session.persist(PrepareRequest::Recall {
-        staging_root: Path::new(APP_STAGING_ROOT),
-        output_dir: &ctx.cfg.output_dir,
-        timestamp: &timestamp,
-        channel_names: &ctx.session.channel_names,
-    });
+    let result = ctx.session.persist(ExportCommand::Recall, &timestamp);
     legacy_persistence_response(ctx, result)
 }
 
@@ -1056,16 +1054,11 @@ fn start_app_capture(
             runtime_session.frozen_export_decision,
         )),
         sample_rate: backend.sample_rate(),
-        channel_names: backend.channel_names().to_vec(),
-        output_dir: resolved_for_runtime
-            .export_policy
-            .output_dir()
-            .to_path_buf(),
+        channel_count: u32::try_from(backend.channel_names().len()).unwrap_or(u32::MAX),
+        profile_name: resolved_for_runtime.name.clone(),
+        policy: Mutex::new(resolved_for_runtime.export_policy.clone()),
     });
-    if let Some(dump_dir) = app_dump_dir() {
-        let _ =
-            session.recover_startup(Path::new(APP_STAGING_ROOT), &session.output_dir, &dump_dir);
-    }
+    let _ = session.recover_startup(Path::new(APP_STAGING_ROOT));
 
     let mut runtime = ctx
         .runtime
@@ -1126,12 +1119,7 @@ fn handle_app_recall(ctx: &IdleDaemonContext) -> ControlResponse {
     };
 
     let timestamp = iso8601_compact_label();
-    let result = session.persist(PrepareRequest::Recall {
-        staging_root: Path::new(APP_STAGING_ROOT),
-        output_dir: &session.output_dir,
-        timestamp: &timestamp,
-        channel_names: &session.channel_names,
-    });
+    let result = session.persist(ExportCommand::Recall, &timestamp);
     app_persistence_response(ctx, result, session.sample_rate)
 }
 
@@ -1187,25 +1175,8 @@ fn handle_app_dump(ctx: &IdleDaemonContext) -> ControlResponse {
         };
     };
 
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => {
-            return ControlResponse {
-                ok: false,
-                message: "HOME not set, cannot resolve dump output path".to_string(),
-                status: Some(idle_status_response(ctx)),
-                persistence_outcome: None,
-            }
-        }
-    };
-    let dump_dir = PathBuf::from(home).join(".cache/lamb/out");
-
     let timestamp = iso8601_compact_label();
-    let result = session.persist(PrepareRequest::Dump {
-        output_parent: &dump_dir,
-        timestamp: &timestamp,
-        channel_names: &session.channel_names,
-    });
+    let result = session.persist(ExportCommand::Dump, &timestamp);
     app_persistence_response(ctx, result, session.sample_rate)
 }
 
@@ -1427,8 +1398,6 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                     match build {
                         Ok((backend, runtime)) => {
                             let sample_rate = backend.sample_rate();
-                            let names = backend.channel_names().to_vec();
-                            let output_dir = profile.export_policy.output_dir().to_path_buf();
                             let session = Arc::new(CaptureSession {
                                 arena: Arc::new(runtime.arena),
                                 workspace: Mutex::new(runtime.workspace),
@@ -1436,16 +1405,12 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                                     runtime.frozen_export_decision,
                                 )),
                                 sample_rate,
-                                channel_names: names,
-                                output_dir: output_dir.clone(),
+                                channel_count: u32::try_from(backend.channel_names().len())
+                                    .unwrap_or(u32::MAX),
+                                profile_name: profile.name.clone(),
+                                policy: Mutex::new(profile.export_policy.clone()),
                             });
-                            if let Some(dump_dir) = app_dump_dir() {
-                                let _ = session.recover_startup(
-                                    Path::new(APP_STAGING_ROOT),
-                                    &output_dir,
-                                    &dump_dir,
-                                );
-                            }
+                            let _ = session.recover_startup(Path::new(APP_STAGING_ROOT));
                             state.session = Some(session);
                             state.state = "capturing".to_string();
                             state.last_error = None;
@@ -1608,8 +1573,9 @@ mod tests {
                 runtime.frozen_export_decision,
             )),
             sample_rate: 100,
-            channel_names: vec!["mic".to_string()],
-            output_dir: PathBuf::from("/tmp/out"),
+            channel_count: 1,
+            profile_name: "legacy".to_string(),
+            policy: Mutex::new(test_policy(PathBuf::from("/tmp/out"))),
         }
     }
 
@@ -1642,6 +1608,94 @@ mod tests {
                 format: "wav".to_string(),
                 split_when_over_bytes: 3_900_000_000,
             },
+        }
+    }
+
+    fn test_policy(output_dir: PathBuf) -> ResolvedExportPolicy {
+        test_policy_with_layout(
+            output_dir,
+            crate::export_policy::ResolvedLayout::CommandDefault,
+        )
+    }
+
+    fn test_policy_with_layout(
+        output_dir: PathBuf,
+        layout: crate::export_policy::ResolvedLayout,
+    ) -> ResolvedExportPolicy {
+        ResolvedExportPolicy::new(
+            output_dir,
+            layout,
+            crate::export_policy::ResolvedActivityPolicy {
+                detector: crate::activity::ActivityDetectorKind::ExactZero,
+                channels: vec![crate::export_policy::ChannelActivityPolicy {
+                    name: "mic".to_string(),
+                    mode: crate::activity::ChannelExportMode::Always,
+                    threshold: None,
+                }],
+                whole_export_exact_zero_gate: true,
+                trim_leading_silence: false,
+            },
+        )
+        .unwrap()
+    }
+
+    fn test_app_context(
+        root: &Path,
+        output_dir: PathBuf,
+        layout: crate::export_policy::ResolvedLayout,
+        samples: &[f32],
+    ) -> IdleDaemonContext {
+        fs::create_dir_all(&output_dir).unwrap();
+        let params = CaptureRuntimeParams {
+            seconds: 1,
+            chunk_frames_override: Some(100),
+            memory_max: None,
+            headroom: 1.0,
+            split_when_over_bytes: 3_900_000_000,
+            io_buffer_bytes_per_channel: 4096,
+            maximum_path_bytes: 512,
+            capture_queue_slots: 8,
+            capture_worker_stack_bytes: 64 * 1024,
+            control_queue_capacity: 2,
+            worker_stack_bytes: 64 * 1024,
+        };
+        let (runtime, ingress) = CaptureRuntime::build(params, 100, 1).unwrap();
+        ingress.try_push_interleaved(samples, 1).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime
+            .arena
+            .status(std::time::Duration::from_secs(1))
+            .unwrap()
+            .worker_written_frames
+            < samples.len() as u64
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let session = Arc::new(CaptureSession {
+            arena: Arc::new(runtime.arena),
+            workspace: Mutex::new(runtime.workspace),
+            coordinator: Arc::new(DumpCoordinator::with_frozen_decision(
+                runtime.frozen_export_decision,
+            )),
+            sample_rate: 100,
+            channel_count: 1,
+            profile_name: "configured-profile".to_string(),
+            policy: Mutex::new(test_policy_with_layout(output_dir, layout)),
+        });
+        IdleDaemonContext {
+            config_path: root.join("lamb.toml"),
+            control_socket_path: root.join("control.sock"),
+            runtime: Mutex::new(AppRuntimeState {
+                config: app_config::AppConfig::default(),
+                state: "capturing".to_string(),
+                last_error: None,
+                active_profile: None,
+                capture: None,
+                capture_health: None,
+                session: Some(session),
+            }),
+            stop: AtomicBool::new(false),
         }
     }
 
@@ -1690,8 +1744,9 @@ mod tests {
                 runtime.frozen_export_decision,
             )),
             sample_rate: 100,
-            channel_names: vec!["mic".to_string()],
-            output_dir: PathBuf::from("/tmp/out"),
+            channel_count: 1,
+            profile_name: "test".to_string(),
+            policy: Mutex::new(test_policy(PathBuf::from("/tmp/out"))),
         });
         let ctx = IdleDaemonContext {
             config_path: PathBuf::from("/tmp/lamb-test-config.toml"),
@@ -1731,6 +1786,140 @@ mod tests {
 
         assert!(!response.ok);
         assert_eq!(response.message, "runtime state lock poisoned");
+    }
+
+    #[test]
+    fn app_dump_writes_beneath_the_session_output_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("profile-output");
+        let ctx = test_app_context(
+            temp.path(),
+            output_dir.clone(),
+            crate::export_policy::ResolvedLayout::FlatDetailed,
+            &[0.25, -0.5],
+        );
+
+        let response = handle_app_dump(&ctx);
+
+        let (reported_directory, files) = match response.persistence_outcome {
+            Some(PersistenceOutcomeResponse::Written {
+                start_frame,
+                end_frame,
+                frames,
+                export_start_frame,
+                export_frames,
+                output_directory,
+                files,
+                ..
+            }) => {
+                assert_eq!((start_frame, end_frame, frames), (0, 2, 2));
+                assert_eq!((export_start_frame, export_frames), (0, 2));
+                (output_directory, files)
+            }
+            outcome => panic!("app dump should write captured audio, got {outcome:?}"),
+        };
+        assert_eq!(reported_directory, output_dir);
+        assert!(!files.is_empty());
+        assert!(files
+            .iter()
+            .all(|path| { path.parent() == Some(output_dir.as_path()) && path.is_file() }));
+    }
+
+    #[test]
+    fn app_recall_uses_explicit_timestamp_directory_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("profile-output");
+        let ctx = test_app_context(
+            temp.path(),
+            output_dir.clone(),
+            crate::export_policy::ResolvedLayout::TimestampDirectory,
+            &[0.25, -0.5],
+        );
+
+        let response = handle_app_recall(&ctx);
+
+        let (reported_directory, files) = match response.persistence_outcome {
+            Some(PersistenceOutcomeResponse::Written {
+                start_frame,
+                end_frame,
+                frames,
+                export_start_frame,
+                export_frames,
+                output_directory,
+                files,
+                ..
+            }) => {
+                assert_eq!((start_frame, end_frame, frames), (0, 2, 2));
+                assert_eq!((export_start_frame, export_frames), (0, 2));
+                (output_directory, files)
+            }
+            outcome => panic!("app recall should write captured audio, got {outcome:?}"),
+        };
+        assert_eq!(reported_directory.parent(), Some(output_dir.as_path()));
+        let timestamp = reported_directory.file_name().unwrap().to_string_lossy();
+        assert_eq!(timestamp.len(), 14);
+        assert!(timestamp
+            .chars()
+            .all(|character| character.is_ascii_digit()));
+        assert!(!files.is_empty());
+        assert!(files
+            .iter()
+            .all(|path| { path.parent() == Some(reported_directory.as_path()) && path.is_file() }));
+    }
+
+    #[test]
+    fn app_policy_and_silent_skips_succeed_consume_ranges_and_publish_no_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy_output = temp.path().join("policy-skip-output");
+        let policy_ctx = test_app_context(
+            temp.path(),
+            policy_output.clone(),
+            crate::export_policy::ResolvedLayout::FlatDetailed,
+            &[0.25, -0.5],
+        );
+        let session = policy_ctx
+            .runtime
+            .lock()
+            .unwrap()
+            .session
+            .as_ref()
+            .unwrap()
+            .clone();
+        session.policy.lock().unwrap().activity.channels[0].mode =
+            crate::activity::ChannelExportMode::Never;
+
+        let policy_response = handle_app_dump(&policy_ctx);
+        assert!(policy_response.ok);
+        match policy_response.persistence_outcome {
+            Some(PersistenceOutcomeResponse::SkippedByPolicy {
+                start_frame,
+                end_frame,
+                frames,
+                ..
+            }) => assert_eq!((start_frame, end_frame, frames), (0, 2, 2)),
+            outcome => panic!("expected policy skip, got {outcome:?}"),
+        }
+        assert_eq!(fs::read_dir(&policy_output).unwrap().count(), 0);
+
+        let silent_output = temp.path().join("silent-skip-output");
+        let silent_ctx = test_app_context(
+            temp.path(),
+            silent_output.clone(),
+            crate::export_policy::ResolvedLayout::TimestampDirectory,
+            &[0.0, -0.0],
+        );
+        let silent_response = handle_app_recall(&silent_ctx);
+        assert!(silent_response.ok);
+        match silent_response.persistence_outcome {
+            Some(PersistenceOutcomeResponse::SkippedSilent {
+                start_frame,
+                end_frame,
+                frames,
+                ..
+            }) => assert_eq!((start_frame, end_frame, frames), (0, 2, 2)),
+            outcome => panic!("expected silent skip, got {outcome:?}"),
+        }
+        assert_eq!(fs::read_dir(&silent_output).unwrap().count(), 0);
     }
 
     fn poisoned_runtime_context() -> IdleDaemonContext {

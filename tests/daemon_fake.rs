@@ -115,7 +115,24 @@ fn assert_persistence_commands_share_cursor(first: ControlRequest, second: Contr
         "second command failed: {second_response:?}"
     );
     let first_end = match first_response.persistence_outcome {
-        Some(PersistenceOutcomeResponse::Written { end_frame, .. }) => end_frame,
+        Some(PersistenceOutcomeResponse::Written {
+            start_frame,
+            end_frame,
+            frames,
+            export_start_frame,
+            export_frames,
+            files,
+            ..
+        }) => {
+            assert_eq!(end_frame - start_frame, frames);
+            assert!(export_start_frame >= start_frame);
+            assert_eq!(export_start_frame + export_frames, end_frame);
+            assert!(!files.is_empty());
+            assert!(files
+                .iter()
+                .all(|path| path.starts_with(&out) && path.is_file()));
+            end_frame
+        }
         outcome => panic!("first command should write captured audio, got {outcome:?}"),
     };
     match second_response.persistence_outcome {
@@ -590,7 +607,11 @@ splitWhenOverBytes = 3900000000
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
-    assert_eq!(exported.len(), 1, "dump should publish one directory");
+    assert_eq!(
+        exported.len(),
+        1,
+        "dump should publish one directory, got {exported:?}"
+    );
     assert!(exported[0].is_dir(), "dump output should be a directory");
     let timestamp = exported[0]
         .file_name()
