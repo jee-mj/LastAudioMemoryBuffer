@@ -1,14 +1,25 @@
+use lamb::activity::{ActivityDetectorKind, ChannelExportMode, FrozenExportDecision};
+use lamb::capture_arena::{CaptureArena, CaptureRuntimeConfig};
 use lamb::dump::{FrameRange, SampleSnapshot};
 use lamb::error::LambError;
+use lamb::export_policy::{
+    ChannelActivityPolicy, ExportCommand, ResolvedActivityPolicy, ResolvedExportPolicy,
+    ResolvedLayout,
+};
 use lamb::export_wav::{
-    export_snapshot_wav, publish_dump, publish_recall, DumpPublishRequest, ExportRequest,
-    RecallPublishRequest,
+    export_snapshot_wav, publish_dump, publish_prepared, publish_recall, DumpPublishRequest,
+    ExportRequest, PreparedPublication, RecallPublishRequest,
+};
+use lamb::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
+use lamb::persistence_workspace::{
+    PersistenceWorkspace, PersistenceWorkspaceConfig, PrepareRequest,
 };
 use lamb::sample_ring::{RingConfig, SampleFormat, SampleRing};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 const TIMESTAMP: &str = "20260630T073218";
 const SPLIT_LIMIT: u64 = 3_900_000_000;
@@ -73,6 +84,116 @@ fn assert_export_error(error: LambError, expected: &str) {
         ),
         other => panic!("expected export error containing {expected:?}, got {other}"),
     }
+}
+
+#[test]
+fn prepared_timestamp_directory_publishes_canonical_filenames() {
+    let plan = SessionMemoryPlan::calculate(SessionMemoryInputs {
+        retention_frames: 2,
+        channels: 1,
+        sample_rate: 48_000,
+        sample_format: SampleFormat::F32Le,
+        chunk_frames: 2,
+        max_active_snapshots: 1,
+        sample_bytes: 4,
+        split_when_over_bytes: 1_000,
+        control_queue_capacity: 2,
+        worker_stack_bytes: 64 * 1024,
+        capture_queue_slots: 4,
+        capture_slot_frames: 2,
+        capture_worker_stack_bytes: 64 * 1024,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 512,
+        headroom: 1.0,
+    })
+    .unwrap();
+    let runtime_config = CaptureRuntimeConfig {
+        ring: RingConfig {
+            channels: 1,
+            sample_rate: 48_000,
+            format: SampleFormat::F32Le,
+            chunk_frames: 2,
+            chunk_count: 1,
+            max_active_snapshots: 1,
+        },
+        queue_slots: 4,
+        slot_frames: 2,
+        sample_bytes: 4,
+        worker_stack_bytes: 64 * 1024,
+    };
+    let (mut arena, ingress) = CaptureArena::new(&plan, runtime_config).unwrap();
+    let mut workspace = PersistenceWorkspace::new(
+        &plan,
+        PersistenceWorkspaceConfig {
+            retention_frames: 2,
+            channels: 1,
+            sample_rate: 48_000,
+            sample_format: SampleFormat::F32Le,
+            chunk_frames: 2,
+            sample_bytes: 4,
+            split_when_over_bytes: 1_000,
+            io_buffer_bytes_per_channel: 6,
+            maximum_path_bytes: 512,
+        },
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("output");
+    let staging = root.path().join("staging");
+    fs::create_dir_all(&output).unwrap();
+    let policy = ResolvedExportPolicy::new(
+        output.clone(),
+        ResolvedLayout::TimestampDirectory,
+        ResolvedActivityPolicy {
+            detector: ActivityDetectorKind::ExactZero,
+            channels: vec![ChannelActivityPolicy {
+                name: "mic".to_string(),
+                mode: ChannelExportMode::Always,
+                threshold: None,
+            }],
+            whole_export_exact_zero_gate: false,
+            trim_leading_silence: false,
+        },
+    )
+    .unwrap();
+    ingress.try_push_interleaved(&[0.5, 0.25], 1).unwrap();
+    let frozen = arena
+        .freeze_since(None, Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let prepared = workspace
+        .prepare(
+            &frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Dump,
+                policy: &policy,
+                profile: "canonical",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+        )
+        .unwrap();
+
+    let published = match publish_prepared(prepared) {
+        PreparedPublication::Published(published) => published,
+        PreparedPublication::RetryableFailure(error) => panic!("publication failed: {error}"),
+        PreparedPublication::Indeterminate { operation, .. } => {
+            panic!("publication became indeterminate: {operation}")
+        }
+    };
+
+    assert_eq!(published.files, [output.join(TIMESTAMP).join("mic.wav")]);
+    assert!(published.files.iter().all(|path| path.exists()));
+    assert!(fs::read_dir(output.join(TIMESTAMP))
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("output-")));
+    arena.shutdown(Duration::from_secs(2)).unwrap();
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use crate::capture_arena::FrozenCaptureEpoch;
+use crate::capture_arena::{FrozenCaptureEpoch, FrozenEpochIdentity};
 use crate::error::{LambError, Result};
 use crate::export_policy::ResolvedActivityPolicy;
 use crate::memory_plan::{
@@ -94,6 +94,7 @@ pub struct FrozenExportDecision {
     export_range: Range<u64>,
     sample_rate: u32,
     valid: bool,
+    frozen_epoch: Option<FrozenEpochIdentity>,
     storage_id: u64,
 }
 
@@ -108,6 +109,7 @@ impl FrozenExportDecision {
             export_range: 0..0,
             sample_rate: plan.sample_rate(),
             valid: false,
+            frozen_epoch: None,
             storage_id: NEXT_FROZEN_EXPORT_DECISION_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -127,6 +129,10 @@ impl FrozenExportDecision {
         self.storage_id
     }
 
+    pub(crate) fn matches_frozen_epoch(&self, frozen: &FrozenCaptureEpoch) -> bool {
+        self.frozen_epoch == Some(frozen.identity())
+    }
+
     /// Recycles this preallocated decision after its frozen transaction completes.
     pub(crate) fn reset(&mut self) {
         for channel in self.channels.as_mut_slice() {
@@ -134,6 +140,7 @@ impl FrozenExportDecision {
         }
         self.export_range = 0..0;
         self.valid = false;
+        self.frozen_epoch = None;
     }
 
     pub fn finalize(
@@ -743,6 +750,7 @@ pub fn classify_frozen_epoch(
         policy.trim_leading_silence,
         policy.whole_export_exact_zero_gate && entire_range_is_finite_zero,
     )?;
+    decision.frozen_epoch = Some(frozen.identity());
     Ok(DecisionOutcome {
         valid: decision.valid(),
         export_range: decision.export_range(),

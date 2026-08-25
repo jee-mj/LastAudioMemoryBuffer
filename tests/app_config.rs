@@ -415,23 +415,32 @@ fn modern_profile_layout_omission_remains_command_default() {
         .unwrap();
 
     assert_eq!(
-        resolved.export_policy.layout,
-        ResolvedLayout::CommandDefault
+        resolved.export_policy.layout(),
+        &ResolvedLayout::CommandDefault
     );
     assert_eq!(
         resolved
             .export_policy
-            .layout
+            .layout()
             .publication_strategy(ExportCommand::Recall),
         PublicationStrategy::FileSet
     );
     assert_eq!(
         resolved
             .export_policy
-            .layout
+            .layout()
             .publication_strategy(ExportCommand::Dump),
         PublicationStrategy::AtomicDirectory
     );
+}
+
+#[test]
+fn profile_resolution_rejects_noncanonical_output_root() {
+    let text =
+        pipewire_profile_text("").replace("/tmp/lamb-profile", "/tmp/lamb-profile/../escape");
+    let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
+
+    assert!(profile::resolve_active_profile(&cfg).is_err());
 }
 
 #[test]
@@ -457,7 +466,7 @@ filenamePattern = "{channel}.wav""#,
         let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
         let resolved = profile::resolve_active_profile(&cfg).unwrap().unwrap();
 
-        assert_eq!(resolved.export_policy.layout, expected);
+        assert_eq!(resolved.export_policy.layout(), &expected);
     }
 }
 

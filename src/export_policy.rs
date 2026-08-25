@@ -378,8 +378,8 @@ pub struct ResolvedActivityPolicy {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedExportPolicy {
-    pub output_dir: PathBuf,
-    pub layout: ResolvedLayout,
+    output_dir: PathBuf,
+    layout: ResolvedLayout,
     pub activity: ResolvedActivityPolicy,
     patterns: ResolvedPatternSet,
 }
@@ -398,6 +398,7 @@ impl ResolvedExportPolicy {
         layout: ResolvedLayout,
         activity: ResolvedActivityPolicy,
     ) -> Result<Self> {
+        validate_output_dir(&output_dir)?;
         let (recall_directory, recall_filename) =
             patterns_for_layout(&layout, ExportCommand::Recall)?;
         let (dump_directory, dump_filename) = patterns_for_layout(&layout, ExportCommand::Dump)?;
@@ -412,6 +413,14 @@ impl ResolvedExportPolicy {
                 dump_filename,
             },
         })
+    }
+
+    pub fn output_dir(&self) -> &Path {
+        &self.output_dir
+    }
+
+    pub fn layout(&self) -> &ResolvedLayout {
+        &self.layout
     }
 
     fn patterns(&self, command: ExportCommand) -> (&ValidatedPattern, &ValidatedPattern) {

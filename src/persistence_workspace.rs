@@ -27,6 +27,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -600,6 +601,11 @@ impl PersistenceWorkspace {
                 decision,
             } => {
                 validate_policy_geometry(&self.config, frozen, policy, decision)?;
+                if decision.valid() && !decision.matches_frozen_epoch(frozen) {
+                    return Err(LambError::ExportInvariant(
+                        "frozen export decision does not match frozen epoch",
+                    ));
+                }
                 if !decision.valid() {
                     classify_frozen_epoch(frozen, &policy.activity, &mut self.detector, decision)?;
                 }
@@ -616,14 +622,14 @@ impl PersistenceWorkspace {
                 {
                     return Ok(PreparedPersistence::SkippedSilent);
                 }
-                let kind = match policy.layout.publication_strategy(command) {
+                let kind = match policy.layout().publication_strategy(command) {
                     PublicationStrategy::FileSet => PersistenceKind::Recall,
                     PublicationStrategy::AtomicDirectory => PersistenceKind::Dump,
                 };
                 let details = RequestDetails {
                     kind,
                     staging_parent: staging_root,
-                    final_parent: &policy.output_dir,
+                    final_parent: policy.output_dir(),
                     timestamp,
                     channel_names: &[],
                     staging_prefix: if kind == PersistenceKind::Dump {
@@ -749,7 +755,7 @@ impl PersistenceWorkspace {
         }
         self.output_count = output_count;
         self.paths[STAGING_PARENT_PATH].set_path(details.staging_parent)?;
-        self.paths[FINAL_ROOT_PATH].set_path(&policy.output_dir)?;
+        self.paths[FINAL_ROOT_PATH].set_path(policy.output_dir())?;
         set_transaction_path(
             &mut self.paths[TRANSACTION_ROOT_PATH],
             details.staging_parent,
@@ -775,15 +781,13 @@ impl PersistenceWorkspace {
                     .ok_or(LambError::ExportInvariant("workspace part overflow"))?;
                 let frames_per_part =
                     (self.config.split_when_over_bytes - WAV_HEADER_BYTES) / WAV_BYTES_PER_SAMPLE;
-                let start_frame = context
-                    .export_start_frame
-                    .checked_add(
-                        zero_part
-                            .checked_mul(frames_per_part)
-                            .ok_or(LambError::ExportInvariant("workspace part start overflow"))?,
-                    )
-                    .ok_or(LambError::ExportInvariant("workspace part start overflow"))?;
-                let end_frame = (start_frame + frames_per_part).min(context.export_end_frame);
+                let part_range = absolute_split_range(
+                    context.export_start_frame..context.export_end_frame,
+                    zero_part,
+                    frames_per_part,
+                )?;
+                let start_frame = part_range.start;
+                let end_frame = part_range.end;
                 let mut suffix = [0_u8; 24];
                 let part_suffix = if part_count == 1 {
                     ""
@@ -821,7 +825,7 @@ impl PersistenceWorkspace {
                 let rendered_directory = self.render_directory.as_str()?;
                 let rendered_filename = self.render_filename.as_str()?;
                 let final_index = OUTPUT_PATH_START + staged_index + FINAL_PATH_OFFSET;
-                self.paths[final_index].set_path(&policy.output_dir)?;
+                self.paths[final_index].set_path(policy.output_dir())?;
                 if !rendered_directory.is_empty() {
                     self.paths[final_index].push_separator()?;
                     self.paths[final_index].push_bytes(rendered_directory.as_bytes())?;
@@ -829,20 +833,22 @@ impl PersistenceWorkspace {
                 self.paths[final_index].push_separator()?;
                 self.paths[final_index].push_bytes(rendered_filename.as_bytes())?;
                 validate_rendered_output_path(
-                    &policy.output_dir,
+                    policy.output_dir(),
                     rendered_directory,
                     rendered_filename,
                     self.paths[final_index].as_path(),
                     context.maximum_path_bytes,
                 )?;
                 let staged_path = OUTPUT_PATH_START + staged_index + STAGED_PATH_OFFSET;
-                self.render_directory
-                    .set_path(self.paths[TRANSACTION_ROOT_PATH].as_path())?;
-                self.paths[staged_path].set_path(self.render_directory.as_path())?;
-                self.paths[staged_path].push_separator()?;
-                write!(&mut self.paths[staged_path], "output-{index:08}").map_err(|_| {
-                    LambError::ExportInvariant("staged name exceeds workspace capacity")
-                })?;
+                if details.kind == PersistenceKind::Recall {
+                    self.render_directory
+                        .set_path(self.paths[TRANSACTION_ROOT_PATH].as_path())?;
+                    self.paths[staged_path].set_path(self.render_directory.as_path())?;
+                    self.paths[staged_path].push_separator()?;
+                    write!(&mut self.paths[staged_path], "output-{index:08}").map_err(|_| {
+                        LambError::ExportInvariant("staged name exceeds workspace capacity")
+                    })?;
+                }
                 self.outputs[index] = OutputFileSlot {
                     start_frame,
                     frame_count: end_frame - start_frame,
@@ -870,6 +876,54 @@ impl PersistenceWorkspace {
                 }
                 index += 1;
             }
+        }
+        if details.kind == PersistenceKind::Dump {
+            self.plan_atomic_staged_paths()?;
+        }
+        Ok(())
+    }
+
+    fn plan_atomic_staged_paths(&mut self) -> Result<()> {
+        let first_final = self
+            .outputs
+            .first()
+            .filter(|_| self.output_count != 0)
+            .ok_or(LambError::ExportInvariant(
+                "atomic directory has no planned outputs",
+            ))?
+            .final_path as usize;
+        let first_parent =
+            self.paths[first_final]
+                .as_path()
+                .parent()
+                .ok_or(LambError::ExportInvariant(
+                    "atomic final path has no parent",
+                ))?;
+        self.render_filename.set_path(first_parent)?;
+        self.paths[FINAL_ROOT_PATH].set_path(self.render_filename.as_path())?;
+        self.render_directory
+            .set_path(self.paths[TRANSACTION_ROOT_PATH].as_path())?;
+
+        for index in 0..self.output_count {
+            let final_path = self.outputs[index].final_path as usize;
+            let staged_path = self.outputs[index].staged_path as usize;
+            let final_file = self.paths[final_path].as_path();
+            if final_file.parent() != Some(self.paths[FINAL_ROOT_PATH].as_path()) {
+                return Err(LambError::ExportInvariant(
+                    "atomic final files must share one direct parent",
+                ));
+            }
+            let basename = final_file
+                .file_name()
+                .ok_or(LambError::ExportInvariant(
+                    "atomic final path must name a direct-child file",
+                ))?
+                .as_bytes();
+            self.render_filename.clear();
+            self.render_filename.push_bytes(basename)?;
+            self.paths[staged_path].set_path(self.render_directory.as_path())?;
+            self.paths[staged_path].push_separator()?;
+            self.paths[staged_path].push_bytes(self.render_filename.as_bytes())?;
         }
         Ok(())
     }
@@ -1780,6 +1834,37 @@ fn validate_workspace_plan(
     Ok(())
 }
 
+fn absolute_split_range(
+    export_range: Range<u64>,
+    zero_part: u64,
+    frames_per_part: u64,
+) -> Result<Range<u64>> {
+    let total_frames =
+        export_range
+            .end
+            .checked_sub(export_range.start)
+            .ok_or(LambError::ExportInvariant(
+                "workspace export range is reversed",
+            ))?;
+    let relative_start = zero_part
+        .checked_mul(frames_per_part)
+        .ok_or(LambError::ExportInvariant("workspace part start overflow"))?;
+    if frames_per_part == 0 || relative_start >= total_frames {
+        return Err(LambError::ExportInvariant(
+            "workspace part is outside export range",
+        ));
+    }
+    let frame_count = (total_frames - relative_start).min(frames_per_part);
+    let start = export_range
+        .start
+        .checked_add(relative_start)
+        .ok_or(LambError::ExportInvariant("workspace part start overflow"))?;
+    let end = start
+        .checked_add(frame_count)
+        .ok_or(LambError::ExportInvariant("workspace part end overflow"))?;
+    Ok(start..end)
+}
+
 fn validate_frozen(config: &PersistenceWorkspaceConfig, frozen: &FrozenCaptureEpoch) -> Result<()> {
     if frozen.channels() != config.channels
         || frozen.sample_rate() != config.sample_rate
@@ -2046,5 +2131,17 @@ mod tests {
             std::path::Path::new("/output/channel-0.wav")
         );
         assert_ne!(*slots.first().unwrap(), ManifestEntrySlot::default());
+    }
+
+    #[test]
+    fn absolute_split_range_ending_at_u64_max_preserves_half_open_boundaries() {
+        assert_eq!(
+            absolute_split_range((u64::MAX - 4)..u64::MAX, 0, 3).unwrap(),
+            (u64::MAX - 4)..(u64::MAX - 1)
+        );
+        assert_eq!(
+            absolute_split_range((u64::MAX - 4)..u64::MAX, 1, 3).unwrap(),
+            (u64::MAX - 1)..u64::MAX
+        );
     }
 }

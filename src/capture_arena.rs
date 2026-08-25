@@ -112,6 +112,13 @@ pub struct CaptureArena {
     runtime_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrozenEpochIdentity {
+    runtime_id: u64,
+    index: usize,
+    generation: u64,
+}
+
 impl fmt::Debug for CaptureArena {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -124,6 +131,7 @@ impl fmt::Debug for CaptureArena {
 pub struct FrozenCaptureEpoch {
     runtime: Arc<RuntimeShared>,
     ring: Arc<SampleRing>,
+    runtime_id: u64,
     index: usize,
     generation: u64,
     base: u64,
@@ -1204,6 +1212,7 @@ impl CaptureArena {
         FrozenCaptureEpoch {
             runtime: Arc::clone(&self.shared),
             ring: descriptor.ring,
+            runtime_id: self.runtime_id,
             index: descriptor.index,
             generation: descriptor.generation,
             base: descriptor.base,
@@ -1338,6 +1347,14 @@ impl Drop for CaptureArena {
 }
 
 impl FrozenCaptureEpoch {
+    pub(crate) fn identity(&self) -> FrozenEpochIdentity {
+        FrozenEpochIdentity {
+            runtime_id: self.runtime_id,
+            index: self.index,
+            generation: self.generation,
+        }
+    }
+
     pub fn absolute_range(&self) -> Range<u64> {
         self.absolute_range.clone()
     }
@@ -2150,6 +2167,7 @@ mod tests {
         let mut frozen = FrozenCaptureEpoch {
             runtime: Arc::clone(&arena.shared),
             ring: descriptor.ring,
+            runtime_id: arena.runtime_id,
             index: descriptor.index,
             generation: descriptor.generation,
             base: descriptor.base,

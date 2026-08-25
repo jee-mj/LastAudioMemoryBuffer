@@ -7,6 +7,14 @@ use lamb::export_policy::{
 use std::path::{Path, PathBuf};
 
 fn policy(layout: ResolvedLayout, output_dir: &str, channels: &[&str]) -> ResolvedExportPolicy {
+    try_policy(layout, output_dir, channels).unwrap()
+}
+
+fn try_policy(
+    layout: ResolvedLayout,
+    output_dir: &str,
+    channels: &[&str],
+) -> lamb::error::Result<ResolvedExportPolicy> {
     ResolvedExportPolicy::new(
         PathBuf::from(output_dir),
         layout,
@@ -24,7 +32,6 @@ fn policy(layout: ResolvedLayout, output_dir: &str, channels: &[&str]) -> Resolv
             trim_leading_silence: false,
         },
     )
-    .unwrap()
 }
 
 fn context(command: ExportCommand) -> RenderContext<'static> {
@@ -37,6 +44,37 @@ fn context(command: ExportCommand) -> RenderContext<'static> {
         export_end_frame: 1_208_000,
         split_when_over_bytes: 312_044,
         maximum_path_bytes: 512,
+    }
+}
+
+#[test]
+fn resolved_policy_exposes_constructor_state_through_read_only_accessors() {
+    let policy = policy(ResolvedLayout::TimestampDirectory, "/exports", &["left"]);
+
+    assert_eq!(policy.layout(), &ResolvedLayout::TimestampDirectory);
+    assert_eq!(policy.output_dir(), Path::new("/exports"));
+}
+
+#[test]
+fn resolved_policy_constructor_rejects_relative_and_noncanonical_output_roots() {
+    let activity = policy(ResolvedLayout::FlatDetailed, "/exports", &["left"]).activity;
+
+    for output_dir in [
+        "exports",
+        ".",
+        "..",
+        "/exports/./nested",
+        "/exports/../escape",
+    ] {
+        assert!(
+            ResolvedExportPolicy::new(
+                PathBuf::from(output_dir),
+                ResolvedLayout::FlatDetailed,
+                activity.clone(),
+            )
+            .is_err(),
+            "accepted output root {output_dir:?}"
+        );
     }
 }
 
@@ -213,26 +251,23 @@ fn preview_rejects_unsafe_output_roots_directories_and_filenames() {
         ("/exports", "ok", "a/b.wav"),
         ("/exports", "ok", "nul\0.wav"),
     ] {
-        let policy = policy(custom(directory, filename), output, &["left"]);
-        assert!(
-            preview_export_paths(&policy, &context(ExportCommand::Recall), &[0]).is_err(),
-            "accepted output={output:?}, directory={directory:?}, filename={filename:?}"
-        );
+        match try_policy(custom(directory, filename), output, &["left"]) {
+            Ok(policy) => assert!(
+                preview_export_paths(&policy, &context(ExportCommand::Recall), &[0]).is_err(),
+                "accepted output={output:?}, directory={directory:?}, filename={filename:?}"
+            ),
+            Err(_) => assert!(output == "exports" || output == "/exports/../escape"),
+        }
     }
 }
 
 #[test]
-fn preview_rejects_raw_dot_components_in_output_root() {
-    let mut unsplit = context(ExportCommand::Recall);
-    unsplit.split_when_over_bytes = 1_000_000;
+fn constructor_rejects_raw_dot_components_in_output_root() {
     for output_dir in ["/exports/./nested", "/exports/."] {
-        let result = preview_export_paths(
-            &policy(custom("", "{channel}.wav"), output_dir, &["left"]),
-            &unsplit,
-            &[0],
+        assert!(
+            try_policy(custom("", "{channel}.wav"), output_dir, &["left"]).is_err(),
+            "accepted output root {output_dir:?}"
         );
-
-        assert!(result.is_err(), "accepted output root {output_dir:?}");
     }
 }
 

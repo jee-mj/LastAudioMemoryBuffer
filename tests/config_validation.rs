@@ -236,9 +236,17 @@ fn legacy_config_resolves_historical_export_policy_per_command() {
         .channels
         .iter()
         .all(|channel| channel.mode == ChannelExportMode::Always));
-    assert_eq!(recall.layout, ResolvedLayout::FlatDetailed);
+    assert_eq!(recall.layout(), &ResolvedLayout::FlatDetailed);
 
     let dump = cfg.resolved_export_policy(ExportCommand::Dump).unwrap();
-    assert_eq!(dump.layout, ResolvedLayout::TimestampDirectory);
-    assert_eq!(dump.output_dir, cfg.output_dir);
+    assert_eq!(dump.layout(), &ResolvedLayout::TimestampDirectory);
+    assert_eq!(dump.output_dir(), cfg.output_dir.as_path());
+}
+
+#[test]
+fn legacy_config_resolution_rejects_noncanonical_output_root() {
+    let mut cfg = valid_config();
+    cfg.output_dir = PathBuf::from("/tmp/lamb-test/../escape");
+
+    assert!(cfg.resolved_export_policy(ExportCommand::Recall).is_err());
 }

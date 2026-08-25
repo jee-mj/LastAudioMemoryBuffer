@@ -973,6 +973,67 @@ fn sparse_split_opens_only_dense_retained_channel_part_outputs() {
 }
 
 #[test]
+fn frozen_decision_cannot_be_reused_for_a_same_geometry_epoch_from_another_runtime() {
+    let geometry = Geometry {
+        retention_frames: 2,
+        channels: 1,
+        chunk_frames: 2,
+        split_when_over_bytes: 1_000,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 256,
+    };
+    let (mut first_arena, first_ingress, plan) = runtime(geometry);
+    let (mut second_arena, second_ingress, _) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let policy = exact_zero_policy(&root.path().join("output"), &[ChannelExportMode::Auto]);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let first = freeze(&mut first_arena, &first_ingress, &[0.5, 0.25], 1);
+    let second = freeze(&mut second_arena, &second_ingress, &[0.5, 0.25], 1);
+
+    let prepared = workspace
+        .prepare(
+            &first,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "identity",
+                staging_root: &root.path().join("first-staging"),
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+        )
+        .unwrap();
+    drop(prepared);
+    assert!(decision.valid());
+
+    let second_staging = root.path().join("second-staging");
+    let mut io = CountingIo::default();
+    let error = match workspace.prepare_with_io(
+        &second,
+        PrepareRequest::Policy {
+            command: ExportCommand::Recall,
+            policy: &policy,
+            profile: "identity",
+            staging_root: &second_staging,
+            timestamp: TIMESTAMP,
+            decision: &mut decision,
+        },
+        &mut io,
+    ) {
+        Ok(_) => panic!("decision from another runtime was accepted"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, LambError::ExportInvariant(_)));
+    assert!(decision.valid());
+    assert!(io.opened.is_empty());
+    assert!(!second_staging.exists());
+    first_arena.shutdown(DEADLINE).unwrap();
+    second_arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
 fn common_crop_wavs_preserve_staggered_onsets_and_untrimmed_tail() {
     const SAMPLE_RATE: usize = 48_000;
     const PREROLL: usize = 2 * SAMPLE_RATE;

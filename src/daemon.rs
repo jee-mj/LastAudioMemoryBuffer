@@ -1057,7 +1057,10 @@ fn start_app_capture(
         )),
         sample_rate: backend.sample_rate(),
         channel_names: backend.channel_names().to_vec(),
-        output_dir: resolved_for_runtime.export_policy.output_dir.clone(),
+        output_dir: resolved_for_runtime
+            .export_policy
+            .output_dir()
+            .to_path_buf(),
     });
     if let Some(dump_dir) = app_dump_dir() {
         let _ =
@@ -1425,7 +1428,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                         Ok((backend, runtime)) => {
                             let sample_rate = backend.sample_rate();
                             let names = backend.channel_names().to_vec();
-                            let output_dir = profile.export_policy.output_dir.clone();
+                            let output_dir = profile.export_policy.output_dir().to_path_buf();
                             let session = Arc::new(CaptureSession {
                                 arena: Arc::new(runtime.arena),
                                 workspace: Mutex::new(runtime.workspace),
