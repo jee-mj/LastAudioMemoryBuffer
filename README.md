@@ -81,9 +81,11 @@ targets fail to compile rather than failing at first publication.
 configVersion = 1
 user = "<USERNAME>"
 backend = "pipewire"
-target = "alsa_input.usb-YourDevice-00.multichannel-input"
-channels = 2
-channelMap = ["mic", "gtr"]
+target = "alsa_input.usb-YourDevice-00.pro-input-0"
+capturePorts = [
+  { source = "capture_AUX0", name = "mic" },
+  { source = "capture_AUX1", name = "gtr" },
+]
 seconds = 1800
 sampleRate = 44100
 sampleFormat = "F32LE"
@@ -111,13 +113,13 @@ startMode = "manual"
 activeProfile = "my-profile"
 
 [profiles.my-profile]
-backend = "jack"
-clientName = "lamb"
+backend = "pipewire"
 
-[profiles.my-profile.capture]
-ports = [
-  { source = "system:capture_1", name = "mic" },
-  { source = "system:capture_2", name = "gtr" },
+[profiles.my-profile.pipewire]
+target = "alsa_input.usb-YourDevice-00.pro-input-0"
+capturePorts = [
+  { source = "capture_AUX0", name = "mic" },
+  { source = "capture_AUX1", name = "gtr" },
 ]
 
 [profiles.my-profile.buffer]
@@ -128,6 +130,15 @@ outputDir = "/home/<USERNAME>/Music/LAMB"
 mode = "per-channel"
 format = "wav"
 ```
+
+Use the PipeWire Pro Audio profile so the device exposes independently
+linkable source ports. Each `source` is an exact PipeWire `port.name` on the
+selected target, and array order defines captured channel order. Each `name`
+defines that channel's WAV filename.
+
+PipeWire configurations without `capturePorts` fail before capture. When
+migrating an existing configuration, remove legacy `channels`, `channelMap`,
+and profile `pipewire.channelMap` keys.
 
 See `lamb config init` and `lamb config show` for managing profiles.
 

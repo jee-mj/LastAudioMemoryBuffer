@@ -1,5 +1,6 @@
 use crate::app_config::{self, AppConfig, CapturePort, ConfigLoadState, ProfileConfig};
 use crate::capture_pipewire::PipeWireCaptureConfig;
+use crate::config::{normalize_capture_ports, ConfiguredCapturePort};
 use crate::error::{io_error, LambError, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -55,37 +56,69 @@ fn validate_jack_profile(name: &str, profile: &ProfileConfig) -> Result<Resolved
 }
 
 fn validate_pipewire_profile(name: &str, profile: &ProfileConfig) -> Result<ResolvedProfile> {
+    let pw = &profile.pipewire;
+    if pw.channel_map.is_some() {
+        return Err(LambError::Validation(format!(
+            "profile {name}: pipewire.channelMap conflicts with pipewire.capturePorts"
+        )));
+    }
+    if !profile.capture.ports.is_empty() || !profile.capture.sources.is_empty() {
+        return Err(LambError::Validation(format!(
+            "profile {name}: capture.ports and capture.sources are only valid for jack profiles"
+        )));
+    }
+    let ports = resolve_pipewire_capture_ports(name, profile)?;
+
     let buffer_seconds = validate_buffer_seconds(name, profile)?;
     let export_output_dir = validate_export_output_dir(name, profile)?;
     let (export_mode, export_format) = validate_export(name, profile)?;
-
-    let pw = &profile.pipewire;
 
     Ok(ResolvedProfile {
         name: name.to_string(),
         backend: "pipewire".to_string(),
         client_name: "lamb".to_string(),
-        ports: pw
-            .channel_map
-            .iter()
-            .enumerate()
-            .map(|(i, name)| ResolvedCapturePort {
-                source: format!("pipewire-input-ch{}", i + 1),
-                name: name.clone(),
-            })
-            .collect(),
+        ports: ports.clone(),
         buffer_seconds,
         export_output_dir,
         export_mode,
         export_format,
         pipewire_config: Some(PipeWireCaptureConfig {
             target: pw.target.clone(),
-            channels: None,
+            capture_ports: ports
+                .iter()
+                .map(|port| ConfiguredCapturePort {
+                    source: port.source.clone(),
+                    name: port.name.clone(),
+                })
+                .collect(),
             sample_rate: pw.sample_rate.unwrap_or(44100),
             dont_remix: pw.dont_remix,
-            channel_map: pw.channel_map.clone(),
             latency: pw.latency.clone(),
         }),
+    })
+}
+
+fn resolve_pipewire_capture_ports(
+    profile_name: &str,
+    profile: &ProfileConfig,
+) -> Result<Vec<ResolvedCapturePort>> {
+    normalize_capture_ports(
+        profile
+            .pipewire
+            .capture_ports
+            .iter()
+            .map(|port| (port.source.as_deref(), port.name.as_deref())),
+        "pipewire.capturePorts",
+        &format!("profile {profile_name}: pipewire.capturePorts is required"),
+    )
+    .map(|ports| {
+        ports
+            .into_iter()
+            .map(|port| ResolvedCapturePort {
+                source: port.source,
+                name: port.name,
+            })
+            .collect()
     })
 }
 

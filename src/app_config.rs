@@ -55,8 +55,18 @@ pub struct PipewireProfileConfig {
     pub sample_rate: Option<u32>,
     #[serde(rename = "dontRemix", default)]
     pub dont_remix: bool,
-    #[serde(rename = "channelMap", default, skip_serializing_if = "Vec::is_empty")]
-    pub channel_map: Vec<String>,
+    #[serde(
+        rename = "capturePorts",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub capture_ports: Vec<CapturePort>,
+    #[serde(
+        rename = "channelMap",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub channel_map: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency: Option<String>,
 }

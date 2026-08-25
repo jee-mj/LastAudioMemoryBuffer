@@ -2,7 +2,9 @@ use crate::app_config::{self, ConfigLoadState};
 use crate::capture_arena::CaptureArenaStatus;
 use crate::capture_fake::FakeCapture;
 use crate::capture_jack::{JackCapture, JackCaptureConfig};
-use crate::capture_pipewire::{PipeWireCapture, PipeWireCaptureConfig, ResolvedTarget};
+use crate::capture_pipewire::{
+    PipeWireCapture, PipeWireCaptureConfig, PipeWireHealth, ResolvedTarget,
+};
 use crate::capture_runtime::{
     CaptureRuntime, CaptureRuntimeParams, DEFAULT_CAPTURE_QUEUE_SLOTS,
     DEFAULT_CAPTURE_WORKER_STACK_BYTES, DEFAULT_CONTROL_QUEUE_CAPACITY,
@@ -177,6 +179,7 @@ fn run_idle_fallback(path: &Path, socket_template: String, reason: String) -> Re
             last_error: Some(reason),
             active_profile: None,
             capture: None,
+            capture_health: None,
             session: None,
         }),
         stop: AtomicBool::new(false),
@@ -232,16 +235,17 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
                 channels,
                 cfg.chunk_frames.unwrap_or(25),
             )?);
-            (cfg.sample_rate, cfg.channel_map.clone(), runtime)
+            let channel_names = cfg.channel_map.clone().unwrap_or_default();
+            (cfg.sample_rate, channel_names, runtime)
         }
         "pipewire" => {
-            let pipewire_cfg = PipeWireCaptureConfig::from_lamb_config(&cfg);
+            let pipewire_cfg = PipeWireCaptureConfig::from_lamb_config(&cfg)?;
+            let channel_names = pipewire_cfg.channel_names();
             let resolved = crate::capture_pipewire::resolve_target(&pipewire_cfg)?;
             eprintln!("lamb: {}", resolved.log_message());
             cfg.channels = Some(resolved.channels);
             cfg.sample_rate = resolved.sample_rate;
             resolved_target = Some(resolved.clone());
-            let channel_names = cfg.channel_map.clone();
             let (capture, runtime) =
                 PipeWireCapture::start_with_resolved(pipewire_cfg, resolved, params)?;
             pipewire_capture = Some(capture);
@@ -283,6 +287,7 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
         resolved_target,
         stop: AtomicBool::new(false),
         last_error: Mutex::new(None),
+        capture_health: pipewire_capture.as_ref().map(PipeWireCapture::health),
     });
     let lane = Arc::new(OperationLane::new(DEFAULT_CONTROL_QUEUE_CAPACITY as usize)?);
     let worker = spawn_operation_worker(
@@ -362,6 +367,7 @@ struct DaemonContext {
     resolved_target: Option<ResolvedTarget>,
     stop: AtomicBool,
     last_error: Mutex<Option<String>>,
+    capture_health: Option<PipeWireHealth>,
 }
 
 struct IdleDaemonContext {
@@ -377,6 +383,7 @@ struct AppRuntimeState {
     last_error: Option<String>,
     active_profile: Option<profile::ResolvedProfile>,
     capture: Option<CaptureBackend>,
+    capture_health: Option<PipeWireHealth>,
     session: Option<Arc<CaptureSession>>,
 }
 
@@ -386,6 +393,13 @@ enum CaptureBackend {
 }
 
 impl CaptureBackend {
+    fn runtime_error(&self) -> Option<String> {
+        match self {
+            Self::Jack(_, _) => None,
+            Self::PipeWire(capture, _) => capture.runtime_error(),
+        }
+    }
+
     fn sample_rate(&self) -> u32 {
         match self {
             CaptureBackend::Jack(c, _) => c.sample_rate,
@@ -411,6 +425,7 @@ fn run_app_config_daemon(path: &Path, config: app_config::AppConfig) -> Result<(
         last_error: None,
         active_profile: None,
         capture: None,
+        capture_health: None,
         session: None,
     };
 
@@ -707,12 +722,24 @@ fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
         dropped,
         frozen_pending,
     ) = if let Some(ref runtime) = runtime {
+        let capture_fault = runtime
+            .capture_health
+            .as_ref()
+            .and_then(PipeWireHealth::fault)
+            .or_else(|| {
+                runtime
+                    .capture
+                    .as_ref()
+                    .and_then(CaptureBackend::runtime_error)
+            });
         let state = if ctx.stop.load(Ordering::Acquire) {
             "stopping".to_string()
+        } else if capture_fault.is_some() {
+            "faulted".to_string()
         } else {
             runtime.state.clone()
         };
-        let last_error = runtime.last_error.clone();
+        let last_error = capture_fault.or_else(|| runtime.last_error.clone());
         if let Some(session) = runtime.session.as_ref() {
             let (capacity, retained, dropped, frozen_pending) = match session.status() {
                 Ok(status) => (
@@ -865,6 +892,13 @@ fn status_response(ctx: &DaemonContext) -> DaemonStatus {
     DaemonStatus {
         state: if ctx.stop.load(Ordering::Acquire) {
             "stopping".to_string()
+        } else if ctx
+            .capture_health
+            .as_ref()
+            .and_then(PipeWireHealth::fault)
+            .is_some()
+        {
+            "faulted".to_string()
         } else {
             "capturing".to_string()
         },
@@ -883,7 +917,11 @@ fn status_response(ctx: &DaemonContext) -> DaemonStatus {
                 .unwrap_or(2)
         }),
         format: ctx.cfg.sample_format.clone(),
-        last_error: ctx.last_error.lock().ok().and_then(|last| last.clone()),
+        last_error: ctx
+            .capture_health
+            .as_ref()
+            .and_then(PipeWireHealth::fault)
+            .or_else(|| ctx.last_error.lock().ok().and_then(|last| last.clone())),
     }
 }
 
@@ -1030,6 +1068,10 @@ fn start_app_capture(
     runtime.state = "capturing".to_string();
     runtime.last_error = None;
     runtime.active_profile = Some(resolved_for_runtime);
+    runtime.capture_health = match &backend {
+        CaptureBackend::PipeWire(capture, _) => Some(capture.health()),
+        CaptureBackend::Jack(_, _) => None,
+    };
     runtime.capture = Some(backend);
     runtime.session = Some(session);
     Ok(format!("capturing {profile_name}"))
@@ -1038,6 +1080,7 @@ fn start_app_capture(
 fn stop_app_capture(ctx: &IdleDaemonContext) {
     if let Ok(mut runtime) = ctx.runtime.lock() {
         let capture = runtime.capture.take();
+        runtime.capture_health = None;
         runtime.session = None;
         runtime.state = if runtime.active_profile.is_some() {
             "idle".to_string()
@@ -1276,6 +1319,7 @@ fn set_app_fault(
         runtime.last_error = Some(error);
         runtime.active_profile = resolved;
         runtime.capture = None;
+        runtime.capture_health = None;
         runtime.session = None;
     }
 }
@@ -1304,6 +1348,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                 state.active_profile = Some(profile.clone());
                 if state.config.daemon.start_mode == "auto" {
                     state.capture.take();
+                    state.capture_health = None;
                     state.session = None;
                     let channel_names: Vec<String> =
                         profile.ports.iter().map(|p| p.name.clone()).collect();
@@ -1370,17 +1415,23 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                             state.session = Some(session);
                             state.state = "capturing".to_string();
                             state.last_error = None;
+                            state.capture_health = match &backend {
+                                CaptureBackend::PipeWire(capture, _) => Some(capture.health()),
+                                CaptureBackend::Jack(_, _) => None,
+                            };
                             state.capture = Some(backend);
                         }
                         Err(err) => {
                             state.state = "faulted".to_string();
                             state.last_error = Some(err.to_string());
+                            state.capture_health = None;
                         }
                     }
                 } else {
                     state.state = "idle".to_string();
                     state.last_error = None;
                     state.capture = None;
+                    state.capture_health = None;
                     state.session = None;
                 }
             } else {
@@ -1388,6 +1439,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
                 state.last_error = Some("no active profile configured".to_string());
                 state.active_profile = None;
                 state.capture = None;
+                state.capture_health = None;
                 state.session = None;
             }
             Ok(())
@@ -1398,6 +1450,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
             state.last_error = Some(format!("config file not found: {}", path.display()));
             state.active_profile = None;
             state.capture = None;
+            state.capture_health = None;
             state.session = None;
             Ok(())
         }
@@ -1407,6 +1460,7 @@ fn reload_app_config_inner(state: &mut AppRuntimeState, path: &Path) -> Result<(
             state.last_error = loaded.error;
             state.active_profile = None;
             state.capture = None;
+            state.capture_health = None;
             state.session = None;
             Ok(())
         }
@@ -1443,6 +1497,117 @@ fn iso8601_compact_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipewire_runtime_fault_changes_legacy_and_profile_status_to_faulted() {
+        let health = crate::capture_pipewire::PipeWireHealth::default();
+        assert!(health.record_fatal("PipeWire core/proxy error: server disconnected"));
+
+        let legacy = DaemonContext {
+            cfg: test_legacy_config(),
+            session: test_session(),
+            resolved_target: None,
+            stop: AtomicBool::new(false),
+            last_error: Mutex::new(None),
+            capture_health: Some(health.clone()),
+        };
+        let profile = IdleDaemonContext {
+            config_path: PathBuf::from("/tmp/lamb-test-config.toml"),
+            control_socket_path: PathBuf::from("/tmp/lamb-test-control.sock"),
+            runtime: Mutex::new(AppRuntimeState {
+                config: app_config::AppConfig::default(),
+                state: "capturing".to_string(),
+                last_error: None,
+                active_profile: None,
+                capture: None,
+                capture_health: Some(health),
+                session: None,
+            }),
+            stop: AtomicBool::new(false),
+        };
+
+        for status in [status_response(&legacy), idle_status_response(&profile)] {
+            assert_eq!(status.state, "faulted");
+            assert_eq!(
+                status.last_error.as_deref(),
+                Some("PipeWire core/proxy error: server disconnected")
+            );
+        }
+    }
+
+    #[test]
+    fn normal_pipewire_stop_is_not_reported_as_a_fault() {
+        let health = crate::capture_pipewire::PipeWireHealth::default();
+        let legacy = DaemonContext {
+            cfg: test_legacy_config(),
+            session: test_session(),
+            resolved_target: None,
+            stop: AtomicBool::new(true),
+            last_error: Mutex::new(None),
+            capture_health: Some(health),
+        };
+
+        let status = status_response(&legacy);
+        assert_eq!(status.state, "stopping");
+        assert_eq!(status.last_error, None);
+    }
+
+    fn test_session() -> CaptureSession {
+        let params = CaptureRuntimeParams {
+            seconds: 1,
+            chunk_frames_override: Some(1),
+            memory_max: None,
+            headroom: 1.0,
+            split_when_over_bytes: 3_900_000_000,
+            io_buffer_bytes_per_channel: 4096,
+            maximum_path_bytes: 512,
+            capture_queue_slots: 8,
+            capture_worker_stack_bytes: 64 * 1024,
+            control_queue_capacity: 2,
+            worker_stack_bytes: 64 * 1024,
+        };
+        let (runtime, _) = CaptureRuntime::build(params, 100, 1).unwrap();
+        CaptureSession {
+            arena: Arc::new(runtime.arena),
+            workspace: Mutex::new(runtime.workspace),
+            coordinator: Arc::new(DumpCoordinator::new()),
+            sample_rate: 100,
+            channel_names: vec!["mic".to_string()],
+            output_dir: PathBuf::from("/tmp/out"),
+        }
+    }
+
+    fn test_legacy_config() -> LambConfig {
+        LambConfig {
+            config_version: 1,
+            user: "test".to_string(),
+            target: None,
+            backend: "pipewire".to_string(),
+            channels: Some(1),
+            channel_map: None,
+            capture_ports: Vec::new(),
+            seconds: 1,
+            sample_rate: 100,
+            sample_format: "F32LE".to_string(),
+            latency: None,
+            dont_remix: true,
+            output_dir: PathBuf::from("/tmp/out"),
+            memory: config::MemoryConfig {
+                max: None,
+                headroom: 1.0,
+            },
+            max_active_snapshots: 1,
+            allow_queued_recall: false,
+            chunk_frames: Some(1),
+            control_socket_path: PathBuf::from("/tmp/lamb-test-control.sock"),
+            control_permissions: "0600".to_string(),
+            export: config::ExportConfig {
+                mode: "per-channel".to_string(),
+                format: "wav".to_string(),
+                split_when_over_bytes: 3_900_000_000,
+            },
+        }
+    }
 
     #[test]
     fn app_status_reports_pending_frozen_epoch() {
@@ -1499,6 +1664,7 @@ mod tests {
                 last_error: None,
                 active_profile: None,
                 capture: None,
+                capture_health: None,
                 session: Some(session),
             }),
             stop: AtomicBool::new(false),
@@ -1539,6 +1705,7 @@ mod tests {
                 last_error: None,
                 active_profile: None,
                 capture: None,
+                capture_health: None,
                 session: None,
             }),
             stop: AtomicBool::new(false),

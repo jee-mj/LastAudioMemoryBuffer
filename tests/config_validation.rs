@@ -1,4 +1,4 @@
-use lamb::config::{load_config_file, ExportConfig, LambConfig, MemoryConfig};
+use lamb::config::{load_config_file, CapturePortConfig, ExportConfig, LambConfig, MemoryConfig};
 use lamb::math::{estimate_ring_bytes, wav_parts_for_channel};
 use std::{fs, path::PathBuf};
 
@@ -9,7 +9,8 @@ fn valid_config() -> LambConfig {
         target: None,
         backend: "fake".to_string(),
         channels: Some(4),
-        channel_map: Vec::new(),
+        channel_map: Some(Vec::new()),
+        capture_ports: Vec::new(),
         seconds: 10,
         sample_rate: 44_100,
         sample_format: "F32LE".to_string(),
@@ -33,9 +34,111 @@ fn valid_config() -> LambConfig {
     }
 }
 
+fn capture_port(source: &str, name: &str) -> CapturePortConfig {
+    CapturePortConfig {
+        source: Some(source.to_string()),
+        name: Some(name.to_string()),
+    }
+}
+
+fn valid_pipewire_config() -> LambConfig {
+    let mut cfg = valid_config();
+    cfg.backend = "pipewire".to_string();
+    cfg.target = Some("studio-input".to_string());
+    cfg.channels = None;
+    cfg.channel_map = None;
+    cfg.capture_ports = vec![
+        capture_port("capture_AUX0", "mic"),
+        capture_port("capture_AUX1", "gtr"),
+    ];
+    cfg
+}
+
 #[test]
 fn valid_config_passes_static_validation() {
     valid_config().validate_static().unwrap();
+}
+
+#[test]
+fn pipewire_requires_capture_ports() {
+    let mut cfg = valid_pipewire_config();
+    cfg.capture_ports.clear();
+    let err = cfg.validate_static().unwrap_err().to_string();
+    assert!(
+        err.contains("capturePorts is required for pipewire backend"),
+        "{err}"
+    );
+}
+
+#[test]
+fn pipewire_rejects_missing_port_source() {
+    let mut cfg = valid_pipewire_config();
+    cfg.capture_ports[0].source = None;
+    let err = cfg.validate_static().unwrap_err().to_string();
+    assert!(err.contains("capturePorts[0].source is required"), "{err}");
+}
+
+#[test]
+fn pipewire_rejects_blank_port_name() {
+    let mut cfg = valid_pipewire_config();
+    cfg.capture_ports[0].name = Some("  ".to_string());
+    let err = cfg.validate_static().unwrap_err().to_string();
+    assert!(err.contains("capturePorts[0].name is required"), "{err}");
+}
+
+#[test]
+fn pipewire_rejects_duplicate_port_source_after_trimming() {
+    let mut cfg = valid_pipewire_config();
+    cfg.capture_ports[1].source = Some(" capture_AUX0 ".to_string());
+    let err = cfg.validate_static().unwrap_err().to_string();
+    assert!(
+        err.contains("capturePorts[1].source duplicates capturePorts[0].source"),
+        "{err}"
+    );
+}
+
+#[test]
+fn pipewire_rejects_duplicate_port_name_after_trimming() {
+    let mut cfg = valid_pipewire_config();
+    cfg.capture_ports[1].name = Some(" mic ".to_string());
+    let err = cfg.validate_static().unwrap_err().to_string();
+    assert!(
+        err.contains("capturePorts[1].name duplicates capturePorts[0].name"),
+        "{err}"
+    );
+}
+
+#[test]
+fn pipewire_rejects_channels_field_presence() {
+    let mut cfg = valid_pipewire_config();
+    cfg.channels = Some(2);
+    let err = cfg.validate_static().unwrap_err().to_string();
+    assert!(
+        err.contains("channels conflicts with capturePorts"),
+        "{err}"
+    );
+}
+
+#[test]
+fn pipewire_rejects_empty_channel_map_field_presence() {
+    let mut cfg = valid_pipewire_config();
+    cfg.channel_map = Some(Vec::new());
+    let err = cfg.validate_static().unwrap_err().to_string();
+    assert!(
+        err.contains("channelMap conflicts with capturePorts"),
+        "{err}"
+    );
+}
+
+#[test]
+fn pipewire_ports_derive_ordered_channels_and_names() {
+    let cfg = valid_pipewire_config();
+    let ports = cfg.resolved_capture_ports().unwrap();
+    assert_eq!(ports.len(), 2);
+    assert_eq!(ports[0].source, "capture_AUX0");
+    assert_eq!(ports[0].name, "mic");
+    assert_eq!(ports[1].source, "capture_AUX1");
+    assert_eq!(ports[1].name, "gtr");
 }
 
 #[test]
@@ -90,7 +193,11 @@ splitWhenOverBytes = 3900000000
 fn channel_map_must_match_explicit_channels() {
     let mut cfg = valid_config();
     cfg.channels = Some(2);
-    cfg.channel_map = vec!["in1".to_string(), "in2".to_string(), "in3".to_string()];
+    cfg.channel_map = Some(vec![
+        "in1".to_string(),
+        "in2".to_string(),
+        "in3".to_string(),
+    ]);
     let err = cfg.validate_static().unwrap_err().to_string();
     assert!(
         err.contains("channelMap length 3 must match channels 2"),

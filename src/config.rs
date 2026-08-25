@@ -1,7 +1,22 @@
 use crate::error::{io_error, LambError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapturePortConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredCapturePort {
+    pub source: String,
+    pub name: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LambConfig {
@@ -12,8 +27,18 @@ pub struct LambConfig {
     #[serde(default = "default_backend")]
     pub backend: String,
     pub channels: Option<u32>,
-    #[serde(rename = "channelMap", default)]
-    pub channel_map: Vec<String>,
+    #[serde(
+        rename = "channelMap",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub channel_map: Option<Vec<String>>,
+    #[serde(
+        rename = "capturePorts",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub capture_ports: Vec<CapturePortConfig>,
     pub seconds: u32,
     #[serde(rename = "sampleRate")]
     pub sample_rate: u32,
@@ -56,7 +81,57 @@ fn default_backend() -> String {
     "pipewire".to_string()
 }
 
+pub(crate) fn normalize_capture_ports<'a>(
+    entries: impl IntoIterator<Item = (Option<&'a str>, Option<&'a str>)>,
+    field: &str,
+    required_error: &str,
+) -> Result<Vec<ConfiguredCapturePort>> {
+    let mut source_indexes = BTreeMap::<String, usize>::new();
+    let mut name_indexes = BTreeMap::<String, usize>::new();
+    let mut resolved = Vec::new();
+
+    for (index, (source, name)) in entries.into_iter().enumerate() {
+        let source = source
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| LambError::Validation(format!("{field}[{index}].source is required")))?
+            .to_string();
+        let name = name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| LambError::Validation(format!("{field}[{index}].name is required")))?
+            .to_string();
+
+        if let Some(first) = source_indexes.insert(source.clone(), index) {
+            return Err(LambError::Validation(format!(
+                "{field}[{index}].source duplicates {field}[{first}].source"
+            )));
+        }
+        if let Some(first) = name_indexes.insert(name.clone(), index) {
+            return Err(LambError::Validation(format!(
+                "{field}[{index}].name duplicates {field}[{first}].name"
+            )));
+        }
+        resolved.push(ConfiguredCapturePort { source, name });
+    }
+
+    if resolved.is_empty() {
+        return Err(LambError::Validation(required_error.to_string()));
+    }
+    Ok(resolved)
+}
+
 impl LambConfig {
+    pub fn resolved_capture_ports(&self) -> Result<Vec<ConfiguredCapturePort>> {
+        normalize_capture_ports(
+            self.capture_ports
+                .iter()
+                .map(|port| (port.source.as_deref(), port.name.as_deref())),
+            "capturePorts",
+            "capturePorts is required for pipewire backend",
+        )
+    }
+
     pub fn validate_static(&self) -> Result<()> {
         if self.config_version != 1 {
             return Err(LambError::Validation(format!(
@@ -78,16 +153,30 @@ impl LambConfig {
         if self.sample_rate == 0 {
             return Err(LambError::Validation("sampleRate must be > 0".to_string()));
         }
-        if let Some(channels) = self.channels {
+        if self.backend == "pipewire" {
+            if self.channels.is_some() {
+                return Err(LambError::Validation(
+                    "channels conflicts with capturePorts for pipewire backend".to_string(),
+                ));
+            }
+            if self.channel_map.is_some() {
+                return Err(LambError::Validation(
+                    "channelMap conflicts with capturePorts for pipewire backend".to_string(),
+                ));
+            }
+            self.resolved_capture_ports()?;
+        } else if let Some(channels) = self.channels {
             if channels == 0 {
                 return Err(LambError::Validation("channels must be > 0".to_string()));
             }
-            if !self.channel_map.is_empty() && self.channel_map.len() != channels as usize {
-                return Err(LambError::Validation(format!(
-                    "channelMap length {} must match channels {}",
-                    self.channel_map.len(),
-                    channels
-                )));
+            if let Some(channel_map) = self.channel_map.as_ref() {
+                if !channel_map.is_empty() && channel_map.len() != channels as usize {
+                    return Err(LambError::Validation(format!(
+                        "channelMap length {} must match channels {}",
+                        channel_map.len(),
+                        channels
+                    )));
+                }
             }
         }
         if self.sample_format != "F32LE" {
