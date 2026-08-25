@@ -3,7 +3,7 @@ use lamb::app_config::{
     default_config_path_from_env, default_config_text, load_optional_config, parse_config_text,
     write_default_config, AppConfig, ConfigLoadState,
 };
-use lamb::export_policy::ResolvedLayout;
+use lamb::export_policy::{ExportCommand, PublicationStrategy, ResolvedLayout};
 use lamb::profile;
 use std::collections::BTreeMap;
 use std::fs;
@@ -417,6 +417,20 @@ fn modern_profile_layout_omission_remains_command_default() {
     assert_eq!(
         resolved.export_policy.layout,
         ResolvedLayout::CommandDefault
+    );
+    assert_eq!(
+        resolved
+            .export_policy
+            .layout
+            .publication_strategy(ExportCommand::Recall),
+        PublicationStrategy::FileSet
+    );
+    assert_eq!(
+        resolved
+            .export_policy
+            .layout
+            .publication_strategy(ExportCommand::Dump),
+        PublicationStrategy::AtomicDirectory
     );
 }
 
