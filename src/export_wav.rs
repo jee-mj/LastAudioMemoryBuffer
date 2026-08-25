@@ -302,6 +302,8 @@ pub enum PreparedPublication {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicationCheckpoint {
     RecallManifestPrepared,
+    RecallParentCreatedBeforeOwnedManifest { index: usize },
+    RecallParentOwnedManifestRecorded { index: usize },
     RecallPartialCreatedBeforeManifest { index: usize },
     RecallPartialSynced { index: usize },
     RecallBeforeFinalRename { index: usize },
@@ -387,17 +389,7 @@ fn publish_prepared_recall(
         }
         Err(error) => return PreparedPublication::RetryableFailure(error),
     };
-    let output_directory = match planned[0].1.parent() {
-        Some(parent) => parent.to_path_buf(),
-        None => {
-            return PreparedPublication::RetryableFailure(LambError::ExportInvariant(
-                "prepared recall final path has no parent",
-            ))
-        }
-    };
-    if let Err(source) = fs::create_dir_all(&output_directory) {
-        return PreparedPublication::RetryableFailure(io_error(&output_directory, source));
-    }
+    let output_directory = staging.final_root().to_path_buf();
     for (_, final_path) in &planned {
         match fs::symlink_metadata(final_path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -436,11 +428,13 @@ fn publish_prepared_recall(
     let staging_identity = staging.staging_identity();
     let ManifestScratch {
         slots,
+        directories,
         path_bytes,
         serialization,
     } = staging.manifest_scratch();
     match publish_recall_inner(
         slots,
+        directories,
         path_bytes,
         serialization,
         hook,
@@ -451,7 +445,7 @@ fn publish_prepared_recall(
         staging_identity,
     ) {
         Ok(published) => {
-            staging.defer_completed_cleanup(TransactionKind::Recall);
+            staging.defer_completed_cleanup(TransactionKind::FileSet);
             PreparedPublication::Published(published)
         }
         Err(error) => {
@@ -513,6 +507,7 @@ impl RecallPublishError {
 #[allow(clippy::too_many_arguments)]
 fn publish_recall_inner(
     slots: &mut [ManifestEntrySlot],
+    directories: &mut [crate::recovery::ManifestDirectorySlot],
     path_bytes: &mut [u8],
     serialization: &mut [u8],
     hook: &mut impl PreparedPublicationHook,
@@ -522,10 +517,10 @@ fn publish_recall_inner(
     output_directory: &Path,
     staging_identity: (u64, u64),
 ) -> std::result::Result<PublishedOutput, RecallPublishError> {
-    let mut manifest = TransactionManifest::new(slots, path_bytes);
+    let mut manifest = TransactionManifest::new_with_directories(slots, directories, path_bytes);
     manifest.version = MANIFEST_VERSION;
     manifest.uid = unsafe { libc::geteuid() };
-    manifest.kind = TransactionKind::Recall;
+    manifest.kind = TransactionKind::FileSet;
     manifest.phase = ManifestPhase::Prepared;
     manifest.transaction_id = manifest
         .push_path(transaction_id)
@@ -559,7 +554,12 @@ fn publish_recall_inner(
                     "prepared recall final filename is invalid",
                 ))
             })?;
-        let partial_path = output_directory.join(format!(".{file_name}.{transaction_id}.partial"));
+        let partial_parent = final_path.parent().ok_or_else(|| {
+            RecallPublishError::retryable(LambError::ExportInvariant(
+                "prepared file-set final path has no parent",
+            ))
+        })?;
+        let partial_path = partial_parent.join(format!(".{file_name}.{transaction_id}.partial"));
         let staged_ref = manifest
             .push_path(
                 path_to_str(staged_path, "staged path").map_err(RecallPublishError::retryable)?,
@@ -585,6 +585,13 @@ fn publish_recall_inner(
         slot.final_path = final_ref;
     }
 
+    // Preflight all candidates before mutating final publication state.  The
+    // manifest records every absent candidate as an identity-unknown intent;
+    // a crash before identity capture is consequently conservative.
+    for (entry_index, (_, final_path)) in planned.iter().enumerate() {
+        register_file_set_parent_intents(&mut manifest, output_directory, entry_index, final_path)
+            .map_err(RecallPublishError::retryable)?;
+    }
     let manifest_path = staging_directory.join(RECALL_MANIFEST_NAME);
     persist_manifest(&mut *serialization, &manifest_path, &manifest, hook)
         .map_err(RecallPublishError::retryable)?;
@@ -595,6 +602,21 @@ fn publish_recall_inner(
             created_finals: Vec::new(),
             partials: Vec::new(),
         })?;
+
+    if let Err(operation) = materialize_file_set_parents(
+        &mut manifest,
+        output_directory,
+        &manifest_path,
+        serialization,
+        hook,
+    ) {
+        return Err(RecallPublishError {
+            operation,
+            durable_failure: true,
+            created_finals: Vec::new(),
+            partials: Vec::new(),
+        });
+    }
 
     let mut durable_failure = false;
     let mut partials = Vec::with_capacity(planned.len());
@@ -703,13 +725,31 @@ fn publish_recall_inner(
             created_finals: Vec::new(),
             partials: Vec::new(),
         })?;
-    hook.sync_directory(output_directory)
-        .map_err(|operation| RecallPublishError {
-            operation,
-            durable_failure: true,
-            created_finals: Vec::new(),
-            partials: Vec::new(),
-        })?;
+    let mut parents = vec![output_directory.to_path_buf()];
+    for owned in &created_finals {
+        let mut parent = owned.path.parent();
+        while let Some(path) = parent {
+            if !path.starts_with(output_directory) {
+                break;
+            }
+            parents.push(path.to_path_buf());
+            if path == output_directory {
+                break;
+            }
+            parent = path.parent();
+        }
+    }
+    parents.sort();
+    parents.dedup();
+    for parent in parents {
+        hook.sync_directory(&parent)
+            .map_err(|operation| RecallPublishError {
+                operation,
+                durable_failure: true,
+                created_finals: Vec::new(),
+                partials: Vec::new(),
+            })?;
+    }
     hook.checkpoint(PublicationCheckpoint::RecallOutputSynced)
         .map_err(|operation| RecallPublishError {
             operation,
@@ -755,6 +795,137 @@ fn path_to_str<'a>(path: &'a Path, description: &str) -> std::result::Result<&'a
             path.display()
         ))
     })
+}
+
+/// Creates a FileSet parent a component at a time, refusing symlinks at every
+/// existing ancestor.  The prepared path renderer has already established
+/// lexical containment; this closes the filesystem race/indirection boundary.
+fn register_file_set_parent_intents(
+    manifest: &mut TransactionManifest,
+    output_root: &Path,
+    entry_index: usize,
+    final_path: &Path,
+) -> Result<()> {
+    let parent = final_path.parent().ok_or(LambError::ExportInvariant(
+        "prepared file-set final path has no parent",
+    ))?;
+    let relative = parent.strip_prefix(output_root).map_err(|_| {
+        LambError::Validation("file-set final path escapes output root".to_string())
+    })?;
+    let mut current = output_root.to_path_buf();
+    match fs::symlink_metadata(&current) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(LambError::Validation(format!(
+                "refusing symlink output root: {}",
+                current.display()
+            )))
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(LambError::Validation(format!(
+                "file-set output root is not a directory: {}",
+                current.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => return Err(io_error(&current, source)),
+    }
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(LambError::Validation(
+                "file-set parent is not lexically contained".to_string(),
+            ));
+        }
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(LambError::Validation(format!(
+                    "refusing symlink ancestor: {}",
+                    current.display()
+                )))
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(LambError::Validation(format!(
+                    "file-set parent is not a directory: {}",
+                    current.display()
+                )))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let prefix_len = current
+                    .to_str()
+                    .ok_or_else(|| {
+                        LambError::Validation(
+                            "created directory path is not valid UTF-8".to_string(),
+                        )
+                    })?
+                    .len();
+                if !manifest.directories().iter().any(|slot| {
+                    manifest
+                        .directory_path(slot)
+                        .is_ok_and(|path| path == current)
+                }) {
+                    manifest.push_directory_intent(entry_index, prefix_len)?;
+                }
+            }
+            Err(source) => return Err(io_error(&current, source)),
+        }
+    }
+    Ok(())
+}
+
+fn materialize_file_set_parents(
+    manifest: &mut TransactionManifest,
+    output_root: &Path,
+    manifest_path: &Path,
+    serialization: &mut [u8],
+    hook: &mut impl PreparedPublicationHook,
+) -> Result<()> {
+    // Output root belongs to configuration rather than the transaction journal.
+    match fs::symlink_metadata(output_root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(LambError::Validation(format!(
+                "invalid file-set output root: {}",
+                output_root.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(output_root).map_err(|source| io_error(output_root, source))?
+        }
+        Err(source) => return Err(io_error(output_root, source)),
+    }
+    for index in 0..manifest.directory_count {
+        let directory = manifest.directories()[index];
+        let path = manifest.directory_path(&directory)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(LambError::Validation(format!(
+                    "invalid file-set parent: {}",
+                    path.display()
+                )))
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(path).map_err(|source| io_error(path, source))?;
+                // If we crash before this capture/update, the durable Intent is
+                // intentionally left identity-unknown and recovery will not rmdir it.
+                hook.checkpoint(
+                    PublicationCheckpoint::RecallParentCreatedBeforeOwnedManifest { index },
+                )?;
+                let identity = capture_identity(path)?;
+                let slot = manifest.directory_mut(index)?;
+                slot.state = Some(crate::recovery::ManifestDirectoryState::Owned);
+                slot.identity = Some(identity);
+                persist_manifest(serialization, manifest_path, manifest, hook)?;
+                hook.checkpoint(PublicationCheckpoint::RecallParentOwnedManifestRecorded {
+                    index,
+                })?;
+            }
+            Err(source) => return Err(io_error(path, source)),
+        }
+    }
+    Ok(())
 }
 
 fn publish_prepared_dump(
@@ -827,6 +998,7 @@ fn publish_prepared_dump(
     let staging_identity = staging.staging_identity();
     let ManifestScratch {
         slots,
+        directories: _,
         path_bytes,
         serialization,
     } = staging.manifest_scratch();
@@ -845,7 +1017,7 @@ fn publish_prepared_dump(
         staging_identity,
     ) {
         Ok(published) => {
-            staging.defer_completed_cleanup(TransactionKind::Dump);
+            staging.defer_completed_cleanup(TransactionKind::AtomicDirectory);
             PreparedPublication::Published(published)
         }
         Err((error, Some(durable))) => {
@@ -913,7 +1085,7 @@ fn publish_dump_inner(
     let mut manifest = TransactionManifest::new(slots, path_bytes);
     manifest.version = MANIFEST_VERSION;
     manifest.uid = unsafe { libc::geteuid() };
-    manifest.kind = TransactionKind::Dump;
+    manifest.kind = TransactionKind::AtomicDirectory;
     manifest.phase = ManifestPhase::Prepared;
     manifest.transaction_id = manifest
         .push_path(transaction_id)

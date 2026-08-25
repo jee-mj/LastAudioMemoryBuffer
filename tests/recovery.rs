@@ -1,7 +1,8 @@
 use lamb::error::LambError;
 use lamb::recovery::{
     capture_identity, recover_dump_parent, recover_dump_root, recover_recall_root,
-    recover_recall_staging_root, FileIdentity, ManifestEntrySlot, ManifestPhase, ManifestStore,
+    recover_recall_root_with_directories, recover_recall_staging_root, FileIdentity,
+    ManifestDirectorySlot, ManifestDirectoryState, ManifestEntrySlot, ManifestPhase, ManifestStore,
     PathRef, RecoveryOutcome, TransactionKind, TransactionManifest, MANIFEST_VERSION,
 };
 use std::fs;
@@ -11,6 +12,14 @@ use std::path::{Path, PathBuf};
 const BUFFER_BYTES: usize = 64 * 1024;
 const PATH_ARENA_BYTES: usize = 512 * 1024;
 const ENTRY_CAPACITY: usize = 16;
+const DIRECTORY_CAPACITY: usize = 64;
+
+#[test]
+fn current_manifest_schema_is_version_two() {
+    // Changing the write schema must remain an intentional compatibility
+    // boundary: recovery fixtures below explicitly retain version one.
+    assert_eq!(MANIFEST_VERSION, 2);
+}
 
 fn identity(path: &Path) -> FileIdentity {
     let metadata = fs::symlink_metadata(path).unwrap();
@@ -25,6 +34,265 @@ fn fresh_manifest() -> (Vec<ManifestEntrySlot>, Vec<u8>) {
         vec![ManifestEntrySlot::default(); ENTRY_CAPACITY],
         vec![0_u8; PATH_ARENA_BYTES],
     )
+}
+
+#[test]
+fn v2_directory_journal_round_trips_and_rolls_back_owned_parents_deepest_first() {
+    let root = tempfile::tempdir().unwrap();
+    let transaction = root.path().join("staging").join("journal-1");
+    let output = root.path().join("output");
+    let nested = output.join("channel").join("part");
+    fs::create_dir_all(&transaction).unwrap();
+    fs::create_dir_all(&nested).unwrap();
+    let omitted = output.join("omitted-channel.wav");
+    fs::write(&omitted, b"foreign omitted channel").unwrap();
+    let staged = transaction.join("staged.wav");
+    fs::write(&staged, b"staged").unwrap();
+
+    let mut slots = vec![ManifestEntrySlot::default(); ENTRY_CAPACITY];
+    let mut directories = vec![ManifestDirectorySlot::default(); DIRECTORY_CAPACITY];
+    let mut paths = vec![0_u8; PATH_ARENA_BYTES];
+    let mut manifest =
+        TransactionManifest::new_with_directories(&mut slots, &mut directories, &mut paths);
+    manifest.version = MANIFEST_VERSION;
+    manifest.uid = unsafe { libc::geteuid() };
+    manifest.kind = TransactionKind::FileSet;
+    manifest.phase = ManifestPhase::Prepared;
+    manifest.transaction_id = manifest.push_path("journal-1").unwrap();
+    manifest.staging_root_path = manifest.push_path(transaction.to_str().unwrap()).unwrap();
+    manifest.staging_root_identity = Some(identity(&transaction));
+    manifest.output_root = manifest.push_path(output.to_str().unwrap()).unwrap();
+    manifest.set_entry_count(1).unwrap();
+    let staged_ref = manifest.push_path(staged.to_str().unwrap()).unwrap();
+    let partial_ref = manifest
+        .push_path(nested.join(".out.wav.journal-1.partial").to_str().unwrap())
+        .unwrap();
+    let final_ref = manifest
+        .push_path(nested.join("out.wav").to_str().unwrap())
+        .unwrap();
+    let entry = manifest.entry_mut(0);
+    entry.staged_path = staged_ref;
+    entry.staged_identity = Some(identity(&staged));
+    entry.partial_path = partial_ref;
+    entry.final_path = final_ref;
+    for path in [output.join("channel"), nested.clone()] {
+        let prefix_len = path.to_str().unwrap().len();
+        let index = manifest.push_directory_intent(0, prefix_len).unwrap();
+        let slot = manifest.directory_mut(index).unwrap();
+        slot.state = Some(ManifestDirectoryState::Owned);
+        slot.identity = Some(identity(&path));
+    }
+    write_manifest(&transaction.join("manifest.json"), &manifest);
+
+    let mut recovery_slots = vec![ManifestEntrySlot::default(); ENTRY_CAPACITY];
+    let mut recovery_directories = vec![ManifestDirectorySlot::default(); DIRECTORY_CAPACITY];
+    let mut recovery_paths = vec![0_u8; PATH_ARENA_BYTES];
+    let mut buffer = vec![0_u8; BUFFER_BYTES];
+    let outcome = recover_recall_root_with_directories(
+        &transaction,
+        &output,
+        &mut buffer,
+        &mut recovery_slots,
+        &mut recovery_directories,
+        &mut recovery_paths,
+    )
+    .unwrap();
+    assert_eq!(outcome, RecoveryOutcome::RolledBack);
+    assert!(!nested.exists());
+    assert!(!output.join("channel").exists());
+    assert_eq!(fs::read(&omitted).unwrap(), b"foreign omitted channel");
+}
+
+#[test]
+fn v2_directory_records_are_compact_coordinates_and_reject_invalid_records_before_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let transaction = root.path().join("staging").join("compact-1");
+    let output = root.path().join("output");
+    let parent = output.join("nested");
+    fs::create_dir_all(&transaction).unwrap();
+    fs::create_dir_all(&parent).unwrap();
+    let omitted = output.join("omitted-channel.wav");
+    fs::write(&omitted, b"omitted").unwrap();
+    let staged = transaction.join("staged.wav");
+    let final_path = parent.join("out.wav");
+    fs::write(&staged, b"staged").unwrap();
+
+    let mut slots = vec![ManifestEntrySlot::default(); ENTRY_CAPACITY];
+    let mut directories = vec![ManifestDirectorySlot::default(); DIRECTORY_CAPACITY];
+    let mut paths = vec![0_u8; PATH_ARENA_BYTES];
+    let mut manifest =
+        TransactionManifest::new_with_directories(&mut slots, &mut directories, &mut paths);
+    manifest.version = MANIFEST_VERSION;
+    manifest.uid = unsafe { libc::geteuid() };
+    manifest.kind = TransactionKind::FileSet;
+    manifest.phase = ManifestPhase::Prepared;
+    manifest.transaction_id = manifest.push_path("compact-1").unwrap();
+    manifest.staging_root_path = manifest.push_path(transaction.to_str().unwrap()).unwrap();
+    manifest.staging_root_identity = Some(identity(&transaction));
+    manifest.output_root = manifest.push_path(output.to_str().unwrap()).unwrap();
+    manifest.set_entry_count(1).unwrap();
+    let staged_ref = manifest.push_path(staged.to_str().unwrap()).unwrap();
+    let partial_ref = manifest
+        .push_path(parent.join(".out.wav.compact-1.partial").to_str().unwrap())
+        .unwrap();
+    let final_ref = manifest.push_path(final_path.to_str().unwrap()).unwrap();
+    let entry = manifest.entry_mut(0);
+    entry.staged_path = staged_ref;
+    entry.staged_identity = Some(identity(&staged));
+    entry.partial_path = partial_ref;
+    entry.final_path = final_ref;
+    let parent_slot = manifest
+        .push_directory_intent(0, parent.to_str().unwrap().len())
+        .unwrap();
+    manifest.directory_mut(parent_slot).unwrap().state = Some(ManifestDirectoryState::Owned);
+    manifest.directory_mut(parent_slot).unwrap().identity = Some(identity(&parent));
+
+    let json = serde_json::to_string(&manifest).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["version"], 2);
+    assert_eq!(value["kind"], "file_set");
+    assert_eq!(value["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(value["created_directories"].as_array().unwrap().len(), 1);
+    assert!(json.contains("\"entry_index\":0"));
+    assert!(json.contains("\"prefix_len\""));
+    assert!(!json.contains("\"created_directories\":[{\"path\""));
+
+    let invalid = json.replace(
+        &format!("\"prefix_len\":{}", parent.to_str().unwrap().len()),
+        "\"prefix_len\":999999",
+    );
+    fs::write(transaction.join("manifest.json"), invalid).unwrap();
+    let mut recovery_slots = vec![ManifestEntrySlot::default(); ENTRY_CAPACITY];
+    let mut recovery_directories = vec![ManifestDirectorySlot::default(); DIRECTORY_CAPACITY];
+    let mut recovery_paths = vec![0_u8; PATH_ARENA_BYTES];
+    let mut buffer = vec![0_u8; BUFFER_BYTES];
+    assert!(recover_recall_root_with_directories(
+        &transaction,
+        &output,
+        &mut buffer,
+        &mut recovery_slots,
+        &mut recovery_directories,
+        &mut recovery_paths
+    )
+    .is_err());
+    assert!(staged.exists());
+    assert!(parent.exists());
+
+    let old_partial = parent
+        .join(".out.wav.compact-1.partial")
+        .to_string_lossy()
+        .into_owned();
+    let new_partial = output
+        .join(".out.wav.compact-1.partial")
+        .to_string_lossy()
+        .into_owned();
+    let non_adjacent = json.replace(&old_partial, &new_partial);
+    fs::write(transaction.join("manifest.json"), non_adjacent).unwrap();
+    assert!(recover_recall_root_with_directories(
+        &transaction,
+        &output,
+        &mut buffer,
+        &mut recovery_slots,
+        &mut recovery_directories,
+        &mut recovery_paths
+    )
+    .is_err());
+    assert!(staged.exists());
+    assert!(parent.exists());
+}
+
+#[test]
+fn v2_partial_rollback_preserves_nonempty_owned_parent_but_finishes() {
+    let root = tempfile::tempdir().unwrap();
+    let transaction = root.path().join("staging").join("nonempty-1");
+    let output = root.path().join("output");
+    let parent = output.join("nested");
+    fs::create_dir_all(&transaction).unwrap();
+    fs::create_dir_all(&parent).unwrap();
+    let omitted = output.join("omitted-channel.wav");
+    fs::write(&omitted, b"omitted").unwrap();
+    fs::write(parent.join("foreign"), b"foreign").unwrap();
+    let staged = transaction.join("staged.wav");
+    fs::write(&staged, b"staged").unwrap();
+    let mut slots = vec![ManifestEntrySlot::default(); ENTRY_CAPACITY];
+    let mut directories = vec![ManifestDirectorySlot::default(); DIRECTORY_CAPACITY];
+    let mut paths = vec![0_u8; PATH_ARENA_BYTES];
+    let mut manifest =
+        TransactionManifest::new_with_directories(&mut slots, &mut directories, &mut paths);
+    manifest.version = MANIFEST_VERSION;
+    manifest.uid = unsafe { libc::geteuid() };
+    manifest.kind = TransactionKind::FileSet;
+    manifest.transaction_id = manifest.push_path("nonempty-1").unwrap();
+    manifest.staging_root_path = manifest.push_path(transaction.to_str().unwrap()).unwrap();
+    manifest.staging_root_identity = Some(identity(&transaction));
+    manifest.output_root = manifest.push_path(output.to_str().unwrap()).unwrap();
+    manifest.set_entry_count(1).unwrap();
+    let staged_ref = manifest.push_path(staged.to_str().unwrap()).unwrap();
+    let partial_ref = manifest
+        .push_path(parent.join(".out.wav.nonempty-1.partial").to_str().unwrap())
+        .unwrap();
+    let final_ref = manifest
+        .push_path(parent.join("out.wav").to_str().unwrap())
+        .unwrap();
+    let entry = manifest.entry_mut(0);
+    entry.staged_path = staged_ref;
+    entry.staged_identity = Some(identity(&staged));
+    entry.partial_path = partial_ref;
+    entry.final_path = final_ref;
+    let index = manifest
+        .push_directory_intent(0, parent.to_str().unwrap().len())
+        .unwrap();
+    manifest.directory_mut(index).unwrap().state = Some(ManifestDirectoryState::Owned);
+    manifest.directory_mut(index).unwrap().identity = Some(identity(&parent));
+    write_manifest(&transaction.join("manifest.json"), &manifest);
+    let mut recovery_slots = vec![ManifestEntrySlot::default(); ENTRY_CAPACITY];
+    let mut recovery_directories = vec![ManifestDirectorySlot::default(); DIRECTORY_CAPACITY];
+    let mut recovery_paths = vec![0_u8; PATH_ARENA_BYTES];
+    let mut buffer = vec![0_u8; BUFFER_BYTES];
+    assert_eq!(
+        recover_recall_root_with_directories(
+            &transaction,
+            &output,
+            &mut buffer,
+            &mut recovery_slots,
+            &mut recovery_directories,
+            &mut recovery_paths
+        )
+        .unwrap(),
+        RecoveryOutcome::RolledBack
+    );
+    assert_eq!(fs::read(parent.join("foreign")).unwrap(), b"foreign");
+    assert_eq!(fs::read(&omitted).unwrap(), b"omitted");
+    assert!(!transaction.exists());
+}
+
+#[test]
+fn v2_atomic_directory_rejects_non_direct_child_before_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("dumps");
+    let (mut slots, mut path_bytes) = fresh_manifest();
+    let (manifest_path, mut manifest) = dump_manifest(&mut slots, &mut path_bytes, &parent, true);
+    manifest.version = MANIFEST_VERSION;
+    manifest.kind = TransactionKind::AtomicDirectory;
+    let nested_final = parent.join("nested").join("final");
+    manifest.final_directory_path = manifest.push_path(nested_final.to_str().unwrap()).unwrap();
+    let nested_file = nested_final.join("mic.wav");
+    manifest.entry_mut(0).final_path = manifest.push_path(nested_file.to_str().unwrap()).unwrap();
+    write_manifest(&manifest_path, &manifest);
+
+    let existing_final = parent.join("20260818T120000").join("mic.wav");
+    let (mut recovery_slots, mut recovery_paths) = fresh_manifest();
+    let mut buffer = vec![0_u8; BUFFER_BYTES];
+    assert!(recover_dump_parent(
+        &parent,
+        &manifest_path,
+        &mut buffer,
+        &mut recovery_slots,
+        &mut recovery_paths,
+    )
+    .is_err());
+    assert!(existing_final.exists());
+    assert!(manifest_path.exists());
 }
 
 fn write_manifest(path: &Path, manifest: &TransactionManifest) {
@@ -44,7 +312,7 @@ fn recall_manifest<'a>(
     fs::create_dir_all(transaction_root).unwrap();
     fs::create_dir_all(output_root).unwrap();
     let mut manifest = TransactionManifest::new(slots, path_bytes);
-    manifest.version = MANIFEST_VERSION;
+    manifest.version = 1;
     manifest.uid = unsafe { libc::geteuid() };
     manifest.kind = TransactionKind::Recall;
     manifest.phase = if final_count == 2 {
@@ -109,7 +377,7 @@ fn dump_manifest<'a>(
         fs::rename(&hidden, &final_dir).unwrap();
     }
     let mut manifest = TransactionManifest::new(slots, path_bytes);
-    manifest.version = MANIFEST_VERSION;
+    manifest.version = 1;
     manifest.uid = unsafe { libc::geteuid() };
     manifest.kind = TransactionKind::Dump;
     manifest.phase = if complete {
@@ -187,7 +455,7 @@ fn recovery_of_a_maximum_manifest_uses_reserved_storage() {
 
     let (mut build_slots, mut build_paths) = fresh_manifest();
     let mut manifest = TransactionManifest::new(&mut build_slots, &mut build_paths);
-    manifest.version = MANIFEST_VERSION;
+    manifest.version = 1;
     manifest.uid = unsafe { libc::geteuid() };
     manifest.kind = TransactionKind::Recall;
     manifest.phase = ManifestPhase::Complete;

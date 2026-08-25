@@ -13,14 +13,16 @@ use crate::export_wav::{
 };
 use crate::math::{wav_part_count, WAV_HEADER_BYTES};
 use crate::memory_plan::{
-    ExactArray, MaterializedBuffer, SessionMemoryPlan, MANIFEST_ENTRY_METADATA_BYTES,
-    MANIFEST_FIXED_PATH_ENTRIES, MANIFEST_JSON_ENTRY_OVERHEAD_BYTES,
+    ExactArray, MaterializedBuffer, SessionMemoryPlan, MANIFEST_DIRECTORY_METADATA_BYTES,
+    MANIFEST_ENTRY_METADATA_BYTES, MANIFEST_FIXED_PATH_ENTRIES,
+    MANIFEST_JSON_DIRECTORY_OVERHEAD_BYTES, MANIFEST_JSON_ENTRY_OVERHEAD_BYTES,
     MANIFEST_JSON_FIXED_OVERHEAD_BYTES, MANIFEST_PATH_ESCAPE_MULTIPLIER,
     OUTPUT_PATH_SLOTS_PER_PART,
 };
 use crate::recovery::{
-    recover_dump_parent, recover_dump_root, recover_recall_root, recover_recall_staging_root,
-    ManifestEntrySlot, RecoveryOutcome, RecoveryScanSummary, TransactionKind,
+    recover_dump_parent, recover_dump_root, recover_recall_root_with_directories,
+    recover_recall_staging_root_with_directories, ManifestDirectorySlot, ManifestEntrySlot,
+    RecoveryOutcome, RecoveryScanSummary, TransactionKind,
 };
 use crate::sample_ring::SampleFormat;
 use std::fmt;
@@ -204,6 +206,8 @@ pub struct WorkspaceAllocationAddresses {
     render_filename_capacity: usize,
     manifest_entries: usize,
     manifest_entry_slots: usize,
+    manifest_directories: usize,
+    manifest_directory_slots: usize,
     manifest_paths: usize,
     manifest_paths_len: usize,
     manifest_serialization: usize,
@@ -385,6 +389,10 @@ const _: () = assert!(
     std::mem::size_of::<ManifestEntrySlot>() <= MANIFEST_ENTRY_METADATA_BYTES as usize,
     "ManifestEntrySlot must fit the reserved per-entry metadata budget"
 );
+const _: () = assert!(
+    std::mem::size_of::<ManifestDirectorySlot>() <= MANIFEST_DIRECTORY_METADATA_BYTES as usize,
+    "ManifestDirectorySlot must fit the reserved per-directory metadata budget"
+);
 
 pub struct PersistenceWorkspace {
     config: PersistenceWorkspaceConfig,
@@ -397,6 +405,7 @@ pub struct PersistenceWorkspace {
     render_directory: ReusablePath,
     render_filename: ReusablePath,
     manifest_entries: ExactArray<ManifestEntrySlot>,
+    manifest_directories: ExactArray<ManifestDirectorySlot>,
     manifest_paths: MaterializedBuffer<u8>,
     manifest_serialization: MaterializedBuffer<u8>,
     output_count: usize,
@@ -464,6 +473,9 @@ impl PersistenceWorkspace {
             .map_err(|_| LambError::Validation("workspace path slot count overflow".to_string()))?;
         let path_capacity = usize::try_from(config.maximum_path_bytes)
             .map_err(|_| LambError::Validation("workspace path capacity overflow".to_string()))?;
+        let directory_slots = usize::try_from(plan.manifest_directory_slots()).map_err(|_| {
+            LambError::Validation("workspace directory slot count overflow".to_string())
+        })?;
         let escaped_path_bytes = config
             .maximum_path_bytes
             .checked_mul(MANIFEST_PATH_ESCAPE_MULTIPLIER)
@@ -473,9 +485,17 @@ impl PersistenceWorkspace {
         let manifest_entry_bytes = escaped_path_bytes
             .checked_add(MANIFEST_JSON_ENTRY_OVERHEAD_BYTES)
             .ok_or_else(|| LambError::Validation("manifest entry capacity overflow".to_string()))?;
-        let manifest_serialization_len = u64::try_from(path_slots)
+        let manifest_serialization_len = u64::try_from(output_slots)
             .ok()
+            .and_then(|slots| slots.checked_mul(3))
+            .and_then(|slots| slots.checked_add(MANIFEST_FIXED_PATH_ENTRIES))
             .and_then(|slots| slots.checked_mul(manifest_entry_bytes))
+            .and_then(|entries| {
+                u64::try_from(directory_slots).ok().and_then(|dirs| {
+                    dirs.checked_mul(MANIFEST_JSON_DIRECTORY_OVERHEAD_BYTES)
+                        .and_then(|directory_bytes| entries.checked_add(directory_bytes))
+                })
+            })
             .and_then(|entries| entries.checked_add(MANIFEST_JSON_FIXED_OVERHEAD_BYTES))
             .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or_else(|| {
@@ -490,11 +510,9 @@ impl PersistenceWorkspace {
             .ok_or_else(|| {
                 LambError::Validation("manifest path arena capacity overflow".to_string())
             })?;
-        if u64::try_from(manifest_paths_len).unwrap_or(u64::MAX) > plan.manifest_paths_bytes() {
-            return Err(LambError::Validation(
-                "manifest path arena exceeds the reserved plan budget".to_string(),
-            ));
-        }
+        // `SessionMemoryPlan` used the identical checked formula before any
+        // allocation is attempted.  The concrete usize conversion above is
+        // the second overflow boundary for this platform.
 
         Ok(Self {
             config,
@@ -510,6 +528,9 @@ impl PersistenceWorkspace {
             render_filename: ReusablePath::new(path_capacity)?,
             manifest_entries: ExactArray::try_from_fn(output_slots, |_| {
                 Ok(ManifestEntrySlot::default())
+            })?,
+            manifest_directories: ExactArray::try_from_fn(directory_slots, |_| {
+                Ok(ManifestDirectorySlot::default())
             })?,
             manifest_paths: MaterializedBuffer::new_zeroed(manifest_paths_len)?,
             manifest_serialization: MaterializedBuffer::new_zeroed(manifest_serialization_len)?,
@@ -565,6 +586,8 @@ impl PersistenceWorkspace {
             render_filename_capacity: self.render_filename.capacity(),
             manifest_entries: self.manifest_entries.as_slice().as_ptr() as usize,
             manifest_entry_slots: self.manifest_entries.len(),
+            manifest_directories: self.manifest_directories.as_slice().as_ptr() as usize,
+            manifest_directory_slots: self.manifest_directories.len(),
             manifest_paths: self.manifest_paths.as_slice().as_ptr() as usize,
             manifest_paths_len: self.manifest_paths.len(),
             manifest_serialization: self.manifest_serialization.as_slice().as_ptr() as usize,
@@ -1378,11 +1401,12 @@ impl PersistenceWorkspace {
                     transaction_root,
                     output_root,
                     ..
-                } => recover_recall_root(
+                } => recover_recall_root_with_directories(
                     transaction_root,
                     output_root,
                     self.manifest_serialization.as_mut_slice(),
                     self.manifest_entries.as_mut_slice(),
+                    self.manifest_directories.as_mut_slice(),
                     self.manifest_paths.as_mut_slice(),
                 )?,
                 DurablePublication::Dump {
@@ -1467,10 +1491,11 @@ impl PersistenceWorkspace {
         staging_root: &Path,
         output_root: &Path,
     ) -> RecoveryScanSummary {
-        recover_recall_staging_root(
+        recover_recall_staging_root_with_directories(
             staging_root,
             output_root,
             self.manifest_entries.as_mut_slice(),
+            self.manifest_directories.as_mut_slice(),
             self.manifest_paths.as_mut_slice(),
             self.manifest_serialization.as_mut_slice(),
         )
@@ -1512,11 +1537,12 @@ impl PersistenceWorkspace {
             }
         };
         if completed.kind == PersistenceKind::Recall {
-            let _ = recover_recall_root(
+            let _ = recover_recall_root_with_directories(
                 &transaction_root,
                 &final_root,
                 self.manifest_serialization.as_mut_slice(),
                 self.manifest_entries.as_mut_slice(),
+                self.manifest_directories.as_mut_slice(),
                 self.manifest_paths.as_mut_slice(),
             );
             self.clear_recovered_transaction();
@@ -1591,6 +1617,7 @@ pub struct OwnedTransactionArtifacts<'a> {
 /// manifest without performing heap allocation proportional to entry count.
 pub(crate) struct ManifestScratch<'a> {
     pub slots: &'a mut [ManifestEntrySlot],
+    pub directories: &'a mut [ManifestDirectorySlot],
     pub path_bytes: &'a mut [u8],
     pub serialization: &'a mut [u8],
 }
@@ -1613,6 +1640,7 @@ impl OwnedTransactionArtifacts<'_> {
     pub(crate) fn manifest_scratch(&mut self) -> ManifestScratch<'_> {
         ManifestScratch {
             slots: self.workspace.manifest_entries.as_mut_slice(),
+            directories: self.workspace.manifest_directories.as_mut_slice(),
             path_bytes: self.workspace.manifest_paths.as_mut_slice(),
             serialization: self.workspace.manifest_serialization.as_mut_slice(),
         }
@@ -1626,6 +1654,10 @@ impl OwnedTransactionArtifacts<'_> {
         (identity.device, identity.inode)
     }
 
+    pub(crate) fn final_root(&self) -> &Path {
+        self.workspace.paths[FINAL_ROOT_PATH].as_path()
+    }
+
     pub(crate) fn defer_recovery(self) {
         std::mem::forget(self);
     }
@@ -1633,8 +1665,8 @@ impl OwnedTransactionArtifacts<'_> {
     pub(crate) fn defer_completed_cleanup(self, kind: TransactionKind) {
         self.workspace.completed_publication = Some(CompletedPublicationCleanup {
             kind: match kind {
-                TransactionKind::Recall => PersistenceKind::Recall,
-                TransactionKind::Dump => PersistenceKind::Dump,
+                TransactionKind::FileSet | TransactionKind::Recall => PersistenceKind::Recall,
+                TransactionKind::AtomicDirectory | TransactionKind::Dump => PersistenceKind::Dump,
             },
         });
         std::mem::forget(self);

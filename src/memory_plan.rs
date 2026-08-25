@@ -21,10 +21,12 @@ pub const SPLIT_PART_SLOT_BYTES: u64 = 32;
 pub const FILE_WRITER_SLOT_BYTES: u64 = 256;
 pub const PATH_SLOT_METADATA_BYTES: u64 = 32;
 pub const MANIFEST_ENTRY_METADATA_BYTES: u64 = 128;
+pub const MANIFEST_DIRECTORY_METADATA_BYTES: u64 = 64;
 // A JSON string can encode one input byte as a six-byte `\u00xx` escape.
 pub const MANIFEST_PATH_ESCAPE_MULTIPLIER: u64 = 6;
 // Covers keys, punctuation, numeric dev/inode identities, and entry separators.
 pub const MANIFEST_JSON_ENTRY_OVERHEAD_BYTES: u64 = 256;
+pub const MANIFEST_JSON_DIRECTORY_OVERHEAD_BYTES: u64 = 192;
 // Covers the manifest envelope, version, transaction identity, and fixed fields.
 pub const MANIFEST_JSON_FIXED_OVERHEAD_BYTES: u64 = 1_024;
 pub const OPERATION_QUEUE_SLOT_BYTES: u64 = 256;
@@ -86,6 +88,7 @@ pub struct SessionMemoryPlan {
     output_file_slots: u64,
     path_slots: u64,
     manifest_paths_bytes: u64,
+    manifest_directory_slots: u64,
 }
 
 impl SessionMemoryPlan {
@@ -278,7 +281,25 @@ impl SessionMemoryPlan {
             MANIFEST_ENTRY_METADATA_BYTES,
         )
         .and_then(allocation_budget_bytes)?;
-        let manifest_path_entries = path_slot_count;
+        // A strict directory ancestor requires at least one component byte and
+        // one separator. Parent records reference a final-path prefix rather
+        // than duplicate a full path, so this is O(outputs * maximum_path).
+        let manifest_directory_slots = checked_mul(
+            "manifest directory slot count overflow",
+            part_slots,
+            inputs.maximum_path_bytes.div_ceil(2),
+        )?;
+        let manifest_directories = checked_mul(
+            "manifest directory metadata overflow",
+            manifest_directory_slots,
+            MANIFEST_DIRECTORY_METADATA_BYTES,
+        )
+        .and_then(allocation_budget_bytes)?;
+        let manifest_path_entries = checked_add(
+            "manifest entry path slot count overflow",
+            checked_mul("manifest entry path count overflow", part_slots, 3)?,
+            MANIFEST_FIXED_PATH_ENTRIES,
+        )?;
         let escaped_manifest_path_bytes = checked_mul(
             "escaped manifest path byte count overflow",
             inputs.maximum_path_bytes,
@@ -294,19 +315,24 @@ impl SessionMemoryPlan {
             manifest_path_entries,
             manifest_path_entry_bytes,
         )?;
+        let manifest_directory_serialization = checked_mul(
+            "manifest directory serialization overflow",
+            manifest_directory_slots,
+            MANIFEST_JSON_DIRECTORY_OVERHEAD_BYTES,
+        )?;
         let manifest_serialization_payload = checked_add(
             "manifest serialization payload overflow",
-            MANIFEST_JSON_FIXED_OVERHEAD_BYTES,
-            all_manifest_path_entries,
+            checked_add(
+                "manifest serialization total overflow",
+                MANIFEST_JSON_FIXED_OVERHEAD_BYTES,
+                all_manifest_path_entries,
+            )?,
+            manifest_directory_serialization,
         )?;
         let manifest_serialization = allocation_budget_bytes(manifest_serialization_payload)?;
         let manifest_paths_payload = checked_mul(
             "manifest path arena byte count overflow",
-            checked_add(
-                "manifest path arena slot count overflow",
-                checked_mul("manifest entry path slot count overflow", part_slots, 3)?,
-                MANIFEST_FIXED_PATH_ENTRIES,
-            )?,
+            manifest_path_entries,
             inputs.maximum_path_bytes,
         )?;
         let manifest_paths = allocation_budget_bytes(manifest_paths_payload)?;
@@ -420,6 +446,10 @@ impl SessionMemoryPlan {
                 bytes: manifest_entries,
             },
             MemoryComponent {
+                name: "manifest_directories",
+                bytes: manifest_directories,
+            },
+            MemoryComponent {
                 name: "manifest_serialization",
                 bytes: manifest_serialization,
             },
@@ -481,6 +511,7 @@ impl SessionMemoryPlan {
             output_file_slots: part_slots,
             path_slots: path_slot_count,
             manifest_paths_bytes: manifest_paths,
+            manifest_directory_slots,
         })
     }
 
@@ -580,6 +611,10 @@ impl SessionMemoryPlan {
 
     pub fn manifest_paths_bytes(&self) -> u64 {
         self.manifest_paths_bytes
+    }
+
+    pub fn manifest_directory_slots(&self) -> u64 {
+        self.manifest_directory_slots
     }
 
     pub fn validate_max(&self, maximum: Option<u64>) -> Result<()> {

@@ -4,7 +4,8 @@ use lamb::memory_plan::{
     MaterializedBuffer, SessionMemoryInputs, SessionMemoryPlan, ACTIVITY_DETECTOR_STATE_SLOT_BYTES,
     ALLOCATOR_HEADER_RESERVE_BYTES, CAPTURE_COMMAND_RESULT_SLOT_BYTES,
     CAPTURE_QUEUE_SLOT_METADATA_BYTES, FILE_WRITER_SLOT_BYTES, FROZEN_EXPORT_DECISION_SLOT_BYTES,
-    MANIFEST_ENTRY_METADATA_BYTES, MANIFEST_FIXED_PATH_ENTRIES, MANIFEST_JSON_ENTRY_OVERHEAD_BYTES,
+    MANIFEST_DIRECTORY_METADATA_BYTES, MANIFEST_ENTRY_METADATA_BYTES, MANIFEST_FIXED_PATH_ENTRIES,
+    MANIFEST_JSON_DIRECTORY_OVERHEAD_BYTES, MANIFEST_JSON_ENTRY_OVERHEAD_BYTES,
     MANIFEST_JSON_FIXED_OVERHEAD_BYTES, MANIFEST_PATH_ESCAPE_MULTIPLIER,
     OPERATION_QUEUE_SLOT_BYTES, OUTPUT_PATH_SLOTS_PER_PART, PATH_SLOT_METADATA_BYTES,
     RING_CHUNK_OBJECT_RESERVE_BYTES, RING_FIXED_METADATA_RESERVE_BYTES,
@@ -109,6 +110,7 @@ fn plan_components_match_concrete_small_input_formulas() {
     let parts_per_channel = 5;
     let part_slots = parts_per_channel * 2;
     let path_slots = part_slots * OUTPUT_PATH_SLOTS_PER_PART + MANIFEST_FIXED_PATH_ENTRIES;
+    let directory_slots = part_slots * 128_u64.div_ceil(2);
     let chunk_sample_bytes = 4 * 2 * 4;
     let scratch_bytes = 4 * 2 * 4;
     let capture_slot_sample_bytes = 4 * 2 * 4;
@@ -194,13 +196,19 @@ fn plan_components_match_concrete_small_input_formulas() {
         plan.component("manifest_serialization").unwrap().bytes,
         allocation(
             MANIFEST_JSON_FIXED_OVERHEAD_BYTES
-                + path_slots
+                + (3 * part_slots + MANIFEST_FIXED_PATH_ENTRIES)
                     * (128 * MANIFEST_PATH_ESCAPE_MULTIPLIER + MANIFEST_JSON_ENTRY_OVERHEAD_BYTES)
+                + directory_slots * MANIFEST_JSON_DIRECTORY_OVERHEAD_BYTES
         )
     );
     assert_eq!(
         plan.component("manifest_paths").unwrap().bytes,
         allocation((3 * part_slots + MANIFEST_FIXED_PATH_ENTRIES) * 128)
+    );
+    assert_eq!(plan.manifest_directory_slots(), directory_slots);
+    assert_eq!(
+        plan.component("manifest_directories").unwrap().bytes,
+        allocation(directory_slots * MANIFEST_DIRECTORY_METADATA_BYTES)
     );
     assert_eq!(
         plan.component("operation_worker_stack").unwrap().bytes,
@@ -432,22 +440,30 @@ fn component_budgets_scale_with_channels_parts_and_queue_capacity() {
 }
 
 #[test]
-fn manifest_budget_covers_two_escaped_paths_per_part_and_five_fixed_paths() {
+fn manifest_budget_is_linear_in_output_count_and_maximum_path_bytes() {
     let mut values = inputs();
     values.maximum_path_bytes = 4_096;
     let plan = SessionMemoryPlan::calculate(values).unwrap();
     let output_parts = 5 * 2;
-    let manifest_path_entries =
-        output_parts * OUTPUT_PATH_SLOTS_PER_PART + MANIFEST_FIXED_PATH_ENTRIES;
+    let directory_slots = output_parts * 4_096_u64.div_ceil(2);
+    let manifest_path_entries = output_parts * 3 + MANIFEST_FIXED_PATH_ENTRIES;
     let payload = MANIFEST_JSON_FIXED_OVERHEAD_BYTES
         + manifest_path_entries
-            * (4_096 * MANIFEST_PATH_ESCAPE_MULTIPLIER + MANIFEST_JSON_ENTRY_OVERHEAD_BYTES);
+            * (4_096 * MANIFEST_PATH_ESCAPE_MULTIPLIER + MANIFEST_JSON_ENTRY_OVERHEAD_BYTES)
+        + directory_slots * MANIFEST_JSON_DIRECTORY_OVERHEAD_BYTES;
 
-    assert_eq!(manifest_path_entries, 25);
+    assert_eq!(directory_slots, 20_480);
     assert_eq!(
         plan.component("manifest_serialization").unwrap().bytes,
         allocation_budget_bytes(payload).unwrap()
     );
+    let old_quadratic_payload = MANIFEST_JSON_FIXED_OVERHEAD_BYTES
+        + (manifest_path_entries + output_parts * 4_096)
+            * (4_096 * MANIFEST_PATH_ESCAPE_MULTIPLIER + MANIFEST_JSON_ENTRY_OVERHEAD_BYTES)
+        + output_parts
+            * 4_096
+            * (4_096 * MANIFEST_PATH_ESCAPE_MULTIPLIER + MANIFEST_JSON_DIRECTORY_OVERHEAD_BYTES);
+    assert!(payload < old_quadratic_payload / 100);
 }
 
 #[test]

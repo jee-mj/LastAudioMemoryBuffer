@@ -13,14 +13,20 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(not(target_os = "linux"))]
 compile_error!("LAMB transactional persistence requires Linux renameat2 and directory fsync");
 
-pub const MANIFEST_VERSION: u32 = 1;
+/// Version 2 records publication strategy. Version 1 is read-only legacy.
+pub const MANIFEST_VERSION: u32 = 2;
+pub const LEGACY_MANIFEST_VERSION: u32 = 1;
 pub const RECALL_MANIFEST_NAME: &str = "manifest.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransactionKind {
+    /// Version-one FileSet spelling; current publishers never write it.
     Recall,
+    /// Version-one AtomicDirectory spelling; current publishers never write it.
     Dump,
+    FileSet,
+    AtomicDirectory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +75,24 @@ pub struct ManifestEntrySlot {
     pub partial_identity: Option<FileIdentity>,
     pub final_path: PathRef,
     pub final_identity: Option<FileIdentity>,
+}
+
+/// A FileSet parent which this transaction intended to create.  `Intent` is
+/// written before mkdir; it deliberately has no identity and is never removed
+/// by recovery.  `Owned` is written only after mkdir and identity capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestDirectoryState {
+    Intent,
+    Owned,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ManifestDirectorySlot {
+    pub entry_index: u32,
+    pub prefix_len: u32,
+    pub state: Option<ManifestDirectoryState>,
+    pub identity: Option<FileIdentity>,
 }
 
 /// Preallocated byte arena backing manifest path strings.
@@ -135,18 +159,32 @@ pub struct TransactionManifest<'a> {
     pub final_directory_identity: Option<FileIdentity>,
     pub entry_count: usize,
     slots: &'a mut [ManifestEntrySlot],
+    directory_slots: &'a mut [ManifestDirectorySlot],
+    pub directory_count: usize,
+    directory_journal_present: bool,
     path_arena: PathArena<'a>,
 }
 
 impl<'a> TransactionManifest<'a> {
     pub fn new(slots: &'a mut [ManifestEntrySlot], path_bytes: &'a mut [u8]) -> Self {
+        Self::new_with_directories(slots, &mut [], path_bytes)
+    }
+
+    pub fn new_with_directories(
+        slots: &'a mut [ManifestEntrySlot],
+        directory_slots: &'a mut [ManifestDirectorySlot],
+        path_bytes: &'a mut [u8],
+    ) -> Self {
         for slot in slots.iter_mut() {
             *slot = ManifestEntrySlot::default();
+        }
+        for slot in directory_slots.iter_mut() {
+            *slot = ManifestDirectorySlot::default();
         }
         Self {
             version: 0,
             uid: 0,
-            kind: TransactionKind::Recall,
+            kind: TransactionKind::FileSet,
             phase: ManifestPhase::Prepared,
             transaction_id: PathRef::default(),
             staging_root_path: PathRef::default(),
@@ -156,6 +194,9 @@ impl<'a> TransactionManifest<'a> {
             final_directory_identity: None,
             entry_count: 0,
             slots,
+            directory_slots,
+            directory_count: 0,
+            directory_journal_present: true,
             path_arena: PathArena::new(path_bytes),
         }
     }
@@ -196,6 +237,58 @@ impl<'a> TransactionManifest<'a> {
         }
         self.entry_count = count;
         Ok(())
+    }
+
+    pub fn directory_capacity(&self) -> usize {
+        self.directory_slots.len()
+    }
+
+    pub fn directories(&self) -> &[ManifestDirectorySlot] {
+        &self.directory_slots[..self.directory_count]
+    }
+
+    pub fn directory_mut(&mut self, index: usize) -> Result<&mut ManifestDirectorySlot> {
+        self.directory_slots.get_mut(index).ok_or_else(|| {
+            LambError::Validation("manifest exceeds the reserved directory capacity".to_string())
+        })
+    }
+
+    pub fn push_directory_intent(
+        &mut self,
+        entry_index: usize,
+        prefix_len: usize,
+    ) -> Result<usize> {
+        if self.directory_count >= self.directory_slots.len() {
+            return Err(LambError::Validation(
+                "manifest exceeds the reserved directory capacity".to_string(),
+            ));
+        }
+        let index = self.directory_count;
+        self.directory_slots[index] = ManifestDirectorySlot {
+            entry_index: u32::try_from(entry_index)
+                .map_err(|_| LambError::Validation("directory entry index overflow".to_string()))?,
+            prefix_len: u32::try_from(prefix_len).map_err(|_| {
+                LambError::Validation("directory prefix length overflow".to_string())
+            })?,
+            state: Some(ManifestDirectoryState::Intent),
+            identity: None,
+        };
+        self.directory_count += 1;
+        Ok(index)
+    }
+
+    pub fn directory_path(&self, slot: &ManifestDirectorySlot) -> Result<&Path> {
+        let entry = self
+            .entries()
+            .get(slot.entry_index as usize)
+            .ok_or_else(|| {
+                LambError::Validation("directory entry index exceeds manifest entries".to_string())
+            })?;
+        let final_path = self.path_ref(entry.final_path);
+        let prefix = final_path.get(..slot.prefix_len as usize).ok_or_else(|| {
+            LambError::Validation("directory prefix is not a UTF-8 boundary".to_string())
+        })?;
+        Ok(Path::new(prefix))
     }
 
     pub fn final_directory(&self) -> Option<(&Path, Option<FileIdentity>)> {
@@ -286,7 +379,12 @@ impl Serialize for TransactionManifest<'_> {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("TransactionManifest", 9)?;
+        let fields = if self.version == MANIFEST_VERSION {
+            10
+        } else {
+            9
+        };
+        let mut state = serializer.serialize_struct("TransactionManifest", fields)?;
         state.serialize_field("version", &self.version)?;
         state.serialize_field("uid", &self.uid)?;
         state.serialize_field("transaction_id", self.transaction_id_str())?;
@@ -302,6 +400,49 @@ impl Serialize for TransactionManifest<'_> {
         state.serialize_field("output_root", &PathDisplay(self.path(self.output_root)))?;
         state.serialize_field("final_directory", &ManifestDirectorySer { manifest: self })?;
         state.serialize_field("entries", &ManifestEntriesSer { manifest: self })?;
+        if self.version == MANIFEST_VERSION {
+            state.serialize_field(
+                "created_directories",
+                &ManifestDirectoriesSer { manifest: self },
+            )?;
+        }
+        state.end()
+    }
+}
+
+struct ManifestDirectoriesSer<'a> {
+    manifest: &'a TransactionManifest<'a>,
+}
+
+impl Serialize for ManifestDirectoriesSer<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.manifest.directory_count))?;
+        for slot in self.manifest.directories() {
+            seq.serialize_element(&ManifestCreatedDirectorySer { slot })?;
+        }
+        seq.end()
+    }
+}
+
+struct ManifestCreatedDirectorySer<'a> {
+    slot: &'a ManifestDirectorySlot,
+}
+
+impl Serialize for ManifestCreatedDirectorySer<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ManifestCreatedDirectory", 4)?;
+        state.serialize_field("entry_index", &self.slot.entry_index)?;
+        state.serialize_field("prefix_len", &self.slot.prefix_len)?;
+        state.serialize_field("state", &self.slot.state)?;
+        state.serialize_field("identity", &self.slot.identity)?;
         state.end()
     }
 }
@@ -390,16 +531,29 @@ impl Serialize for ManifestEntrySer<'_> {
 // arena in place, streaming entries without a heap `Vec` or `PathBuf`.
 pub struct ManifestParseSeed<'a> {
     slots: &'a mut [ManifestEntrySlot],
+    directory_slots: &'a mut [ManifestDirectorySlot],
     path_arena: PathArena<'a>,
 }
 
 impl<'a> ManifestParseSeed<'a> {
     pub fn new(slots: &'a mut [ManifestEntrySlot], path_bytes: &'a mut [u8]) -> Self {
+        Self::new_with_directories(slots, &mut [], path_bytes)
+    }
+
+    pub fn new_with_directories(
+        slots: &'a mut [ManifestEntrySlot],
+        directory_slots: &'a mut [ManifestDirectorySlot],
+        path_bytes: &'a mut [u8],
+    ) -> Self {
         for slot in slots.iter_mut() {
             *slot = ManifestEntrySlot::default();
         }
+        for slot in directory_slots.iter_mut() {
+            *slot = ManifestDirectorySlot::default();
+        }
         Self {
             slots,
+            directory_slots,
             path_arena: PathArena::new(path_bytes),
         }
     }
@@ -414,6 +568,7 @@ impl<'de, 'a> serde::de::DeserializeSeed<'de> for ManifestParseSeed<'a> {
     {
         struct Visitor<'a> {
             slots: &'a mut [ManifestEntrySlot],
+            directory_slots: &'a mut [ManifestDirectorySlot],
             path_arena: PathArena<'a>,
         }
 
@@ -441,6 +596,9 @@ impl<'de, 'a> serde::de::DeserializeSeed<'de> for ManifestParseSeed<'a> {
                     final_directory_identity: None,
                     entry_count: 0,
                     slots: self.slots,
+                    directory_slots: self.directory_slots,
+                    directory_count: 0,
+                    directory_journal_present: false,
                     path_arena: self.path_arena,
                 };
 
@@ -496,6 +654,17 @@ impl<'de, 'a> serde::de::DeserializeSeed<'de> for ManifestParseSeed<'a> {
                                 manifest: &mut manifest,
                             })?;
                         }
+                        "created_directories" => {
+                            if manifest.directory_journal_present {
+                                return Err(serde::de::Error::custom(
+                                    "duplicate created_directories field",
+                                ));
+                            }
+                            manifest.directory_journal_present = true;
+                            manifest.directory_count = map.next_value_seed(DirectoriesSeed {
+                                manifest: &mut manifest,
+                            })?;
+                        }
                         _ => {
                             return Err(serde::de::Error::custom(format!(
                                 "unknown manifest field {key}"
@@ -509,6 +678,7 @@ impl<'de, 'a> serde::de::DeserializeSeed<'de> for ManifestParseSeed<'a> {
 
         deserializer.deserialize_map(Visitor {
             slots: self.slots,
+            directory_slots: self.directory_slots,
             path_arena: self.path_arena,
         })
     }
@@ -662,6 +832,117 @@ impl<'de, 'b, 'a> serde::de::DeserializeSeed<'de> for EntriesSeed<'b, 'a> {
 struct EntrySlotSeed<'b, 'a> {
     manifest: &'b mut TransactionManifest<'a>,
     index: usize,
+}
+
+struct DirectoriesSeed<'b, 'a> {
+    manifest: &'b mut TransactionManifest<'a>,
+}
+
+impl<'de, 'b, 'a> serde::de::DeserializeSeed<'de> for DirectoriesSeed<'b, 'a> {
+    type Value = usize;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<usize, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct V<'b, 'a>(&'b mut TransactionManifest<'a>);
+        impl<'de, 'b, 'a> serde::de::Visitor<'de> for V<'b, 'a> {
+            type Value = usize;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of created directory records")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<usize, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut count = 0;
+                while let Some(()) = seq.next_element_seed(DirectorySlotSeed {
+                    manifest: &mut *self.0,
+                    index: count,
+                })? {
+                    count += 1;
+                }
+                Ok(count)
+            }
+        }
+        deserializer.deserialize_seq(V(self.manifest))
+    }
+}
+
+struct DirectorySlotSeed<'b, 'a> {
+    manifest: &'b mut TransactionManifest<'a>,
+    index: usize,
+}
+
+impl<'de, 'b, 'a> serde::de::DeserializeSeed<'de> for DirectorySlotSeed<'b, 'a> {
+    type Value = ();
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct V<'b, 'a> {
+            manifest: &'b mut TransactionManifest<'a>,
+            index: usize,
+        }
+        impl<'de, 'b, 'a> serde::de::Visitor<'de> for V<'b, 'a> {
+            type Value = ();
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a created directory record")
+            }
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut entry_index = None;
+                let mut prefix_len = None;
+                let mut state = None;
+                let mut identity = None;
+                while let Some(key) = map.next_key::<&str>()? {
+                    match key {
+                        "entry_index" if entry_index.is_none() => {
+                            entry_index = Some(map.next_value()?)
+                        }
+                        "prefix_len" if prefix_len.is_none() => {
+                            prefix_len = Some(map.next_value()?)
+                        }
+                        "state" if state.is_none() => state = Some(map.next_value()?),
+                        "identity" if identity.is_none() => identity = Some(map.next_value()?),
+                        "entry_index" | "prefix_len" | "state" | "identity" => {
+                            return Err(serde::de::Error::custom(
+                                "duplicate created directory field",
+                            ))
+                        }
+                        _ => return Err(serde::de::Error::custom(format!("unknown field {key}"))),
+                    }
+                }
+                let slot = self
+                    .manifest
+                    .directory_slots
+                    .get_mut(self.index)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("manifest exceeds directory capacity")
+                    })?;
+                slot.entry_index = entry_index.ok_or_else(|| {
+                    serde::de::Error::custom("created directory entry index missing")
+                })?;
+                slot.prefix_len = prefix_len.ok_or_else(|| {
+                    serde::de::Error::custom("created directory prefix length missing")
+                })?;
+                slot.state =
+                    Some(state.ok_or_else(|| {
+                        serde::de::Error::custom("created directory state missing")
+                    })?);
+                slot.identity = identity.ok_or_else(|| {
+                    serde::de::Error::custom("created directory identity missing")
+                })?;
+                Ok(())
+            }
+        }
+        deserializer.deserialize_map(V {
+            manifest: self.manifest,
+            index: self.index,
+        })
+    }
 }
 
 impl<'de, 'b, 'a> serde::de::DeserializeSeed<'de> for EntrySlotSeed<'b, 'a> {
@@ -913,12 +1194,22 @@ impl<'a> ManifestStore<'a> {
         slots: &'b mut [ManifestEntrySlot],
         path_bytes: &'b mut [u8],
     ) -> Result<(TransactionManifest<'b>, FileIdentity)> {
+        self.read_with_identity_directories(manifest_path, slots, &mut [], path_bytes)
+    }
+
+    pub fn read_with_identity_directories<'b>(
+        &mut self,
+        manifest_path: &Path,
+        slots: &'b mut [ManifestEntrySlot],
+        directory_slots: &'b mut [ManifestDirectorySlot],
+        path_bytes: &'b mut [u8],
+    ) -> Result<(TransactionManifest<'b>, FileIdentity)> {
         let used = self.read_file_bounded(manifest_path)?;
         let identity = read_manifest_identity(manifest_path).map_err(|source| {
             LambError::Validation(format!("failed to read manifest identity: {source}"))
         })?;
         let mut deserializer = serde_json::Deserializer::from_slice(&self.buffer[..used]);
-        let manifest = ManifestParseSeed::new(slots, path_bytes)
+        let manifest = ManifestParseSeed::new_with_directories(slots, directory_slots, path_bytes)
             .deserialize(&mut deserializer)
             .map_err(|error| {
                 LambError::Validation(format!("malformed transaction manifest: {error}"))
@@ -1000,12 +1291,34 @@ pub fn recover_recall_root(
     slots: &mut [ManifestEntrySlot],
     path_bytes: &mut [u8],
 ) -> Result<RecoveryOutcome> {
+    recover_recall_root_with_directories(
+        transaction_root,
+        output_root,
+        buffer,
+        slots,
+        &mut [],
+        path_bytes,
+    )
+}
+
+pub fn recover_recall_root_with_directories(
+    transaction_root: &Path,
+    output_root: &Path,
+    buffer: &mut [u8],
+    slots: &mut [ManifestEntrySlot],
+    directory_slots: &mut [ManifestDirectorySlot],
+    path_bytes: &mut [u8],
+) -> Result<RecoveryOutcome> {
     let manifest_path = transaction_root.join(RECALL_MANIFEST_NAME);
-    let (manifest, manifest_identity) =
-        ManifestStore::new(buffer).read_with_identity(&manifest_path, slots, path_bytes)?;
+    let (manifest, manifest_identity) = ManifestStore::new(buffer).read_with_identity_directories(
+        &manifest_path,
+        slots,
+        directory_slots,
+        path_bytes,
+    )?;
     validate_manifest(
         &manifest,
-        TransactionKind::Recall,
+        TransactionKind::FileSet,
         transaction_root,
         output_root,
         &manifest_path,
@@ -1019,7 +1332,7 @@ pub fn recover_recall_root(
             let (final_path, _) = manifest.final_of(entry);
             sync_regular_file(final_path, identity)?;
         }
-        sync_directory(output_root)?;
+        sync_file_set_directories(&manifest, output_root)?;
         best_effort_remove_recall_metadata(&manifest, &manifest_path, manifest_identity);
         if let Some(parent) = manifest.path(manifest.staging_root_path).parent() {
             let _ = sync_directory(parent);
@@ -1040,6 +1353,16 @@ pub fn recover_recall_root(
     }
     if pending {
         return Ok(RecoveryOutcome::Pending);
+    }
+    // Directory cleanup is best-effort: an owned directory made nonempty by a
+    // foreign sibling must not strand an otherwise resolved transaction.
+    for directory in manifest.directories().iter().rev() {
+        if directory.state == Some(ManifestDirectoryState::Owned) {
+            let _ = remove_directory_if_identity(
+                manifest.directory_path(directory)?,
+                directory.identity,
+            )?;
+        }
     }
     let staging_root = manifest.path(manifest.staging_root_path);
     if !directory_contains_only(staging_root, &manifest_path)? {
@@ -1063,7 +1386,7 @@ pub fn recover_dump_parent(
         ManifestStore::new(buffer).read_with_identity(manifest_path, slots, path_bytes)?;
     validate_manifest(
         &manifest,
-        TransactionKind::Dump,
+        TransactionKind::AtomicDirectory,
         manifest.path(manifest.staging_root_path),
         output_parent,
         manifest_path,
@@ -1174,6 +1497,24 @@ pub fn recover_recall_staging_root(
     path_bytes: &mut [u8],
     buffer: &mut [u8],
 ) -> RecoveryScanSummary {
+    recover_recall_staging_root_with_directories(
+        staging_root,
+        output_root,
+        slots,
+        &mut [],
+        path_bytes,
+        buffer,
+    )
+}
+
+pub fn recover_recall_staging_root_with_directories(
+    staging_root: &Path,
+    output_root: &Path,
+    slots: &mut [ManifestEntrySlot],
+    directory_slots: &mut [ManifestDirectorySlot],
+    path_bytes: &mut [u8],
+    buffer: &mut [u8],
+) -> RecoveryScanSummary {
     let mut summary = RecoveryScanSummary::default();
     let Ok(entries) = fs::read_dir(staging_root) else {
         return summary;
@@ -1188,7 +1529,14 @@ pub fn recover_recall_staging_root(
             continue;
         }
         summary.discovered += 1;
-        match recover_recall_root(&path, output_root, buffer, slots, path_bytes) {
+        match recover_recall_root_with_directories(
+            &path,
+            output_root,
+            buffer,
+            slots,
+            directory_slots,
+            path_bytes,
+        ) {
             Ok(RecoveryOutcome::Complete) => summary.completed += 1,
             Ok(RecoveryOutcome::RolledBack) => summary.rolled_back += 1,
             Ok(RecoveryOutcome::Pending) => {
@@ -1280,11 +1628,25 @@ fn sync_owned_directory(path: &Path, expected: FileIdentity) -> Result<()> {
 }
 
 fn validate_manifest_basics(manifest: &TransactionManifest) -> Result<()> {
-    if manifest.version != MANIFEST_VERSION {
+    if manifest.version != MANIFEST_VERSION && manifest.version != LEGACY_MANIFEST_VERSION {
         return Err(LambError::Validation(format!(
             "unsupported transaction manifest version {}",
             manifest.version
         )));
+    }
+    if !matches!(
+        (manifest.version, manifest.kind),
+        (
+            LEGACY_MANIFEST_VERSION,
+            TransactionKind::Recall | TransactionKind::Dump
+        ) | (
+            MANIFEST_VERSION,
+            TransactionKind::FileSet | TransactionKind::AtomicDirectory
+        )
+    ) {
+        return Err(LambError::Validation(
+            "transaction manifest version and strategy do not match".to_string(),
+        ));
     }
     if manifest.uid != unsafe { libc::geteuid() } {
         return Err(LambError::Validation(
@@ -1295,6 +1657,16 @@ fn validate_manifest_basics(manifest: &TransactionManifest) -> Result<()> {
     if manifest.entry_count == 0 {
         return Err(LambError::Validation(
             "transaction manifest has no file entries".to_string(),
+        ));
+    }
+    if manifest.version == MANIFEST_VERSION && !manifest.directory_journal_present {
+        return Err(LambError::Validation(
+            "version-two manifest omits created directory journal".to_string(),
+        ));
+    }
+    if manifest.version == LEGACY_MANIFEST_VERSION && manifest.directory_count != 0 {
+        return Err(LambError::Validation(
+            "version-one manifest may not contain created directory journal".to_string(),
         ));
     }
     Ok(())
@@ -1308,7 +1680,26 @@ fn validate_manifest(
     manifest_path: &Path,
 ) -> Result<()> {
     validate_manifest_basics(manifest)?;
-    if manifest.kind != expected_kind {
+    if !matches!(
+        (expected_kind, manifest.version, manifest.kind),
+        (
+            TransactionKind::FileSet,
+            LEGACY_MANIFEST_VERSION,
+            TransactionKind::Recall
+        ) | (
+            TransactionKind::AtomicDirectory,
+            LEGACY_MANIFEST_VERSION,
+            TransactionKind::Dump
+        ) | (
+            TransactionKind::FileSet,
+            MANIFEST_VERSION,
+            TransactionKind::FileSet
+        ) | (
+            TransactionKind::AtomicDirectory,
+            MANIFEST_VERSION,
+            TransactionKind::AtomicDirectory
+        )
+    ) {
         return Err(LambError::Validation(
             "transaction manifest kind does not match recovery API".to_string(),
         ));
@@ -1330,8 +1721,9 @@ fn validate_manifest(
     let staging_name = staging_root_path.file_name().and_then(|name| name.to_str());
     let transaction_id = manifest.transaction_id_str();
     let expected_staging_name = match expected_kind {
-        TransactionKind::Recall => transaction_id.to_string(),
-        TransactionKind::Dump => format!(".tmp-lamb-{transaction_id}"),
+        TransactionKind::FileSet => transaction_id.to_string(),
+        TransactionKind::AtomicDirectory => format!(".tmp-lamb-{transaction_id}"),
+        TransactionKind::Recall | TransactionKind::Dump => unreachable!("strategy only"),
     };
     if staging_name != Some(expected_staging_name.as_str()) {
         return Err(LambError::Validation(
@@ -1345,7 +1737,7 @@ fn validate_manifest(
             ));
         }
     }
-    if expected_kind == TransactionKind::Recall {
+    if expected_kind == TransactionKind::FileSet {
         if manifest_path != expected_staging_root.join(RECALL_MANIFEST_NAME) {
             return Err(LambError::Validation(
                 "recall manifest is not inside its transaction directory".to_string(),
@@ -1367,7 +1759,7 @@ fn validate_manifest(
     let mut paths = HashSet::new();
     insert_unique_path(&mut paths, staging_root_path)?;
     insert_unique_path(&mut paths, manifest_path)?;
-    if expected_kind == TransactionKind::Dump {
+    if expected_kind == TransactionKind::AtomicDirectory {
         let (final_directory_path, _) = manifest.final_directory().ok_or_else(|| {
             LambError::Validation("dump manifest has no final directory".to_string())
         })?;
@@ -1377,6 +1769,54 @@ fn validate_manifest(
     } else if manifest.final_directory().is_some() {
         return Err(LambError::Validation(
             "recall manifest must not name a final directory".to_string(),
+        ));
+    }
+
+    if expected_kind == TransactionKind::FileSet {
+        for (index, directory) in manifest.directories().iter().enumerate() {
+            let path = manifest.directory_path(directory)?;
+            let entry = manifest
+                .entries()
+                .get(directory.entry_index as usize)
+                .ok_or_else(|| {
+                    LambError::Validation(
+                        "directory entry index exceeds sparse entry count".to_string(),
+                    )
+                })?;
+            let (final_path, _) = manifest.final_of(entry);
+            validate_contained(expected_output_root, path)?;
+            validate_contained(path, final_path)?;
+            if path == expected_output_root {
+                return Err(LambError::Validation(
+                    "created directory journal may not own output root".to_string(),
+                ));
+            }
+            for previous in &manifest.directories()[..index] {
+                let previous = manifest.directory_path(previous)?;
+                if previous == path {
+                    return Err(LambError::Validation(
+                        "created directory journal contains duplicate derived path".to_string(),
+                    ));
+                }
+                if previous.starts_with(path) && previous != path {
+                    return Err(LambError::Validation(
+                        "created directory journal is not parent-first".to_string(),
+                    ));
+                }
+            }
+            match (directory.state, directory.identity) {
+                (Some(ManifestDirectoryState::Intent), None)
+                | (Some(ManifestDirectoryState::Owned), Some(_)) => {}
+                _ => {
+                    return Err(LambError::Validation(
+                        "created directory journal state and identity disagree".to_string(),
+                    ))
+                }
+            }
+        }
+    } else if manifest.directory_count != 0 {
+        return Err(LambError::Validation(
+            "atomic-directory manifest may not contain created directory journal".to_string(),
         ));
     }
 
@@ -1391,12 +1831,18 @@ fn validate_manifest(
                 .ok_or_else(|| LambError::Validation("staged path has no parent".to_string()))?,
             staged_path,
         )?;
-        if expected_kind == TransactionKind::Recall {
+        if expected_kind == TransactionKind::FileSet {
             let (partial_path, _) = manifest.partial(entry).ok_or_else(|| {
                 LambError::Validation("recall entry has no adjacent partial path".to_string())
             })?;
-            validate_direct_child(expected_output_root, partial_path)?;
-            validate_direct_child(expected_output_root, final_path)?;
+            let final_parent = final_path
+                .parent()
+                .ok_or_else(|| LambError::Validation("final path has no parent".to_string()))?;
+            if partial_path.parent() != Some(final_parent) {
+                return Err(LambError::Validation(
+                    "file-set partial is not adjacent to its final".to_string(),
+                ));
+            }
             let partial_name = partial_path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -1434,7 +1880,10 @@ fn validate_manifest(
 }
 
 fn validate_phase_state(manifest: &TransactionManifest) -> Result<()> {
-    if manifest.kind == TransactionKind::Dump {
+    if matches!(
+        manifest.kind,
+        TransactionKind::Dump | TransactionKind::AtomicDirectory
+    ) {
         if matches!(manifest.phase, ManifestPhase::Publishing { .. }) {
             return Err(LambError::Validation(
                 "dump manifest has an impossible publishing phase".to_string(),
@@ -1503,7 +1952,10 @@ fn validate_phase_state(manifest: &TransactionManifest) -> Result<()> {
 }
 
 fn complete_final_set(manifest: &TransactionManifest) -> Result<bool> {
-    if manifest.kind == TransactionKind::Dump {
+    if matches!(
+        manifest.kind,
+        TransactionKind::Dump | TransactionKind::AtomicDirectory
+    ) {
         let Some((final_directory_path, identity)) = manifest.final_directory() else {
             return Ok(false);
         };
@@ -1525,6 +1977,46 @@ fn complete_final_set(manifest: &TransactionManifest) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// Synchronizes FileSet parents without an allocation-backed traversal. Entries
+/// are already sparse and ordered deterministically; scanning prior entries
+/// suppresses repeated ancestors while each path is visited root-first.
+fn sync_file_set_directories(manifest: &TransactionManifest, output_root: &Path) -> Result<()> {
+    sync_directory(output_root)?;
+    for (index, entry) in manifest.entries().iter().enumerate() {
+        let (final_path, _) = manifest.final_of(entry);
+        let Some(parent) = final_path.parent() else {
+            continue;
+        };
+        let root = output_root
+            .to_str()
+            .ok_or_else(|| LambError::Validation("output root is not valid UTF-8".to_string()))?;
+        let parent = parent
+            .to_str()
+            .ok_or_else(|| LambError::Validation("final parent is not valid UTF-8".to_string()))?;
+        let mut end = root.len();
+        while end < parent.len() {
+            end = parent[end + 1..]
+                .find('/')
+                .map(|offset| end + 1 + offset)
+                .unwrap_or(parent.len());
+            let candidate = Path::new(&parent[..end]);
+            let seen = manifest.entries()[..index].iter().any(|prior| {
+                let (prior_final, _) = manifest.final_of(prior);
+                prior_final
+                    .parent()
+                    .is_some_and(|prior_parent| prior_parent.starts_with(candidate))
+            });
+            if !seen {
+                sync_directory(candidate)?;
+            }
+            if end == parent.len() {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn inferred_final_identity(
@@ -1631,7 +2123,10 @@ fn validate_identity_uniqueness(manifest: &TransactionManifest) -> Result<()> {
                 ));
             }
         }
-        if manifest.kind == TransactionKind::Recall {
+        if matches!(
+            manifest.kind,
+            TransactionKind::Recall | TransactionKind::FileSet
+        ) {
             for identity in [entry.partial_identity, entry.final_identity]
                 .into_iter()
                 .flatten()
@@ -1641,6 +2136,15 @@ fn validate_identity_uniqueness(manifest: &TransactionManifest) -> Result<()> {
                         "transaction manifest contains duplicate owned identity".to_string(),
                     ));
                 }
+            }
+        }
+    }
+    for directory in manifest.directories() {
+        if let Some(identity) = directory.identity {
+            if !identities.insert((identity.device, identity.inode)) {
+                return Err(LambError::Validation(
+                    "transaction manifest contains duplicate owned identity".to_string(),
+                ));
             }
         }
     }
