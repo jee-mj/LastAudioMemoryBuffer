@@ -31,6 +31,10 @@ pub const OPERATION_QUEUE_SLOT_BYTES: u64 = 256;
 pub const RUNTIME_METADATA_RESERVE_BYTES: u64 = 512;
 pub const CAPTURE_QUEUE_SLOT_METADATA_BYTES: u64 = 64;
 pub const CAPTURE_COMMAND_RESULT_SLOT_BYTES: u64 = 512;
+// ExactArray payload slots. Activity owns compile-time assertions that tie these
+// module-cycle-free plan constants to the concrete private detector layouts.
+pub const FROZEN_EXPORT_DECISION_SLOT_BYTES: u64 = 24;
+pub const ACTIVITY_DETECTOR_CHANNEL_WORKSPACE_BYTES: u64 = 128;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SessionMemoryInputs {
@@ -314,6 +318,20 @@ impl SessionMemoryPlan {
         .and_then(allocation_budget_bytes)?;
         let operation_worker_stack = allocation_budget_bytes(inputs.worker_stack_bytes)?;
         let runtime_fixed_metadata = allocation_budget_bytes(RUNTIME_METADATA_RESERVE_BYTES)?;
+        let frozen_export_decisions = checked_mul(
+            "frozen export decision storage overflow",
+            u64::from(inputs.channels),
+            FROZEN_EXPORT_DECISION_SLOT_BYTES,
+        )?;
+        let activity_detector_workspace = checked_add(
+            "activity detector workspace overflow",
+            checked_mul(
+                "activity detector channel workspace overflow",
+                u64::from(inputs.channels),
+                ACTIVITY_DETECTOR_CHANNEL_WORKSPACE_BYTES,
+            )?,
+            interleaved_scratch,
+        )?;
 
         let components = vec![
             MemoryComponent {
@@ -403,6 +421,14 @@ impl SessionMemoryPlan {
             MemoryComponent {
                 name: "runtime_fixed_metadata",
                 bytes: runtime_fixed_metadata,
+            },
+            MemoryComponent {
+                name: "frozen_export_decisions",
+                bytes: frozen_export_decisions,
+            },
+            MemoryComponent {
+                name: "activity_detector_workspace",
+                bytes: activity_detector_workspace,
             },
         ];
         let committed_bytes = components.iter().try_fold(0_u64, |total, component| {

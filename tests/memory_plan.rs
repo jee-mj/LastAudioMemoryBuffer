@@ -1,12 +1,13 @@
 use lamb::error::LambError;
 use lamb::memory_plan::{
     allocation_budget_bytes, required_bytes_with_headroom, ExactArray, Materializable,
-    MaterializedBuffer, SessionMemoryInputs, SessionMemoryPlan, ALLOCATOR_HEADER_RESERVE_BYTES,
+    MaterializedBuffer, SessionMemoryInputs, SessionMemoryPlan,
+    ACTIVITY_DETECTOR_CHANNEL_WORKSPACE_BYTES, ALLOCATOR_HEADER_RESERVE_BYTES,
     CAPTURE_COMMAND_RESULT_SLOT_BYTES, CAPTURE_QUEUE_SLOT_METADATA_BYTES, FILE_WRITER_SLOT_BYTES,
-    MANIFEST_ENTRY_METADATA_BYTES, MANIFEST_FIXED_PATH_ENTRIES, MANIFEST_JSON_ENTRY_OVERHEAD_BYTES,
-    MANIFEST_JSON_FIXED_OVERHEAD_BYTES, MANIFEST_PATH_ESCAPE_MULTIPLIER,
-    OPERATION_QUEUE_SLOT_BYTES, OUTPUT_PATH_SLOTS_PER_PART, PATH_SLOT_METADATA_BYTES,
-    RING_CHUNK_OBJECT_RESERVE_BYTES, RING_FIXED_METADATA_RESERVE_BYTES,
+    FROZEN_EXPORT_DECISION_SLOT_BYTES, MANIFEST_ENTRY_METADATA_BYTES, MANIFEST_FIXED_PATH_ENTRIES,
+    MANIFEST_JSON_ENTRY_OVERHEAD_BYTES, MANIFEST_JSON_FIXED_OVERHEAD_BYTES,
+    MANIFEST_PATH_ESCAPE_MULTIPLIER, OPERATION_QUEUE_SLOT_BYTES, OUTPUT_PATH_SLOTS_PER_PART,
+    PATH_SLOT_METADATA_BYTES, RING_CHUNK_OBJECT_RESERVE_BYTES, RING_FIXED_METADATA_RESERVE_BYTES,
     RUNTIME_METADATA_RESERVE_BYTES, SPLIT_PART_SLOT_BYTES,
 };
 use lamb::sample_ring::{RingConfig, SampleFormat, SampleRing};
@@ -214,6 +215,14 @@ fn plan_components_match_concrete_small_input_formulas() {
         allocation(RUNTIME_METADATA_RESERVE_BYTES)
     );
     assert_eq!(
+        plan.component("frozen_export_decisions").unwrap().bytes,
+        2 * 24
+    );
+    assert_eq!(
+        plan.component("activity_detector_workspace").unwrap().bytes,
+        2 * 128 + scratch_bytes
+    );
+    assert_eq!(
         plan.committed_bytes(),
         plan.components()
             .iter()
@@ -221,6 +230,62 @@ fn plan_components_match_concrete_small_input_formulas() {
             .sum::<u64>()
     );
     assert!(plan.required_with_headroom() >= plan.committed_bytes());
+}
+
+#[test]
+fn detector_and_frozen_decision_memory_is_channel_bounded_and_included_in_maximum() {
+    let base = SessionMemoryPlan::calculate(inputs()).unwrap();
+    let mut more_channels = inputs();
+    more_channels.channels = 4;
+    let more_channels = SessionMemoryPlan::calculate(more_channels).unwrap();
+
+    assert_eq!(FROZEN_EXPORT_DECISION_SLOT_BYTES, 24);
+    assert_eq!(ACTIVITY_DETECTOR_CHANNEL_WORKSPACE_BYTES, 128);
+    assert_eq!(base.component("frozen_export_decisions").unwrap().bytes, 48);
+    assert_eq!(
+        base.component("activity_detector_workspace").unwrap().bytes,
+        288
+    );
+    assert_eq!(
+        more_channels
+            .component("frozen_export_decisions")
+            .unwrap()
+            .bytes,
+        96
+    );
+    assert_eq!(
+        more_channels
+            .component("activity_detector_workspace")
+            .unwrap()
+            .bytes,
+        576
+    );
+    let detector_components = base.component("frozen_export_decisions").unwrap().bytes
+        + base.component("activity_detector_workspace").unwrap().bytes;
+    assert_eq!(
+        base.committed_bytes(),
+        base.components()
+            .iter()
+            .filter(|component| {
+                component.name != "frozen_export_decisions"
+                    && component.name != "activity_detector_workspace"
+            })
+            .map(|component| component.bytes)
+            .sum::<u64>()
+            + detector_components
+    );
+    assert!(base.validate_max(Some(base.committed_bytes())).is_ok());
+    assert!(base.validate_max(Some(base.committed_bytes() - 1)).is_err());
+}
+
+#[test]
+fn detector_scratch_geometry_overflow_is_rejected() {
+    let mut values = inputs();
+    values.channels = u32::MAX;
+    values.chunk_frames = u32::MAX;
+    values.sample_bytes = 4;
+
+    assert!(SessionMemoryPlan::calculate(values).is_err());
 }
 
 #[test]
