@@ -1,10 +1,12 @@
+use crate::activity::ThresholdSource;
+use crate::calibration::{ConfiguredDeviceSelector, InputBackend, LiveDeviceKeyKind, StaleReason};
 use crate::error::{io_error, LambError, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "command", rename_all = "kebab-case")]
 pub enum ControlRequest {
     Recall,
@@ -20,6 +22,34 @@ pub enum ControlRequest {
     StopCapture,
     Reload,
     Dump,
+    Threshold {
+        request: ThresholdRequest,
+    },
+}
+
+/// Profile threshold operations are nested so the outer command remains
+/// extensible without flattening unrelated command arguments into one wire
+/// namespace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "operation", rename_all = "kebab-case")]
+pub enum ThresholdRequest {
+    Calibrate {
+        profile: String,
+        channel: String,
+        seconds: u32,
+    },
+    Set {
+        profile: String,
+        channel: String,
+        dbfs: f64,
+    },
+    Show {
+        profile: String,
+    },
+    Reset {
+        profile: String,
+        channel: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -29,6 +59,82 @@ pub struct ControlResponse {
     pub status: Option<DaemonStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistence_outcome: Option<PersistenceOutcomeResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_report: Option<ThresholdReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThresholdReport {
+    pub profile: String,
+    pub active_profile: bool,
+    pub capturing: bool,
+    pub channels: Vec<ThresholdChannelReport>,
+    pub message: String,
+}
+
+/// Per-configured-channel threshold state.  This deliberately separates
+/// persisted artifact facts from current-live evaluation: an offline Show can
+/// describe the former without claiming that a calibrated threshold is usable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThresholdChannelReport {
+    pub channel: String,
+    pub detector: String,
+    pub detector_version: String,
+    pub configured_input: ConfiguredInputReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored: Option<StoredThresholdReport>,
+    pub artifact_status: CalibrationReportStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_live_identity: Option<LiveInputReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_identity_matches: Option<bool>,
+    pub calibration_evaluation: CalibrationEvaluation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_threshold_dbfs: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfiguredInputReport {
+    pub backend: InputBackend,
+    pub selector: ConfiguredDeviceSelector,
+    pub source: String,
+    pub input_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveInputReport {
+    pub backend: InputBackend,
+    pub key_kind: LiveDeviceKeyKind,
+    pub key_value: String,
+    pub resolved_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StoredThresholdReport {
+    pub threshold_dbfs: f64,
+    pub source: ThresholdSource,
+    pub updated_at_unix_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum CalibrationReportStatus {
+    NotConfigured,
+    NotApplicable,
+    Complete,
+    Stale { reason: StaleReason },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CalibrationEvaluation {
+    NotResolved,
+    Valid,
+    Stale { reason: StaleReason },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -504,6 +610,21 @@ pub fn client_stop_capture(socket: &Path) -> Result<()> {
 pub fn client_reload(socket: &Path) -> Result<()> {
     let response = send_request(socket, &ControlRequest::Reload)?;
     if response.ok {
+        Ok(())
+    } else {
+        Err(LambError::Control(response.message))
+    }
+}
+
+pub fn client_threshold(socket: &Path, request: ThresholdRequest) -> Result<()> {
+    let response = send_request(socket, &ControlRequest::Threshold { request })?;
+    if response.ok {
+        println!("{}", response.message);
+        if let Some(report) = response.threshold_report {
+            let report = serde_json::to_string_pretty(&report)
+                .map_err(|err| LambError::Control(err.to_string()))?;
+            println!("{report}");
+        }
         Ok(())
     } else {
         Err(LambError::Control(response.message))

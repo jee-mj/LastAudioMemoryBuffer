@@ -3,16 +3,21 @@ use lamb::activity::WINDOWED_RMS_PEAK_DETECTOR_VERSION;
 use lamb::app_config::{ActivityThresholdConfig, AppConfig};
 use lamb::calibration::{
     commit_prepared_generation_with_hooks, derive_calibrated_threshold, save_config_atomic,
-    save_config_atomic_with_hook_and_name_source, state_root_from_env, CalibrationMetadata,
-    CalibrationStore, CalibrationValidity, CleanupCheckpoint, DurabilityCheckpoint,
-    OldGenerationCleanup, PreparedCalibrationGeneration, RecordedGeneration, StableInputIdentity,
+    save_config_atomic_with_hook_and_name_source, state_root_from_env, CalibrationArtifactStatus,
+    CalibrationMetadata, CalibrationStore, CalibrationValidity, CleanupCheckpoint,
+    DurabilityCheckpoint, OldGenerationCleanup, PreparedCalibrationGeneration, RecordedGeneration,
     StaleReason,
+};
+use lamb::calibration::{
+    ConfiguredDeviceSelector, ConfiguredInputIdentity, InputBackend, LiveDeviceKeyKind,
+    ResolvedLiveInputIdentity,
 };
 use lamb::capture_arena::{
     CalibrationCaptureRequest, CaptureArena, CaptureIngress, CaptureRuntimeConfig,
 };
 use lamb::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
 use lamb::sample_ring::{RingConfig, SampleFormat};
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
@@ -36,6 +41,116 @@ fn calibration_store_rejects_zero_and_unrepresentable_riff_frame_limits() {
     assert!(CalibrationStore::new(temp.path(), largest_riff_f32le_frames + 1).is_err());
     let store = CalibrationStore::new(temp.path(), largest_riff_f32le_frames).unwrap();
     assert_eq!(store.maximum_frames(), largest_riff_f32le_frames);
+}
+
+#[test]
+fn tiny_positive_rms_derives_the_floored_threshold() {
+    let mut stats = [1e-20];
+
+    assert_eq!(derive_calibrated_threshold(&mut stats).unwrap(), -110.0);
+}
+
+#[test]
+fn configured_identity_v2_tags_selector_kinds_and_excludes_live_device_state() {
+    let auto = ConfiguredInputIdentity::new(
+        InputBackend::PipeWire,
+        ConfiguredDeviceSelector::PipeWireAuto,
+        " mic ",
+        " capture_MIC ",
+    )
+    .unwrap();
+    let target = ConfiguredInputIdentity::new(
+        InputBackend::PipeWire,
+        ConfiguredDeviceSelector::PipeWireTarget("auto".to_string()),
+        "mic",
+        "capture_MIC",
+    )
+    .unwrap();
+    let same_auto = ConfiguredInputIdentity::new(
+        InputBackend::PipeWire,
+        ConfiguredDeviceSelector::PipeWireAuto,
+        "mic",
+        "capture_MIC",
+    )
+    .unwrap();
+
+    assert_eq!(auto.input_id(), same_auto.input_id());
+    assert_ne!(auto.input_id(), target.input_id());
+}
+
+#[test]
+fn resolved_live_identity_compares_key_kind_and_value() {
+    let serial = ResolvedLiveInputIdentity::new(
+        InputBackend::PipeWire,
+        LiveDeviceKeyKind::HardwareSerial,
+        "device-42",
+        "capture_MIC",
+    )
+    .unwrap();
+    let path = ResolvedLiveInputIdentity::new(
+        InputBackend::PipeWire,
+        LiveDeviceKeyKind::ObjectPath,
+        "device-42",
+        "capture_MIC",
+    )
+    .unwrap();
+
+    assert_ne!(serial, path);
+}
+
+#[test]
+fn jack_configured_and_live_sources_require_matching_complete_client_ports() {
+    for source in ["client", "client:", ":port", "other:port"] {
+        assert!(ConfiguredInputIdentity::new(
+            InputBackend::Jack,
+            ConfiguredDeviceSelector::JackSourceClient("client".into()),
+            "mic",
+            source,
+        )
+        .is_err());
+        assert!(ResolvedLiveInputIdentity::new(
+            InputBackend::Jack,
+            LiveDeviceKeyKind::JackSourceClient,
+            "client",
+            source,
+        )
+        .is_err());
+    }
+
+    assert!(ConfiguredInputIdentity::new(
+        InputBackend::Jack,
+        ConfiguredDeviceSelector::JackSourceClient("client".into()),
+        "mic",
+        "client:port",
+    )
+    .is_ok());
+    assert!(ResolvedLiveInputIdentity::new(
+        InputBackend::Jack,
+        LiveDeviceKeyKind::JackSourceClient,
+        "client",
+        "client:port",
+    )
+    .is_ok());
+}
+
+#[test]
+fn jack_configured_and_live_sources_reject_extra_separators() {
+    for source in ["client:port:extra", "client::port"] {
+        assert!(ConfiguredInputIdentity::new(
+            InputBackend::Jack,
+            ConfiguredDeviceSelector::JackSourceClient("client".into()),
+            "mic",
+            source,
+        )
+        .is_err());
+        assert!(ResolvedLiveInputIdentity::new(
+            InputBackend::Jack,
+            LiveDeviceKeyKind::JackSourceClient,
+            "client",
+            source,
+        )
+        .is_err());
+    }
 }
 
 fn runtime() -> (CaptureArena, CaptureIngress) {
@@ -102,14 +217,227 @@ fn calibration_request_validation_is_bounded_by_the_startup_plan() {
     arena.shutdown(DEADLINE).unwrap();
 }
 
-fn identity() -> StableInputIdentity {
-    StableInputIdentity::new("pipewire", "alsa_input.usb", "aux3", "capture_AUX3").unwrap()
+fn identity() -> ConfiguredInputIdentity {
+    ConfiguredInputIdentity::new(
+        InputBackend::PipeWire,
+        ConfiguredDeviceSelector::PipeWireTarget("alsa_input.usb".into()),
+        "aux3",
+        "capture_AUX3",
+    )
+    .unwrap()
 }
 
-fn identity_with_forged_input_id(input_id: &str) -> StableInputIdentity {
+fn live_identity() -> ResolvedLiveInputIdentity {
+    ResolvedLiveInputIdentity::new(
+        InputBackend::PipeWire,
+        LiveDeviceKeyKind::HardwareSerial,
+        "device-42",
+        "capture_AUX3",
+    )
+    .unwrap()
+}
+
+fn identity_with_forged_input_id(input_id: &str) -> ConfiguredInputIdentity {
     let mut value = serde_json::to_value(identity()).unwrap();
     value["input_id"] = serde_json::Value::String(input_id.to_owned());
     serde_json::from_value(value).unwrap()
+}
+
+fn live_identity_with_forged_field(
+    field: &str,
+    value: serde_json::Value,
+) -> ResolvedLiveInputIdentity {
+    let mut identity = serde_json::to_value(live_identity()).unwrap();
+    identity[field] = value;
+    serde_json::from_value(identity).unwrap()
+}
+
+#[test]
+fn prepared_metadata_v2_round_trips_configured_and_resolved_live_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = calibration_store(temp.path());
+    let configured = identity();
+    let live = live_identity();
+
+    let prepared = store
+        .prepare(
+            &configured,
+            &live,
+            "generation-v2",
+            &[0.0],
+            48_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            1_000,
+        )
+        .unwrap();
+    let encoded = std::fs::read(prepared.metadata_path()).unwrap();
+    let decoded: CalibrationMetadata = serde_json::from_slice(&encoded).unwrap();
+
+    assert_eq!(decoded.version, 2);
+    assert_eq!(decoded.configured_input.as_ref(), Some(&configured));
+    assert_eq!(decoded.resolved_live_input.as_ref(), Some(&live));
+    assert_eq!(
+        serde_json::from_slice::<CalibrationMetadata>(&serde_json::to_vec(&decoded).unwrap())
+            .unwrap(),
+        decoded
+    );
+}
+
+#[test]
+fn forged_live_identity_is_rejected_before_filesystem_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("missing/state");
+    let store = calibration_store(&root);
+    for forged in [
+        live_identity_with_forged_field("key_value", serde_json::json!(" device-42 ")),
+        live_identity_with_forged_field("resolved_source", serde_json::json!(" capture_AUX3 ")),
+        live_identity_with_forged_field("backend", serde_json::json!("jack")),
+    ] {
+        assert!(matches!(
+            store.prepare(
+                &identity(),
+                &forged,
+                "forged-live",
+                &[0.0],
+                48_000,
+                -110.0,
+                &mut [0.0],
+                &[0.0],
+                1_000,
+            ),
+            Err(lamb::error::LambError::Validation(_))
+        ));
+    }
+    assert!(!root.exists());
+}
+
+#[test]
+fn forged_configured_fields_and_selector_coherence_are_rejected_before_filesystem_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("missing/state");
+    let store = calibration_store(&root);
+    let mut forged_values = Vec::new();
+    for (field, value) in [
+        ("name", serde_json::json!(" aux3 ")),
+        ("source", serde_json::json!(" capture_AUX3 ")),
+        ("backend", serde_json::json!("jack")),
+    ] {
+        let mut forged = serde_json::to_value(identity()).unwrap();
+        forged[field] = value;
+        forged_values.push(serde_json::from_value(forged).unwrap());
+    }
+    let mut forged = serde_json::to_value(identity()).unwrap();
+    forged["selector"] = serde_json::json!({
+        "kind": "pipe-wire-target",
+        "value": " alsa_input.usb "
+    });
+    forged_values.push(serde_json::from_value(forged).unwrap());
+
+    for forged in forged_values {
+        assert!(matches!(
+            store.prepare(
+                &forged,
+                &live_identity(),
+                "forged-configured",
+                &[0.0],
+                48_000,
+                -110.0,
+                &mut [0.0],
+                &[0.0],
+                1_000,
+            ),
+            Err(lamb::error::LambError::Validation(_))
+        ));
+    }
+    assert!(!root.exists());
+}
+
+#[test]
+fn manual_validation_needs_no_live_identity_or_artifact_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = calibration_store(temp.path().join("missing"));
+    let input = identity();
+    let threshold = ActivityThresholdConfig {
+        threshold_dbfs: -40.0,
+        threshold_source: ThresholdSource::Manual,
+        updated_at_unix_seconds: 1,
+        input_id: input.input_id().into(),
+        calibration_id: None,
+    };
+
+    assert_eq!(
+        store
+            .validate(&threshold, &input, None, 48_000, u64::MAX)
+            .unwrap(),
+        CalibrationValidity::Valid
+    );
+
+    let forged_live = live_identity_with_forged_field("key_value", serde_json::json!(" forged "));
+    assert_eq!(
+        store
+            .validate(&threshold, &input, Some(&forged_live), 48_000, u64::MAX,)
+            .unwrap(),
+        CalibrationValidity::Valid
+    );
+
+    let mismatched = ActivityThresholdConfig {
+        input_id: "0".repeat(64),
+        threshold_source: ThresholdSource::Calibrated,
+        calibration_id: Some("missing".into()),
+        ..threshold
+    };
+    assert_eq!(
+        store
+            .validate(&mismatched, &input, Some(&forged_live), 48_000, u64::MAX,)
+            .unwrap(),
+        CalibrationValidity::Stale(StaleReason::InputMismatch)
+    );
+}
+
+#[test]
+fn offline_inspection_and_cleanup_are_available_without_an_active_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = calibration_store(temp.path());
+    let input = identity();
+    let live = live_identity();
+    let mut prepared = store
+        .prepare(
+            &input,
+            &live,
+            "offline",
+            &[0.0],
+            48_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            1_000,
+        )
+        .unwrap();
+    prepared.mark_authoritative();
+    let threshold = ActivityThresholdConfig {
+        threshold_dbfs: -110.0,
+        threshold_source: ThresholdSource::Calibrated,
+        updated_at_unix_seconds: 1_000,
+        input_id: input.input_id().into(),
+        calibration_id: Some("offline".into()),
+    };
+
+    let inspection = store.inspect_offline(&threshold, &input, 1_000).unwrap();
+    assert_eq!(inspection.status, CalibrationArtifactStatus::Complete);
+    assert_eq!(inspection.metadata.as_ref().map(|m| m.version), Some(2));
+
+    std::fs::remove_file(prepared.sample_path()).unwrap();
+    assert_eq!(
+        store
+            .inspect_offline(&threshold, &input, 1_000)
+            .unwrap()
+            .status,
+        CalibrationArtifactStatus::Stale(StaleReason::MissingSample)
+    );
+    assert!(store.cleanup_offline(&BTreeSet::new()).unwrap().is_empty());
+    assert!(!prepared.path().exists());
 }
 
 fn assert_forged_identity_rejected_without_side_effects(input_id: &str) {
@@ -126,6 +454,7 @@ fn assert_forged_identity_rejected_without_side_effects(input_id: &str) {
     let store = calibration_store(&root);
     let preparation = store.prepare(
         &input,
+        &live_identity(),
         "generation-a",
         &[0.0],
         48_000,
@@ -141,7 +470,7 @@ fn assert_forged_identity_rejected_without_side_effects(input_id: &str) {
         input_id: input.input_id().to_owned(),
         calibration_id: None,
     };
-    let validation = store.validate(&threshold, &input, 48_000, 1_000);
+    let validation = store.validate(&threshold, &input, Some(&live_identity()), 48_000, 1_000);
 
     assert!(matches!(
         preparation,
@@ -286,7 +615,7 @@ fn generation_bytes(prepared: &PreparedCalibrationGeneration) -> (Vec<u8>, Vec<u
 fn generation_fixture() -> (
     tempfile::TempDir,
     CalibrationStore,
-    StableInputIdentity,
+    ConfiguredInputIdentity,
     PreparedCalibrationGeneration,
     ActivityThresholdConfig,
 ) {
@@ -296,6 +625,7 @@ fn generation_fixture() -> (
     let prepared = store
         .prepare(
             &input,
+            &live_identity(),
             "generation-a",
             &[0.0, -0.5, 1.0],
             48_000,
@@ -324,6 +654,7 @@ fn generated_generations_are_unique_and_explicit_duplicates_never_overwrite() {
     let first_generated = store
         .prepare_generated(
             &input,
+            &live_identity(),
             &[0.25],
             48_000,
             threshold,
@@ -335,6 +666,7 @@ fn generated_generations_are_unique_and_explicit_duplicates_never_overwrite() {
     let second_generated = store
         .prepare_generated(
             &input,
+            &live_identity(),
             &[0.5],
             48_000,
             threshold,
@@ -352,6 +684,7 @@ fn generated_generations_are_unique_and_explicit_duplicates_never_overwrite() {
     let explicit = store
         .prepare(
             &input,
+            &live_identity(),
             "fixed-generation",
             &[0.25],
             48_000,
@@ -366,6 +699,7 @@ fn generated_generations_are_unique_and_explicit_duplicates_never_overwrite() {
     assert!(store
         .prepare(
             &input,
+            &live_identity(),
             "fixed-generation",
             &[0.75],
             48_000,
@@ -412,7 +746,7 @@ fn lease_preparation_rejects_unusable_capture_and_persists_capture_geometry() {
     assert!(!short.metadata().usable);
     assert_eq!(short.complete_windows(), 0);
     assert!(store
-        .prepare_lease(&input, "short", &mut short, -110.0, 1)
+        .prepare_lease(&input, &live_identity(), "short", &mut short, -110.0, 1)
         .is_err());
     assert!(!temp.path().join(input.input_id()).join("short").exists());
     drop(short);
@@ -437,11 +771,27 @@ fn lease_preparation_rejects_unusable_capture_and_persists_capture_geometry() {
     assert!(usable.metadata().usable);
     assert_eq!(usable.partial_final_frames(), 5);
     let threshold = derive_calibrated_threshold(usable.rms_mut()).unwrap();
+    let mut checkpoints = Vec::new();
     let prepared = store
-        .prepare_lease(&input, "usable", &mut usable, threshold, 2)
+        .prepare_generated_lease_with_hook(
+            &input,
+            &live_identity(),
+            &mut usable,
+            threshold,
+            2,
+            &mut |checkpoint| {
+                checkpoints.push(checkpoint);
+                Ok(())
+            },
+        )
         .unwrap();
     assert_eq!(prepared.metadata().partial_final_frames, 5);
     assert_eq!(prepared.metadata().dropped_frames, 0);
+    assert!(checkpoints.contains(&DurabilityCheckpoint::SampleWritten));
+    assert!(checkpoints.contains(&DurabilityCheckpoint::MetadataWritten));
+    assert!(checkpoints.contains(&DurabilityCheckpoint::GenerationDirectorySynced));
+    assert!(checkpoints.contains(&DurabilityCheckpoint::InputDirectorySynced));
+    assert!(checkpoints.contains(&DurabilityCheckpoint::RootDirectorySynced));
     drop(prepared);
     drop(usable);
     arena.shutdown(DEADLINE).unwrap();
@@ -461,16 +811,201 @@ fn rewrite_metadata(
     .unwrap();
 }
 
+fn rewrite_metadata_value(
+    prepared: &PreparedCalibrationGeneration,
+    change: impl FnOnce(&mut serde_json::Value),
+) {
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(prepared.metadata_path()).unwrap()).unwrap();
+    change(&mut metadata);
+    std::fs::write(
+        prepared.metadata_path(),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+}
+
+fn convert_to_legacy_v1(metadata: &mut serde_json::Value) {
+    let fields = ["pipewire", "alsa_input.usb", "aux3", "capture_AUX3"];
+    let mut hasher = Sha256::new();
+    hasher.update(b"lamb/stable-input-identity/v1\0");
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    let input_id = format!("{:x}", hasher.finalize());
+    metadata["version"] = serde_json::json!(1);
+    metadata["input"] = serde_json::json!({
+        "backend": fields[0],
+        "device": fields[1],
+        "name": fields[2],
+        "source": fields[3],
+        "input_id": input_id,
+    });
+    metadata["input_id"] = serde_json::json!(input_id);
+    metadata
+        .as_object_mut()
+        .unwrap()
+        .remove("resolved_live_input");
+}
+
+#[test]
+fn calibrated_validation_distinguishes_missing_and_mismatched_live_identity() {
+    let (_temp, store, input, prepared, threshold) = generation_fixture();
+    rewrite_metadata_value(&prepared, convert_to_legacy_v1);
+    assert_stale(
+        &store,
+        &threshold,
+        &input,
+        48_000,
+        1_000,
+        StaleReason::MissingLiveIdentity,
+    );
+
+    let (_temp, store, input, prepared, threshold) = generation_fixture();
+    rewrite_metadata_value(&prepared, |metadata| {
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("resolved_live_input");
+    });
+    assert_stale(
+        &store,
+        &threshold,
+        &input,
+        48_000,
+        1_000,
+        StaleReason::MissingLiveIdentity,
+    );
+    assert_eq!(
+        store
+            .validate(&threshold, &input, None, 48_000, 1_000)
+            .unwrap(),
+        CalibrationValidity::Stale(StaleReason::MissingLiveIdentity)
+    );
+
+    let (_temp, store, input, prepared, threshold) = generation_fixture();
+    let other = ConfiguredInputIdentity::new(
+        InputBackend::PipeWire,
+        ConfiguredDeviceSelector::PipeWireTarget("other".into()),
+        "aux3",
+        "capture_AUX3",
+    )
+    .unwrap();
+    rewrite_metadata_value(&prepared, |metadata| {
+        metadata["input"] = serde_json::to_value(&other).unwrap();
+        metadata["input_id"] = serde_json::json!(other.input_id());
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("resolved_live_input");
+    });
+    assert_stale(
+        &store,
+        &threshold,
+        &input,
+        48_000,
+        1_000,
+        StaleReason::InputMismatch,
+    );
+
+    for current_live in [
+        ResolvedLiveInputIdentity::new(
+            InputBackend::PipeWire,
+            LiveDeviceKeyKind::ObjectPath,
+            "device-42",
+            "capture_AUX3",
+        )
+        .unwrap(),
+        ResolvedLiveInputIdentity::new(
+            InputBackend::PipeWire,
+            LiveDeviceKeyKind::HardwareSerial,
+            "device-43",
+            "capture_AUX3",
+        )
+        .unwrap(),
+        ResolvedLiveInputIdentity::new(
+            InputBackend::PipeWire,
+            LiveDeviceKeyKind::HardwareSerial,
+            "device-42",
+            "capture_OTHER",
+        )
+        .unwrap(),
+    ] {
+        let (_temp, store, input, _prepared, threshold) = generation_fixture();
+        assert_eq!(
+            store
+                .validate(&threshold, &input, Some(&current_live), 48_000, 1_000)
+                .unwrap(),
+            CalibrationValidity::Stale(StaleReason::LiveIdentityMismatch)
+        );
+    }
+}
+
+#[test]
+fn offline_inspection_distinguishes_persisted_artifact_failures() {
+    let (_temp, store, input, prepared, threshold) = generation_fixture();
+    std::fs::remove_file(prepared.metadata_path()).unwrap();
+    assert_eq!(
+        store
+            .inspect_offline(&threshold, &input, 1_000)
+            .unwrap()
+            .status,
+        CalibrationArtifactStatus::Stale(StaleReason::MissingMetadata)
+    );
+
+    let (_temp, store, input, prepared, threshold) = generation_fixture();
+    std::fs::write(prepared.metadata_path(), b"{").unwrap();
+    assert_eq!(
+        store
+            .inspect_offline(&threshold, &input, 1_000)
+            .unwrap()
+            .status,
+        CalibrationArtifactStatus::Stale(StaleReason::CorruptMetadata)
+    );
+
+    let (_temp, store, input, prepared, threshold) = generation_fixture();
+    std::fs::write(prepared.sample_path(), b"not a wav").unwrap();
+    assert_eq!(
+        store
+            .inspect_offline(&threshold, &input, 1_000)
+            .unwrap()
+            .status,
+        CalibrationArtifactStatus::Stale(StaleReason::CorruptSample)
+    );
+
+    let (_temp, store, input, _prepared, threshold) = generation_fixture();
+    assert_eq!(
+        store
+            .inspect_offline(&threshold, &input, 1_000 + 30 * 24 * 60 * 60 + 1)
+            .unwrap()
+            .status,
+        CalibrationArtifactStatus::Stale(StaleReason::Expired)
+    );
+
+    let (_temp, store, input, prepared, threshold) = generation_fixture();
+    rewrite_metadata_value(&prepared, convert_to_legacy_v1);
+    assert_eq!(
+        store
+            .inspect_offline(&threshold, &input, 1_000)
+            .unwrap()
+            .status,
+        CalibrationArtifactStatus::Stale(StaleReason::MissingLiveIdentity)
+    );
+}
+
 fn assert_stale(
     store: &CalibrationStore,
     threshold: &ActivityThresholdConfig,
-    input: &StableInputIdentity,
+    input: &ConfiguredInputIdentity,
     sample_rate: u32,
     now: u64,
     reason: StaleReason,
 ) {
     assert_eq!(
-        store.validate(threshold, input, sample_rate, now).unwrap(),
+        store
+            .validate(threshold, input, Some(&live_identity()), sample_rate, now)
+            .unwrap(),
         CalibrationValidity::Stale(reason)
     );
 }
@@ -481,11 +1016,41 @@ fn calibration_identity_is_stable_length_delimited_and_order_independent() {
     assert_eq!(original.input_id().len(), 64);
     assert_eq!(original, identity());
     for changed in [
-        StableInputIdentity::new("jack", "alsa_input.usb", "aux3", "capture_AUX3").unwrap(),
-        StableInputIdentity::new("pipewire", "other", "aux3", "capture_AUX3").unwrap(),
-        StableInputIdentity::new("pipewire", "alsa_input.usb", "aux4", "capture_AUX3").unwrap(),
-        StableInputIdentity::new("pipewire", "alsa_input.usb", "aux3", "other").unwrap(),
-        StableInputIdentity::new("pipewire:a", "lsa_input.usb", "aux3", "capture_AUX3").unwrap(),
+        ConfiguredInputIdentity::new(
+            InputBackend::Jack,
+            ConfiguredDeviceSelector::JackSourceClient("client".into()),
+            "aux3",
+            "client:port",
+        )
+        .unwrap(),
+        ConfiguredInputIdentity::new(
+            InputBackend::PipeWire,
+            ConfiguredDeviceSelector::PipeWireTarget("other".into()),
+            "aux3",
+            "capture_AUX3",
+        )
+        .unwrap(),
+        ConfiguredInputIdentity::new(
+            InputBackend::PipeWire,
+            ConfiguredDeviceSelector::PipeWireTarget("alsa_input.usb".into()),
+            "aux4",
+            "capture_AUX3",
+        )
+        .unwrap(),
+        ConfiguredInputIdentity::new(
+            InputBackend::PipeWire,
+            ConfiguredDeviceSelector::PipeWireTarget("alsa_input.usb".into()),
+            "aux3",
+            "other",
+        )
+        .unwrap(),
+        ConfiguredInputIdentity::new(
+            InputBackend::PipeWire,
+            ConfiguredDeviceSelector::PipeWireTarget("alsa_input.usb:a".into()),
+            "aux3",
+            "capture_AUX3",
+        )
+        .unwrap(),
     ] {
         assert_ne!(original.input_id(), changed.input_id());
     }
@@ -533,6 +1098,7 @@ fn prepared_generation_round_trips_exact_float_wav_and_validates_staleness() {
     let prepared = store
         .prepare(
             &input,
+            &live_identity(),
             "generation-a",
             &[0.0, -0.5, 1.0],
             48_000,
@@ -564,7 +1130,13 @@ fn prepared_generation_round_trips_exact_float_wav_and_validates_staleness() {
     };
     assert_eq!(
         store
-            .validate(&threshold, &input, 48_000, 1_000 + 30 * 24 * 60 * 60)
+            .validate(
+                &threshold,
+                &input,
+                Some(&live_identity()),
+                48_000,
+                1_000 + 30 * 24 * 60 * 60,
+            )
             .unwrap(),
         CalibrationValidity::Valid
     );
@@ -652,7 +1224,7 @@ fn every_calibration_staleness_reason_is_structured_and_manual_does_not_age() {
     for (name, change, reason) in [
         (
             "version",
-            (|m: &mut CalibrationMetadata| m.version = 2) as fn(&mut CalibrationMetadata),
+            (|m: &mut CalibrationMetadata| m.version = 3) as fn(&mut CalibrationMetadata),
             StaleReason::CorruptMetadata,
         ),
         (
@@ -694,9 +1266,15 @@ fn every_calibration_staleness_reason_is_structured_and_manual_does_not_age() {
     );
 
     let (_temp, store, input, prepared, threshold) = generation_fixture();
-    let other = StableInputIdentity::new("jack", "other", "mic", "capture_1").unwrap();
+    let other = ConfiguredInputIdentity::new(
+        InputBackend::Jack,
+        ConfiguredDeviceSelector::JackSourceClient("other".into()),
+        "mic",
+        "other:capture_1",
+    )
+    .unwrap();
     rewrite_metadata(&prepared, |m| {
-        m.input = other.clone();
+        m.configured_input = Some(other.clone());
         m.input_id = other.input_id().to_string();
     });
     assert_stale(
@@ -773,11 +1351,17 @@ fn every_calibration_staleness_reason_is_structured_and_manual_does_not_age() {
     };
     assert_eq!(
         empty_store
-            .validate(&manual, &input, 48_000, u64::MAX)
+            .validate(&manual, &input, None, 48_000, u64::MAX)
             .unwrap(),
         CalibrationValidity::Valid
     );
-    let other = StableInputIdentity::new("jack", "other", "mic", "capture_1").unwrap();
+    let other = ConfiguredInputIdentity::new(
+        InputBackend::Jack,
+        ConfiguredDeviceSelector::JackSourceClient("other".into()),
+        "mic",
+        "other:capture_1",
+    )
+    .unwrap();
     assert_stale(
         &empty_store,
         &manual,
@@ -803,9 +1387,19 @@ fn every_calibration_staleness_reason_is_structured_and_manual_does_not_age() {
 
 #[test]
 fn malformed_metadata_numeric_and_identity_fields_never_validate() {
-    let changes: [fn(&mut CalibrationMetadata); 8] = [
+    let changes: [fn(&mut CalibrationMetadata); 9] = [
         |m| m.input_id = "unsafe/input".into(),
-        |m| m.input = StableInputIdentity::new(" pipewire", "device", "name", "source").unwrap(),
+        |m| {
+            let mut forged = serde_json::to_value(identity()).unwrap();
+            forged["name"] = serde_json::json!(" name ");
+            m.configured_input = Some(serde_json::from_value(forged).unwrap());
+        },
+        |m| {
+            m.resolved_live_input = Some(live_identity_with_forged_field(
+                "key_value",
+                serde_json::json!(" device-42 "),
+            ));
+        },
         |m| m.sample_rate = 0,
         |m| m.frames = 0,
         |m| m.complete_windows = 0,
@@ -976,6 +1570,7 @@ fn prepare_above_store_bound_creates_no_input_or_generation_directory() {
     assert!(store
         .prepare(
             &input,
+            &live_identity(),
             "too-large",
             &[0.0, 0.0, 0.0],
             1_000,
@@ -1000,7 +1595,9 @@ fn metadata_above_store_bound_is_corrupt_before_sample_is_opened() {
     std::fs::remove_file(prepared.sample_path()).unwrap();
 
     assert_eq!(
-        store.validate(&threshold, &input, 48_000, 1_000).unwrap(),
+        store
+            .validate(&threshold, &input, Some(&live_identity()), 48_000, 1_000)
+            .unwrap(),
         CalibrationValidity::Stale(StaleReason::CorruptMetadata)
     );
 }
@@ -1015,13 +1612,24 @@ fn invalid_generation_geometry_never_creates_a_generation_directory() {
         ("mismatch", vec![0.0], vec![0.0], vec![0.0, 0.0]),
     ] {
         assert!(store
-            .prepare(&input, id, &samples, 1_000, -110.0, &mut rms, &peak, 1)
+            .prepare(
+                &input,
+                &live_identity(),
+                id,
+                &samples,
+                1_000,
+                -110.0,
+                &mut rms,
+                &peak,
+                1
+            )
             .is_err());
         assert!(!temp.path().join(input.input_id()).join(id).exists());
     }
     assert!(store
         .prepare(
             &input,
+            &live_identity(),
             "../escape",
             &[0.0],
             1_000,
@@ -1035,6 +1643,7 @@ fn invalid_generation_geometry_never_creates_a_generation_directory() {
     assert!(store
         .prepare(
             &input,
+            &live_identity(),
             "incoherent-threshold",
             &[0.0],
             1_000,
@@ -1062,7 +1671,17 @@ fn inconsistent_supplied_statistics_never_create_a_generation_directory() {
     ] {
         let threshold = derived_threshold(&rms);
         assert!(store
-            .prepare(&input, id, &samples, 1_000, threshold, &mut rms, &peak, 1,)
+            .prepare(
+                &input,
+                &live_identity(),
+                id,
+                &samples,
+                1_000,
+                threshold,
+                &mut rms,
+                &peak,
+                1,
+            )
             .is_err());
         assert!(!temp.path().join(input.input_id()).join(id).exists());
     }
@@ -1083,7 +1702,17 @@ fn every_generation_durability_checkpoint_cleans_only_the_new_generation() {
         let store = calibration_store(temp.path());
         let input = identity();
         let mut old = store
-            .prepare(&input, "old", &[0.25], 1_000, -110.0, &mut [0.0], &[0.0], 1)
+            .prepare(
+                &input,
+                &live_identity(),
+                "old",
+                &[0.25],
+                1_000,
+                -110.0,
+                &mut [0.0],
+                &[0.0],
+                1,
+            )
             .unwrap();
         old.mark_authoritative();
         let old_bytes = generation_bytes(&old);
@@ -1103,6 +1732,7 @@ fn every_generation_durability_checkpoint_cleans_only_the_new_generation() {
         assert!(store
             .prepare_with_hook(
                 &input,
+                &live_identity(),
                 "new",
                 &[0.5],
                 1_000,
@@ -1129,6 +1759,7 @@ fn prepared_cleanup_preserves_a_foreign_replacement_after_identity_capture() {
     let mut prepared = store
         .prepare(
             &input,
+            &live_identity(),
             "prepared",
             &[0.0],
             1_000,
@@ -1168,7 +1799,17 @@ fn precommit_failures_preserve_old_authority_skip_callback_and_cleanup_prepared(
         let store = calibration_store(temp.path());
         let input = identity();
         let mut old = store
-            .prepare(&input, "old", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 1)
+            .prepare(
+                &input,
+                &live_identity(),
+                "old",
+                &[0.0],
+                1_000,
+                -110.0,
+                &mut [0.0],
+                &[0.0],
+                1,
+            )
             .unwrap();
         old.mark_authoritative();
         let old_bytes = generation_bytes(&old);
@@ -1176,7 +1817,17 @@ fn precommit_failures_preserve_old_authority_skip_callback_and_cleanup_prepared(
         let config_bytes = b"old authoritative config\n".to_vec();
         std::fs::write(&config_path, &config_bytes).unwrap();
         let mut prepared = store
-            .prepare(&input, "new", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+            .prepare(
+                &input,
+                &live_identity(),
+                "new",
+                &[0.0],
+                1_000,
+                -110.0,
+                &mut [0.0],
+                &[0.0],
+                2,
+            )
             .unwrap();
         let prepared_path = prepared.path().to_path_buf();
         let candidate = if failed_checkpoint.is_none() {
@@ -1224,7 +1875,17 @@ fn precommit_cleanup_hook_failure_preserves_operation_and_cleanup_contexts() {
     let store = calibration_store(temp.path());
     let input = identity();
     let mut prepared = store
-        .prepare(&input, "new", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
         .unwrap();
     let prepared_path = prepared.path().to_path_buf();
     let config_path = temp.path().join("lamb.toml");
@@ -1272,7 +1933,17 @@ fn precommit_cleanup_identity_race_is_reported_instead_of_discarded() {
     let store = calibration_store(temp.path());
     let input = identity();
     let mut prepared = store
-        .prepare(&input, "new", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
         .unwrap();
     let prepared_path = prepared.path().to_path_buf();
     let moved_prepared = temp.path().join("prepared-moved-away");
@@ -1311,7 +1982,17 @@ fn config_persistence_cleanup_failure_conservatively_preserves_prepared() {
     let store = calibration_store(temp.path());
     let input = identity();
     let mut prepared = store
-        .prepare(&input, "new", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
         .unwrap();
     let prepared_path = prepared.path().to_path_buf();
     let candidate = valid_candidate(&prepared);
@@ -1497,7 +2178,9 @@ fn atomic_config_preserves_metadata_rejects_special_targets_and_retries_collisio
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("lamb.toml");
     std::fs::write(&path, b"old\n").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o6751)).unwrap();
+    // Keep a non-default mode while avoiding set-ID bits, which sandboxed Nix
+    // builders may reject even for a builder-owned temporary file.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0751)).unwrap();
     let before = std::fs::symlink_metadata(&path).unwrap();
     let collision = temp.path().join(".lamb.toml.config.41.tmp");
     std::fs::write(&collision, b"collision stays").unwrap();
@@ -1642,7 +2325,17 @@ fn durable_success_still_installs_when_old_config_cleanup_identity_changes() {
     let store = calibration_store(temp.path());
     let input = identity();
     let mut prepared = store
-        .prepare(&input, "new", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
         .unwrap();
     let candidate = valid_candidate(&prepared);
     let config_path = temp.path().join("lamb.toml");
@@ -1690,7 +2383,17 @@ fn post_exchange_identity_change_preserves_foreign_target_and_old_config_recover
     let store = calibration_store(temp.path());
     let input = identity();
     let mut prepared = store
-        .prepare(&input, "new", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
         .unwrap();
     let prepared_path = prepared.path().to_path_buf();
     let candidate = valid_candidate(&prepared);
@@ -1739,6 +2442,80 @@ fn post_exchange_identity_change_preserves_foreign_target_and_old_config_recover
         .expect("old authoritative config must remain in adjacent recovery state");
     assert_eq!(std::fs::read(recovery).unwrap(), old_bytes);
     assert_eq!(installed.get(), 0);
+    drop(prepared);
+    assert!(prepared_path.exists());
+}
+
+#[test]
+fn indeterminate_publication_keeps_prepared_generation_after_drop() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = calibration_store(temp.path());
+    let input = identity();
+    let mut prepared = store
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
+        .unwrap();
+    let prepared_path = prepared.path().to_path_buf();
+    let candidate = valid_candidate(&prepared);
+    let config_path = temp.path().join("lamb.toml");
+    let old_bytes = b"old authoritative config\n";
+    let foreign_bytes = b"foreign replacement\n";
+    std::fs::write(&config_path, old_bytes).unwrap();
+    let moved_candidate = temp.path().join("candidate-moved-away.toml");
+    let installed = Cell::new(0);
+    let cleanup_invocations = Cell::new(0);
+    let mut hook = |checkpoint| {
+        if checkpoint == DurabilityCheckpoint::ConfigRenamed {
+            std::fs::rename(&config_path, &moved_candidate).unwrap();
+            std::fs::write(&config_path, foreign_bytes).unwrap();
+            Err(lamb::error::LambError::Config(
+                "injected post-exchange failure".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
+    let error = commit_prepared_generation_with_hooks(
+        &config_path,
+        &candidate,
+        &mut prepared,
+        None,
+        || installed.set(installed.get() + 1),
+        &mut hook,
+        &mut |_, _| {
+            cleanup_invocations.set(cleanup_invocations.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        lamb::error::LambError::IndeterminatePublication { .. }
+    ));
+    assert_eq!(installed.get(), 0);
+    assert_eq!(std::fs::read(&config_path).unwrap(), foreign_bytes);
+    assert!(std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .any(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".lamb.toml.config"))
+                && path.exists()
+        }));
+    assert_eq!(cleanup_invocations.get(), 0);
+    drop(prepared);
     assert!(prepared_path.exists());
 }
 
@@ -1748,13 +2525,33 @@ fn installed_candidate_with_disturbed_old_recovery_is_indeterminate_and_preserve
     let store = calibration_store(temp.path());
     let input = identity();
     let mut old = store
-        .prepare(&input, "old", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 1)
+        .prepare(
+            &input,
+            &live_identity(),
+            "old",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            1,
+        )
         .unwrap();
     let previous = RecordedGeneration::capture(old.path()).unwrap();
     old.mark_authoritative();
     let old_generation_bytes = generation_bytes(&old);
     let mut prepared = store
-        .prepare(&input, "new", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
         .unwrap();
     let prepared_path = prepared.path().to_path_buf();
     let candidate = valid_candidate(&prepared);
@@ -1816,7 +2613,17 @@ fn commit_rejects_previous_generation_aliasing_prepared_before_config_side_effec
     let store = calibration_store(temp.path());
     let input = identity();
     let mut prepared = store
-        .prepare(&input, "new", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
         .unwrap();
     let prepared_path = prepared.path().to_path_buf();
     let previous = RecordedGeneration::capture(&prepared_path).unwrap();
@@ -1852,7 +2659,17 @@ fn commit_requires_the_exact_prepared_threshold_reference() {
     let store = calibration_store(temp.path());
     let input = identity();
     let mut prepared = store
-        .prepare(&input, "new", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
         .unwrap();
     let prepared_path = prepared.path().to_path_buf();
     let mut candidate = valid_candidate(&prepared);
@@ -1889,7 +2706,17 @@ fn commit_rejects_an_invalid_profile_containing_the_prepared_reference() {
     let store = calibration_store(temp.path());
     let input = identity();
     let mut prepared = store
-        .prepare(&input, "new", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
         .unwrap();
     let prepared_path = prepared.path().to_path_buf();
     let mut candidate = valid_candidate(&prepared);
@@ -1916,14 +2743,34 @@ fn successful_commit_is_durable_before_one_callback_and_reports_old_identity_rac
     let store = calibration_store(temp.path());
     let input = identity();
     let mut old = store
-        .prepare(&input, "old", &[0.0], 1_000, -110.0, &mut [0.0], &[0.0], 1)
+        .prepare(
+            &input,
+            &live_identity(),
+            "old",
+            &[0.0],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            1,
+        )
         .unwrap();
     let old_recorded = RecordedGeneration::capture(old.path()).unwrap();
     old.mark_authoritative();
     let old_path = old.path().to_path_buf();
     let moved_old = old_path.with_file_name("old-recorded-moved");
     let mut prepared = store
-        .prepare(&input, "new", &[0.25], 1_000, -110.0, &mut [0.0], &[0.0], 2)
+        .prepare(
+            &input,
+            &live_identity(),
+            "new",
+            &[0.25],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            2,
+        )
         .unwrap();
     let prepared_path = prepared.path().to_path_buf();
     let mut candidate = valid_candidate(&prepared);
@@ -1974,6 +2821,7 @@ fn startup_cleanup_keeps_referenced_removes_orphans_and_reports_foreign_replacem
     let mut referenced = store
         .prepare(
             &input,
+            &live_identity(),
             "referenced",
             &[0.0],
             1_000,
@@ -1987,6 +2835,7 @@ fn startup_cleanup_keeps_referenced_removes_orphans_and_reports_foreign_replacem
     let mut orphan = store
         .prepare(
             &input,
+            &live_identity(),
             "orphan",
             &[0.0],
             1_000,
@@ -2000,6 +2849,7 @@ fn startup_cleanup_keeps_referenced_removes_orphans_and_reports_foreign_replacem
     let mut replaced = store
         .prepare(
             &input,
+            &live_identity(),
             "replaced",
             &[0.0],
             1_000,
@@ -2041,6 +2891,53 @@ fn startup_cleanup_keeps_referenced_removes_orphans_and_reports_foreign_replacem
 }
 
 #[test]
+fn root_maintenance_api_inspects_and_cleans_without_an_unbounded_preparation_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = calibration_store(temp.path());
+    let input = identity();
+    let live = live_identity();
+    let mut referenced = store
+        .prepare(
+            &input,
+            &live,
+            "referenced-root-api",
+            &[0.25],
+            1_000,
+            -110.0,
+            &mut [0.0],
+            &[0.0],
+            10,
+        )
+        .unwrap();
+    referenced.mark_authoritative();
+    let threshold = ActivityThresholdConfig {
+        threshold_dbfs: -110.0,
+        threshold_source: ThresholdSource::Calibrated,
+        updated_at_unix_seconds: 10,
+        input_id: input.input_id().to_string(),
+        calibration_id: Some("referenced-root-api".to_string()),
+    };
+
+    let inspected = CalibrationStore::inspect_root(temp.path(), &threshold, &input, 10).unwrap();
+    assert_eq!(inspected.status, CalibrationArtifactStatus::Complete);
+    assert_eq!(inspected.metadata.unwrap().sample_rate, 1_000);
+
+    let orphan = temp.path().join(input.input_id()).join("orphan-root-api");
+    std::fs::create_dir(&orphan).unwrap();
+    std::fs::write(orphan.join("partial"), b"bounded maintenance").unwrap();
+    let keep = BTreeSet::from([(
+        input.input_id().to_string(),
+        "referenced-root-api".to_string(),
+    )]);
+    assert_eq!(
+        CalibrationStore::cleanup_root(temp.path(), &keep).unwrap(),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert!(referenced.path().exists());
+    assert!(!orphan.exists());
+}
+
+#[test]
 fn prepare_refuses_an_input_directory_symlink_without_touching_its_referent() {
     let temp = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -2051,6 +2948,7 @@ fn prepare_refuses_an_input_directory_symlink_without_touching_its_referent() {
     assert!(store
         .prepare(
             &input,
+            &live_identity(),
             "anchored",
             &[0.0],
             1_000,
@@ -2071,6 +2969,7 @@ fn validation_refuses_state_ancestor_and_generation_symlinks_without_reading_out
     let external = calibration_store(outside.path())
         .prepare(
             &input,
+            &live_identity(),
             "external",
             &[0.0],
             1_000,
@@ -2091,7 +2990,7 @@ fn validation_refuses_state_ancestor_and_generation_symlinks_without_reading_out
     symlink(outside.path(), &ancestor).unwrap();
     let store = calibration_store(ancestor.join("ignored"));
     assert!(matches!(
-        store.validate(&threshold, &input, 1_000, 1),
+        store.validate(&threshold, &input, Some(&live_identity()), 1_000, 1),
         Ok(CalibrationValidity::Stale(StaleReason::MissingState))
     ));
     assert!(external.path().exists());
@@ -2159,6 +3058,7 @@ fn prepare_refuses_a_generation_symlink_without_overwriting_the_external_directo
     assert!(calibration_store(temp.path())
         .prepare(
             &input,
+            &live_identity(),
             "aliased",
             &[0.0],
             1_000,
@@ -2223,6 +3123,7 @@ fn nested_missing_ancestry_syncs_each_created_component_before_working() {
     calibration_store(&root)
         .prepare_with_hook(
             &input,
+            &live_identity(),
             "nested",
             &[0.0],
             1_000,
@@ -2251,6 +3152,7 @@ fn prepared_cleanup_removes_its_owned_generation_and_returns_true() {
     let mut prepared = store
         .prepare(
             &input,
+            &live_identity(),
             "owned",
             &[0.0],
             1_000,
@@ -2272,6 +3174,7 @@ fn cleanup_quarantine_replacement_is_left_pending_without_recursing_into_foreign
     let mut prepared = store
         .prepare(
             &input,
+            &live_identity(),
             "owned",
             &[0.0],
             1_000,
@@ -2315,6 +3218,7 @@ fn created_child_replacement_after_ancestry_sync_receives_no_generation_files() 
     let mut replaced = false;
     let result = calibration_store(temp.path()).prepare_with_hook(
         &input,
+        &live_identity(),
         "owned",
         &[0.0],
         1_000,
@@ -2358,6 +3262,7 @@ fn root_replacement_after_root_sync_fails_without_touching_the_replacement() {
     assert!(store
         .prepare_with_hook(
             &input,
+            &live_identity(),
             "owned",
             &[0.0],
             1_000,

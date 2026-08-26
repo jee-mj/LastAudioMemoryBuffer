@@ -1,3 +1,4 @@
+use crate::calibration::LiveDeviceKeyKind;
 use crate::capture_arena::CaptureIngress;
 use crate::capture_runtime::{CaptureRuntime, CaptureRuntimeParams};
 use crate::config::{ConfiguredCapturePort, LambConfig};
@@ -18,9 +19,14 @@ pub struct ResolvedTarget {
     pub sample_rate: u32,
     pub format: String,
     pub source_ports: Vec<ResolvedSourcePort>,
+    pub durable_live_key: Option<(LiveDeviceKeyKind, String)>,
 }
 
 impl ResolvedTarget {
+    pub fn durable_live_key(&self) -> Option<(LiveDeviceKeyKind, String)> {
+        self.durable_live_key.clone()
+    }
+
     pub fn log_message(&self) -> String {
         let target = match self.id {
             Some(id) => format!("{} ({id})", self.name),
@@ -73,6 +79,8 @@ pub struct AvailableNode {
     pub object_type: String,
     pub media_class: Option<String>,
     pub name: Option<String>,
+    pub hardware_serial: Option<String>,
+    pub object_path: Option<String>,
     pub description: Option<String>,
     pub channels: Option<u32>,
     pub sample_rate: Option<u32>,
@@ -393,6 +401,23 @@ fn resolved_from_node(
         sample_rate,
         format,
         source_ports,
+        durable_live_key: durable_live_key(node),
+    })
+}
+
+fn durable_live_key(node: &AvailableNode) -> Option<(LiveDeviceKeyKind, String)> {
+    [
+        (
+            LiveDeviceKeyKind::HardwareSerial,
+            node.hardware_serial.as_deref(),
+        ),
+        (LiveDeviceKeyKind::ObjectPath, node.object_path.as_deref()),
+        (LiveDeviceKeyKind::NodeName, node.name.as_deref()),
+    ]
+    .into_iter()
+    .find_map(|(kind, value)| {
+        let value = value?.trim();
+        (!value.is_empty()).then(|| (kind, value.to_string()))
     })
 }
 
@@ -839,6 +864,8 @@ fn available_node_from_global(
         object_type: global.type_.to_string(),
         media_class: string_prop(props, *pipewire::keys::MEDIA_CLASS),
         name: string_prop(props, *pipewire::keys::NODE_NAME),
+        hardware_serial: string_prop(props, "device.serial"),
+        object_path: string_prop(props, "object.path"),
         description: string_prop(props, *pipewire::keys::NODE_DESCRIPTION),
         channels: u32_prop(props, *pipewire::keys::AUDIO_CHANNELS),
         sample_rate: u32_prop(props, "audio.rate"),

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Version of the implemented 20 ms / 10 ms windowed RMS/peak detector.
 pub const WINDOWED_RMS_PEAK_DETECTOR_VERSION: &str = "windowed-rms-peak-v1";
+pub const EXACT_ZERO_DETECTOR_VERSION: &str = "exact-zero-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -101,6 +102,17 @@ pub struct FrozenExportDecision {
     storage_id: u64,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrozenExportDecisionSnapshot {
+    pub(crate) channels: Vec<FrozenChannelDecision>,
+    pub(crate) export_range: Range<u64>,
+    pub(crate) sample_rate: u32,
+    pub(crate) valid: bool,
+    pub(crate) frozen_epoch: Option<FrozenEpochIdentity>,
+    pub(crate) storage_id: u64,
+}
+
 static NEXT_FROZEN_EXPORT_DECISION_STORAGE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl FrozenExportDecision {
@@ -130,6 +142,18 @@ impl FrozenExportDecision {
     /// Returns a stable allocation identity without exposing the backing storage.
     pub fn storage_id(&self) -> u64 {
         self.storage_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_test(&self) -> FrozenExportDecisionSnapshot {
+        FrozenExportDecisionSnapshot {
+            channels: self.channels().to_vec(),
+            export_range: self.export_range.clone(),
+            sample_rate: self.sample_rate,
+            valid: self.valid,
+            frozen_epoch: self.frozen_epoch,
+            storage_id: self.storage_id,
+        }
     }
 
     pub(crate) fn matches_frozen_epoch(&self, frozen: &FrozenCaptureEpoch) -> bool {

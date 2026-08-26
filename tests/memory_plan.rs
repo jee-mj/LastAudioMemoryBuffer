@@ -1,3 +1,8 @@
+use lamb::capture_runtime::{
+    CaptureRuntime, CaptureRuntimeParams, DEFAULT_CAPTURE_QUEUE_SLOTS,
+    DEFAULT_CAPTURE_WORKER_STACK_BYTES, DEFAULT_CONTROL_QUEUE_CAPACITY,
+    DEFAULT_IO_BUFFER_BYTES_PER_CHANNEL, DEFAULT_MAXIMUM_PATH_BYTES, DEFAULT_WORKER_STACK_BYTES,
+};
 use lamb::error::LambError;
 use lamb::memory_plan::{
     allocation_budget_bytes, required_bytes_with_headroom, ExactArray, Materializable,
@@ -109,6 +114,54 @@ fn calibration_duration_boundaries_and_detector_v1_ceil_geometry_are_checked() {
     let mut over_maximum = inputs();
     over_maximum.maximum_calibration_seconds = 31;
     assert!(SessionMemoryPlan::calculate(over_maximum).is_err());
+}
+
+#[test]
+fn capture_runtime_retains_the_startup_planned_calibration_capacity() {
+    // Catches recomputing calibration capacity from later daemon arithmetic or
+    // retaining a value that differs from the arena allocation plan.
+    for maximum_calibration_seconds in [0, 1, 30] {
+        let params = CaptureRuntimeParams {
+            seconds: 2,
+            chunk_frames_override: Some(4),
+            memory_max: None,
+            headroom: 1.0,
+            split_when_over_bytes: 1_000_000,
+            io_buffer_bytes_per_channel: DEFAULT_IO_BUFFER_BYTES_PER_CHANNEL,
+            maximum_path_bytes: DEFAULT_MAXIMUM_PATH_BYTES,
+            maximum_calibration_seconds,
+            capture_queue_slots: DEFAULT_CAPTURE_QUEUE_SLOTS,
+            capture_worker_stack_bytes: DEFAULT_CAPTURE_WORKER_STACK_BYTES,
+            control_queue_capacity: DEFAULT_CONTROL_QUEUE_CAPACITY,
+            worker_stack_bytes: DEFAULT_WORKER_STACK_BYTES,
+        };
+        let plan = SessionMemoryPlan::calculate(SessionMemoryInputs {
+            retention_frames: 96_000,
+            channels: 1,
+            sample_rate: 48_000,
+            sample_format: SampleFormat::F32Le,
+            chunk_frames: 4,
+            max_active_snapshots: 1,
+            sample_bytes: 4,
+            split_when_over_bytes: params.split_when_over_bytes,
+            control_queue_capacity: params.control_queue_capacity,
+            worker_stack_bytes: params.worker_stack_bytes,
+            capture_queue_slots: params.capture_queue_slots,
+            capture_slot_frames: 4,
+            capture_worker_stack_bytes: params.capture_worker_stack_bytes,
+            io_buffer_bytes_per_channel: params.io_buffer_bytes_per_channel,
+            maximum_path_bytes: params.maximum_path_bytes,
+            maximum_calibration_seconds,
+            headroom: params.headroom,
+        })
+        .unwrap();
+
+        let (runtime, _ingress) = CaptureRuntime::build(params, 48_000, 1).unwrap();
+        assert_eq!(
+            runtime.calibration_sample_frames(),
+            plan.calibration_sample_frames()
+        );
+    }
 }
 
 #[test]

@@ -38,9 +38,14 @@ pub struct CaptureRuntime {
     pub arena: CaptureArena,
     pub workspace: PersistenceWorkspace,
     pub frozen_export_decision: FrozenExportDecision,
+    calibration_sample_frames: u64,
 }
 
 impl CaptureRuntime {
+    pub fn calibration_sample_frames(&self) -> u64 {
+        self.calibration_sample_frames
+    }
+
     pub fn build(
         params: CaptureRuntimeParams,
         sample_rate: u32,
@@ -112,6 +117,7 @@ impl CaptureRuntime {
                 arena,
                 workspace,
                 frozen_export_decision,
+                calibration_sample_frames: plan.calibration_sample_frames(),
             },
             ingress,
         ))

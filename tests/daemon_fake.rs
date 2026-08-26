@@ -4,7 +4,126 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lamb::control::{send_request, ControlRequest, ControlResponse, PersistenceOutcomeResponse};
+use lamb::activity::ThresholdSource;
+use lamb::calibration::{ConfiguredDeviceSelector, InputBackend, StaleReason};
+use lamb::control::{
+    send_request, CalibrationEvaluation, CalibrationReportStatus, ConfiguredInputReport,
+    ControlRequest, ControlResponse, PersistenceOutcomeResponse, StoredThresholdReport,
+    ThresholdChannelReport, ThresholdReport, ThresholdRequest,
+};
+
+#[test]
+fn threshold_requests_round_trip_through_the_nested_protocol() {
+    let request = ControlRequest::Threshold {
+        request: ThresholdRequest::Calibrate {
+            profile: "studio".to_string(),
+            channel: "mic".to_string(),
+            seconds: 5,
+        },
+    };
+
+    let encoded = serde_json::to_string(&request).unwrap();
+    assert_eq!(
+        encoded,
+        r#"{"command":"threshold","request":{"operation":"calibrate","profile":"studio","channel":"mic","seconds":5}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<ControlRequest>(&encoded).unwrap(),
+        request
+    );
+}
+
+#[test]
+fn threshold_report_is_optional_for_legacy_response_compatibility() {
+    let old: ControlResponse =
+        serde_json::from_str(r#"{"ok":true,"message":"status","status":null}"#).unwrap();
+    assert_eq!(old.threshold_report, None);
+
+    let report = ThresholdReport {
+        profile: "studio".to_string(),
+        active_profile: true,
+        capturing: false,
+        channels: vec![ThresholdChannelReport {
+            channel: "mic".to_string(),
+            detector: "windowed-rms-peak".to_string(),
+            detector_version: "windowed-rms-peak-v1".to_string(),
+            configured_input: ConfiguredInputReport {
+                backend: InputBackend::PipeWire,
+                selector: ConfiguredDeviceSelector::PipeWireAuto,
+                source: "source_FL".to_string(),
+                input_id: "a".repeat(64),
+            },
+            stored: Some(StoredThresholdReport {
+                threshold_dbfs: -42.0,
+                source: ThresholdSource::Manual,
+                updated_at_unix_seconds: 7,
+                age_seconds: Some(3),
+                calibration_id: None,
+            }),
+            artifact_status: CalibrationReportStatus::NotApplicable,
+            current_live_identity: None,
+            configured_identity_matches: None,
+            calibration_evaluation: CalibrationEvaluation::NotResolved,
+            effective_threshold_dbfs: Some(-42.0),
+        }],
+        message: "stored manual threshold".to_string(),
+    };
+    let response = ControlResponse {
+        ok: true,
+        message: "threshold updated".to_string(),
+        status: None,
+        persistence_outcome: None,
+        threshold_report: Some(report.clone()),
+    };
+    assert_eq!(
+        serde_json::from_str::<ControlResponse>(&serde_json::to_string(&response).unwrap())
+            .unwrap(),
+        response
+    );
+}
+
+#[test]
+fn threshold_report_round_trips_all_typed_profile_wide_fields() {
+    let report = ThresholdReport {
+        profile: "studio".to_string(),
+        active_profile: false,
+        capturing: false,
+        channels: vec![ThresholdChannelReport {
+            channel: "mic".to_string(),
+            detector: "windowed-rms-peak".to_string(),
+            detector_version: "windowed-rms-peak-v1".to_string(),
+            configured_input: ConfiguredInputReport {
+                backend: InputBackend::Jack,
+                selector: ConfiguredDeviceSelector::JackSourceClient("system".to_string()),
+                source: "system:capture_1".to_string(),
+                input_id: "b".repeat(64),
+            },
+            stored: Some(StoredThresholdReport {
+                threshold_dbfs: -48.0,
+                source: ThresholdSource::Calibrated,
+                updated_at_unix_seconds: 10,
+                age_seconds: Some(5),
+                calibration_id: Some("cal-1".to_string()),
+            }),
+            artifact_status: CalibrationReportStatus::Stale {
+                reason: StaleReason::MissingLiveIdentity,
+            },
+            current_live_identity: None,
+            configured_identity_matches: None,
+            calibration_evaluation: CalibrationEvaluation::NotResolved,
+            effective_threshold_dbfs: None,
+        }],
+        message: "threshold report".to_string(),
+    };
+
+    let encoded = serde_json::to_string(&report).unwrap();
+    assert!(encoded.contains("configured_input"), "{encoded}");
+    assert!(encoded.contains("calibration_evaluation"), "{encoded}");
+    assert_eq!(
+        serde_json::from_str::<ThresholdReport>(&encoded).unwrap(),
+        report
+    );
+}
 
 #[test]
 fn persistence_written_response_round_trips_with_source_frame_metadata() {
@@ -26,6 +145,7 @@ fn persistence_written_response_round_trips_with_source_frame_metadata() {
             output_directory: PathBuf::from("/tmp/out/20260818T120000"),
             files: vec![PathBuf::from("/tmp/out/20260818T120000/mic.wav")],
         }),
+        threshold_report: None,
     };
 
     let encoded = serde_json::to_string(&response).unwrap();
@@ -51,6 +171,7 @@ fn persistence_non_written_responses_round_trip_as_successes() {
                 cleared_frames: 0,
                 capture_dropped_frames: 0,
             }),
+            threshold_report: None,
         },
         ControlResponse {
             ok: true,
@@ -62,6 +183,7 @@ fn persistence_non_written_responses_round_trip_as_successes() {
                 cleared_frames: 0,
                 capture_dropped_frames: 0,
             }),
+            threshold_report: None,
         },
     ];
 

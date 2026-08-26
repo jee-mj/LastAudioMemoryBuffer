@@ -3,7 +3,7 @@ use crate::activity::{ThresholdSource, WINDOWED_RMS_PEAK_DETECTOR_VERSION};
 use crate::app_config::{ActivityThresholdConfig, AppConfig};
 use crate::capture_arena::CalibrationLease;
 use crate::error::{io_error, LambError, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
@@ -19,17 +19,236 @@ const STALE_SECONDS: u64 = 30 * 24 * 60 * 60;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputBackend {
+    PipeWire,
+    Jack,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StableInputIdentity {
-    pub backend: String,
-    pub device: String,
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub enum ConfiguredDeviceSelector {
+    PipeWireTarget(String),
+    PipeWireAuto,
+    JackSourceClient(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LiveDeviceKeyKind {
+    HardwareSerial,
+    ObjectPath,
+    NodeName,
+    JackSourceClient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedLiveInputIdentity {
+    pub backend: InputBackend,
+    pub key_kind: LiveDeviceKeyKind,
+    pub key_value: String,
+    pub resolved_source: String,
+}
+
+impl ResolvedLiveInputIdentity {
+    pub fn new(
+        backend: InputBackend,
+        key_kind: LiveDeviceKeyKind,
+        key_value: &str,
+        resolved_source: &str,
+    ) -> Result<Self> {
+        let key_value = canonical_identity_field(key_value, "live device key")?;
+        let resolved_source = canonical_identity_field(resolved_source, "resolved source")?;
+        match (backend, key_kind) {
+            (InputBackend::PipeWire, LiveDeviceKeyKind::JackSourceClient)
+            | (InputBackend::Jack, LiveDeviceKeyKind::HardwareSerial)
+            | (InputBackend::Jack, LiveDeviceKeyKind::ObjectPath)
+            | (InputBackend::Jack, LiveDeviceKeyKind::NodeName) => {
+                return Err(LambError::Validation(
+                    "live device key kind does not match backend".into(),
+                ));
+            }
+            _ => {}
+        }
+        if backend == InputBackend::Jack {
+            validate_jack_source(&key_value, &resolved_source)?;
+        }
+        Ok(Self {
+            backend,
+            key_kind,
+            key_value,
+            resolved_source,
+        })
+    }
+
+    fn validate_canonical(&self) -> Result<()> {
+        let canonical = Self::new(
+            self.backend,
+            self.key_kind,
+            &self.key_value,
+            &self.resolved_source,
+        )?;
+        if *self != canonical {
+            return Err(LambError::Validation(
+                "resolved live input identity is not canonical".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfiguredInputIdentity {
+    pub backend: InputBackend,
+    pub selector: ConfiguredDeviceSelector,
     pub name: String,
     pub source: String,
     input_id: String,
 }
 
-impl StableInputIdentity {
-    pub fn new(backend: &str, device: &str, name: &str, source: &str) -> Result<Self> {
+impl ConfiguredInputIdentity {
+    pub fn new(
+        backend: InputBackend,
+        selector: ConfiguredDeviceSelector,
+        name: &str,
+        source: &str,
+    ) -> Result<Self> {
+        let name = canonical_identity_field(name, "configured channel name")?;
+        let source = canonical_identity_field(source, "configured source")?;
+        let selector = match selector {
+            ConfiguredDeviceSelector::PipeWireTarget(value) => {
+                ConfiguredDeviceSelector::PipeWireTarget(canonical_identity_field(
+                    &value,
+                    "PipeWire target",
+                )?)
+            }
+            ConfiguredDeviceSelector::PipeWireAuto => ConfiguredDeviceSelector::PipeWireAuto,
+            ConfiguredDeviceSelector::JackSourceClient(value) => {
+                ConfiguredDeviceSelector::JackSourceClient(canonical_identity_field(
+                    &value,
+                    "JACK source client",
+                )?)
+            }
+        };
+        match (&backend, &selector) {
+            (InputBackend::PipeWire, ConfiguredDeviceSelector::PipeWireTarget(_))
+            | (InputBackend::PipeWire, ConfiguredDeviceSelector::PipeWireAuto)
+            | (InputBackend::Jack, ConfiguredDeviceSelector::JackSourceClient(_)) => {}
+            _ => {
+                return Err(LambError::Validation(
+                    "configured device selector does not match backend".into(),
+                ));
+            }
+        }
+        if let ConfiguredDeviceSelector::JackSourceClient(client) = &selector {
+            validate_jack_source(client, &source)?;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"lamb/configured-input-identity/v2\0");
+        hash_identity_field(
+            &mut hasher,
+            match backend {
+                InputBackend::PipeWire => b"pipewire",
+                InputBackend::Jack => b"jack",
+            },
+        )?;
+        match &selector {
+            ConfiguredDeviceSelector::PipeWireTarget(value) => {
+                hash_identity_field(&mut hasher, b"pipewire-target")?;
+                hash_identity_field(&mut hasher, value.as_bytes())?;
+            }
+            ConfiguredDeviceSelector::PipeWireAuto => {
+                hash_identity_field(&mut hasher, b"pipewire-auto")?;
+            }
+            ConfiguredDeviceSelector::JackSourceClient(value) => {
+                hash_identity_field(&mut hasher, b"jack-source-client")?;
+                hash_identity_field(&mut hasher, value.as_bytes())?;
+            }
+        }
+        hash_identity_field(&mut hasher, name.as_bytes())?;
+        hash_identity_field(&mut hasher, source.as_bytes())?;
+        Ok(Self {
+            backend,
+            selector,
+            name,
+            source,
+            input_id: format!("{:x}", hasher.finalize()),
+        })
+    }
+
+    pub fn input_id(&self) -> &str {
+        &self.input_id
+    }
+
+    fn validate_canonical(&self) -> Result<()> {
+        let exact_lowercase_sha256 = self.input_id.len() == 64
+            && self
+                .input_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let canonical = Self::new(
+            self.backend,
+            self.selector.clone(),
+            &self.name,
+            &self.source,
+        )?;
+        if !exact_lowercase_sha256 || *self != canonical {
+            return Err(LambError::Validation(
+                "configured input identity is not canonical".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn canonical_identity_field(value: &str, label: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(LambError::Validation(format!("{label} must be non-empty")));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_jack_source(client: &str, source: &str) -> Result<()> {
+    let mut components = source.split(':');
+    let source_client = components.next().unwrap_or_default();
+    let Some(port) = components.next() else {
+        return Err(LambError::Validation(
+            "JACK source must be a complete client:port".into(),
+        ));
+    };
+    if source_client.is_empty()
+        || port.is_empty()
+        || components.next().is_some()
+        || source_client != client
+    {
+        return Err(LambError::Validation(
+            "JACK source must match its non-empty source client".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn hash_identity_field(hasher: &mut Sha256, value: &[u8]) -> Result<()> {
+    let len = u64::try_from(value.len())
+        .map_err(|_| LambError::Validation("identity field too long".into()))?;
+    hasher.update(len.to_be_bytes());
+    hasher.update(value);
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct LegacyInputIdentity {
+    backend: String,
+    device: String,
+    name: String,
+    source: String,
+    input_id: String,
+}
+
+impl LegacyInputIdentity {
+    fn new(backend: &str, device: &str, name: &str, source: &str) -> Result<Self> {
         let fields = [backend, device, name, source].map(|field| {
             let value = field.trim();
             if value.is_empty() {
@@ -59,7 +278,7 @@ impl StableInputIdentity {
             input_id,
         })
     }
-    pub fn input_id(&self) -> &str {
+    fn input_id(&self) -> &str {
         &self.input_id
     }
 
@@ -104,11 +323,14 @@ pub fn default_state_root() -> Result<PathBuf> {
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CalibrationMetadata {
     pub version: u32,
     pub calibration_id: String,
-    pub input: StableInputIdentity,
+    #[serde(rename = "input", skip_serializing_if = "Option::is_none")]
+    pub configured_input: Option<ConfiguredInputIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_live_input: Option<ResolvedLiveInputIdentity>,
     pub input_id: String,
     pub detector_version: String,
     pub threshold_dbfs: f32,
@@ -120,9 +342,70 @@ pub struct CalibrationMetadata {
     pub frames: u64,
     pub sample_rate: u32,
     pub created_at_unix_seconds: u64,
+    #[serde(skip)]
+    legacy_input: Option<LegacyInputIdentity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize)]
+struct CalibrationMetadataWire {
+    version: u32,
+    calibration_id: String,
+    input: serde_json::Value,
+    #[serde(default)]
+    resolved_live_input: Option<ResolvedLiveInputIdentity>,
+    input_id: String,
+    detector_version: String,
+    threshold_dbfs: f32,
+    p95_rms: f32,
+    observed_peak: f32,
+    complete_windows: u64,
+    partial_final_frames: u64,
+    dropped_frames: u64,
+    frames: u64,
+    sample_rate: u32,
+    created_at_unix_seconds: u64,
+}
+
+impl<'de> Deserialize<'de> for CalibrationMetadata {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CalibrationMetadataWire::deserialize(deserializer)?;
+        let (configured_input, legacy_input) = if wire.version == 1 {
+            (
+                None,
+                Some(serde_json::from_value(wire.input).map_err(serde::de::Error::custom)?),
+            )
+        } else {
+            (
+                Some(serde_json::from_value(wire.input).map_err(serde::de::Error::custom)?),
+                None,
+            )
+        };
+        Ok(Self {
+            version: wire.version,
+            calibration_id: wire.calibration_id,
+            configured_input,
+            resolved_live_input: wire.resolved_live_input,
+            input_id: wire.input_id,
+            detector_version: wire.detector_version,
+            threshold_dbfs: wire.threshold_dbfs,
+            p95_rms: wire.p95_rms,
+            observed_peak: wire.observed_peak,
+            complete_windows: wire.complete_windows,
+            partial_final_frames: wire.partial_final_frames,
+            dropped_frames: wire.dropped_frames,
+            frames: wire.frames,
+            sample_rate: wire.sample_rate,
+            created_at_unix_seconds: wire.created_at_unix_seconds,
+            legacy_input,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum StaleReason {
     MissingCalibrationId,
     MissingState,
@@ -134,6 +417,8 @@ pub enum StaleReason {
     DetectorMismatch,
     SampleRateMismatch,
     InputMismatch,
+    MissingLiveIdentity,
+    LiveIdentityMismatch,
     Expired,
     FutureTimestamp,
     IncoherentTimestamp,
@@ -143,6 +428,18 @@ pub enum StaleReason {
 pub enum CalibrationValidity {
     Valid,
     Stale(StaleReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalibrationArtifactStatus {
+    Complete,
+    Stale(StaleReason),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalibrationArtifactInspection {
+    pub status: CalibrationArtifactStatus,
+    pub metadata: Option<CalibrationMetadata>,
 }
 
 /// Explicit, caller-owned failure-injection seam for durability tests.
@@ -192,18 +489,18 @@ pub fn derive_calibrated_threshold(stats: &mut [f32]) -> Result<f32> {
 }
 
 fn derived_threshold_from_amplitude(amplitude: f32) -> Result<f32> {
-    let dbfs = if amplitude == 0.0 {
+    let dbfs = if amplitude <= 0.0 {
         -120.0
     } else {
-        20.0 * amplitude.log10()
+        (20.0 * amplitude.log10()).max(-120.0)
     };
-    let threshold = dbfs + 10.0;
-    if !threshold.is_finite() || !(-120.0..=0.0).contains(&threshold) {
+    let threshold_dbfs = dbfs + 10.0;
+    if !threshold_dbfs.is_finite() || !(-120.0..=0.0).contains(&threshold_dbfs) {
         return Err(LambError::Validation(
             "derived calibration threshold is outside [-120, 0] dBFS".into(),
         ));
     }
-    Ok(threshold)
+    Ok(threshold_dbfs)
 }
 
 #[derive(Debug)]
@@ -230,6 +527,50 @@ impl CalibrationStore {
             maximum_frames,
         })
     }
+
+    /// Inspects one generation from a caller-owned state root without creating
+    /// a preparation-capable store with an invented capture-session capacity.
+    pub fn inspect_root(
+        root: impl AsRef<Path>,
+        threshold: &ActivityThresholdConfig,
+        input: &ConfiguredInputIdentity,
+        now: u64,
+    ) -> Result<CalibrationArtifactInspection> {
+        // RIFF's 32-bit chunk length is the format-level upper bound. This is
+        // used only by the associated inspection call and is never returned as
+        // a store that could prepare a calibration sample.
+        let maximum_frames = u64::from((u32::MAX - 36) / 4);
+        Self::new(root, maximum_frames)?.inspect_offline(threshold, input, now)
+    }
+
+    /// Validates against live session facts using that session's real planned
+    /// calibration capacity rather than a maintenance-only synthetic bound.
+    pub fn validate_root(
+        root: impl AsRef<Path>,
+        maximum_frames: u64,
+        threshold: &ActivityThresholdConfig,
+        input: &ConfiguredInputIdentity,
+        current_live_input: Option<&ResolvedLiveInputIdentity>,
+        sample_rate: u32,
+        now: u64,
+    ) -> Result<CalibrationValidity> {
+        Self::new(root, maximum_frames)?.validate(
+            threshold,
+            input,
+            current_live_input,
+            sample_rate,
+            now,
+        )
+    }
+
+    /// Reconciles generations beneath a caller-owned state root without a
+    /// capture session or sample-sized allocation.
+    pub fn cleanup_root(
+        root: impl AsRef<Path>,
+        referenced: &BTreeSet<(String, String)>,
+    ) -> Result<Vec<PathBuf>> {
+        Self::new(root, 1)?.cleanup_offline(referenced)
+    }
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -239,7 +580,8 @@ impl CalibrationStore {
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_generated(
         &self,
-        input: &StableInputIdentity,
+        input: &ConfiguredInputIdentity,
+        live_input: &ResolvedLiveInputIdentity,
         samples: &[f32],
         sample_rate: u32,
         threshold_dbfs: f32,
@@ -251,6 +593,7 @@ impl CalibrationStore {
             let id = next_generation_id(created_at_unix_seconds)?;
             match self.prepare(
                 input,
+                live_input,
                 &id,
                 samples,
                 sample_rate,
@@ -270,14 +613,41 @@ impl CalibrationStore {
     }
     pub fn prepare_generated_lease(
         &self,
-        input: &StableInputIdentity,
+        input: &ConfiguredInputIdentity,
+        live_input: &ResolvedLiveInputIdentity,
         lease: &mut CalibrationLease<'_>,
         threshold_dbfs: f32,
         created_at_unix_seconds: u64,
     ) -> Result<PreparedCalibrationGeneration> {
+        self.prepare_generated_lease_with_hook(
+            input,
+            live_input,
+            lease,
+            threshold_dbfs,
+            created_at_unix_seconds,
+            &mut |_| Ok(()),
+        )
+    }
+    pub fn prepare_generated_lease_with_hook(
+        &self,
+        input: &ConfiguredInputIdentity,
+        live_input: &ResolvedLiveInputIdentity,
+        lease: &mut CalibrationLease<'_>,
+        threshold_dbfs: f32,
+        created_at_unix_seconds: u64,
+        hook: &mut DurabilityHook<'_>,
+    ) -> Result<PreparedCalibrationGeneration> {
         for _ in 0..1024 {
             let id = next_generation_id(created_at_unix_seconds)?;
-            match self.prepare_lease(input, &id, lease, threshold_dbfs, created_at_unix_seconds) {
+            match self.prepare_lease_with_hook(
+                input,
+                live_input,
+                &id,
+                lease,
+                threshold_dbfs,
+                created_at_unix_seconds,
+                hook,
+            ) {
                 Err(LambError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::AlreadyExists => {}
                 result => return result,
@@ -290,7 +660,8 @@ impl CalibrationStore {
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &self,
-        input: &StableInputIdentity,
+        input: &ConfiguredInputIdentity,
+        live_input: &ResolvedLiveInputIdentity,
         calibration_id: &str,
         samples: &[f32],
         sample_rate: u32,
@@ -301,6 +672,7 @@ impl CalibrationStore {
     ) -> Result<PreparedCalibrationGeneration> {
         self.prepare_with_hook(
             input,
+            live_input,
             calibration_id,
             samples,
             sample_rate,
@@ -314,7 +686,8 @@ impl CalibrationStore {
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_with_hook(
         &self,
-        input: &StableInputIdentity,
+        input: &ConfiguredInputIdentity,
+        live_input: &ResolvedLiveInputIdentity,
         calibration_id: &str,
         samples: &[f32],
         sample_rate: u32,
@@ -326,6 +699,7 @@ impl CalibrationStore {
     ) -> Result<PreparedCalibrationGeneration> {
         self.prepare_captured_with_hook(
             input,
+            live_input,
             calibration_id,
             samples,
             sample_rate,
@@ -341,7 +715,8 @@ impl CalibrationStore {
     #[allow(clippy::too_many_arguments)]
     fn prepare_captured_with_hook(
         &self,
-        input: &StableInputIdentity,
+        input: &ConfiguredInputIdentity,
+        live_input: &ResolvedLiveInputIdentity,
         calibration_id: &str,
         samples: &[f32],
         sample_rate: u32,
@@ -354,6 +729,7 @@ impl CalibrationStore {
         hook: &mut DurabilityHook<'_>,
     ) -> Result<PreparedCalibrationGeneration> {
         input.validate_canonical()?;
+        live_input.validate_canonical()?;
         let frames = u64::try_from(samples.len())
             .map_err(|_| LambError::Validation("calibration sample count overflow".into()))?;
         if frames > self.maximum_frames {
@@ -423,9 +799,10 @@ impl CalibrationStore {
                 hook,
             )?;
             let metadata = CalibrationMetadata {
-                version: 1,
+                version: 2,
                 calibration_id: calibration_id.into(),
-                input: input.clone(),
+                configured_input: Some(input.clone()),
+                resolved_live_input: Some(live_input.clone()),
                 input_id: input.input_id().into(),
                 detector_version: WINDOWED_RMS_PEAK_DETECTOR_VERSION.into(),
                 threshold_dbfs,
@@ -437,6 +814,7 @@ impl CalibrationStore {
                 frames,
                 sample_rate,
                 created_at_unix_seconds,
+                legacy_input: None,
             };
             write_metadata_at(
                 &generation_dir,
@@ -465,6 +843,7 @@ impl CalibrationStore {
                 &generation_dir,
                 &dir,
                 input,
+                live_input,
                 calibration_id,
                 Some(sample_rate),
                 self.maximum_frames,
@@ -481,11 +860,33 @@ impl CalibrationStore {
     }
     pub fn prepare_lease(
         &self,
-        input: &StableInputIdentity,
+        input: &ConfiguredInputIdentity,
+        live_input: &ResolvedLiveInputIdentity,
         calibration_id: &str,
         lease: &mut CalibrationLease<'_>,
         threshold_dbfs: f32,
         created_at_unix_seconds: u64,
+    ) -> Result<PreparedCalibrationGeneration> {
+        self.prepare_lease_with_hook(
+            input,
+            live_input,
+            calibration_id,
+            lease,
+            threshold_dbfs,
+            created_at_unix_seconds,
+            &mut |_| Ok(()),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_lease_with_hook(
+        &self,
+        input: &ConfiguredInputIdentity,
+        live_input: &ResolvedLiveInputIdentity,
+        calibration_id: &str,
+        lease: &mut CalibrationLease<'_>,
+        threshold_dbfs: f32,
+        created_at_unix_seconds: u64,
+        hook: &mut DurabilityHook<'_>,
     ) -> Result<PreparedCalibrationGeneration> {
         let lease_metadata = lease.metadata();
         if !lease_metadata.usable
@@ -504,6 +905,7 @@ impl CalibrationStore {
         let (samples, rms, peak) = lease.persistence_parts_mut();
         self.prepare_captured_with_hook(
             input,
+            live_input,
             calibration_id,
             samples,
             sample_rate,
@@ -513,13 +915,14 @@ impl CalibrationStore {
             created_at_unix_seconds,
             lease_metadata.partial_final_frames,
             lease_metadata.dropped_frames,
-            &mut |_| Ok(()),
+            hook,
         )
     }
     pub fn validate(
         &self,
         threshold: &ActivityThresholdConfig,
-        input: &StableInputIdentity,
+        input: &ConfiguredInputIdentity,
+        current_live_input: Option<&ResolvedLiveInputIdentity>,
         sample_rate: u32,
         now: u64,
     ) -> Result<CalibrationValidity> {
@@ -529,6 +932,9 @@ impl CalibrationStore {
         }
         if threshold.threshold_source == ThresholdSource::Manual {
             return Ok(CalibrationValidity::Valid);
+        }
+        if let Some(live_input) = current_live_input {
+            live_input.validate_canonical()?;
         }
         let Some(id) = threshold
             .calibration_id
@@ -560,14 +966,24 @@ impl CalibrationStore {
         if metadata.frames > self.maximum_frames {
             return Ok(CalibrationValidity::Stale(StaleReason::CorruptMetadata));
         }
-        if metadata.version != 1 {
-            return Ok(CalibrationValidity::Stale(StaleReason::CorruptMetadata));
-        }
         if metadata.calibration_id != id {
             return Ok(CalibrationValidity::Stale(StaleReason::GenerationMismatch));
         }
-        if metadata.input_id != input.input_id() || metadata.input != *input {
+        if metadata.version == 1 {
+            return Ok(CalibrationValidity::Stale(StaleReason::MissingLiveIdentity));
+        }
+        if metadata.input_id != input.input_id()
+            || metadata.configured_input.as_ref() != Some(input)
+        {
             return Ok(CalibrationValidity::Stale(StaleReason::InputMismatch));
+        }
+        if metadata.resolved_live_input.is_none() || current_live_input.is_none() {
+            return Ok(CalibrationValidity::Stale(StaleReason::MissingLiveIdentity));
+        }
+        if metadata.resolved_live_input.as_ref() != current_live_input {
+            return Ok(CalibrationValidity::Stale(
+                StaleReason::LiveIdentityMismatch,
+            ));
         }
         if metadata.detector_version != WINDOWED_RMS_PEAK_DETECTOR_VERSION {
             return Ok(CalibrationValidity::Stale(StaleReason::DetectorMismatch));
@@ -604,6 +1020,112 @@ impl CalibrationStore {
             return Ok(CalibrationValidity::Stale(StaleReason::CorruptMetadata));
         }
         Ok(CalibrationValidity::Valid)
+    }
+
+    /// Inspects persisted calibration artifacts without making any claim about
+    /// the current live device. All reads remain descriptor-relative and bounded.
+    pub fn inspect_offline(
+        &self,
+        threshold: &ActivityThresholdConfig,
+        input: &ConfiguredInputIdentity,
+        now: u64,
+    ) -> Result<CalibrationArtifactInspection> {
+        input.validate_canonical()?;
+        let stale = |reason, metadata| CalibrationArtifactInspection {
+            status: CalibrationArtifactStatus::Stale(reason),
+            metadata,
+        };
+        if threshold.input_id != input.input_id() {
+            return Ok(stale(StaleReason::InputMismatch, None));
+        }
+        if threshold.threshold_source == ThresholdSource::Manual {
+            return Ok(CalibrationArtifactInspection {
+                status: CalibrationArtifactStatus::Complete,
+                metadata: None,
+            });
+        }
+        let Some(id) = threshold
+            .calibration_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        else {
+            return Ok(stale(StaleReason::MissingCalibrationId, None));
+        };
+        if !safe_id(id) {
+            return Ok(stale(StaleReason::GenerationMismatch, None));
+        }
+        let dir = self.root.join(input.input_id()).join(id);
+        let generation = match open_generation(&self.root, input.input_id(), id) {
+            Ok(generation) => generation,
+            Err(_) => return Ok(stale(StaleReason::MissingState, None)),
+        };
+        let metadata =
+            match read_metadata_at(&generation, "metadata.json", &dir.join("metadata.json")) {
+                Ok(metadata) => metadata,
+                Err(LambError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(stale(StaleReason::MissingMetadata, None));
+                }
+                Err(_) => return Ok(stale(StaleReason::CorruptMetadata, None)),
+            };
+        if metadata.frames > self.maximum_frames {
+            return Ok(stale(StaleReason::CorruptMetadata, Some(metadata)));
+        }
+        if metadata.calibration_id != id {
+            return Ok(stale(StaleReason::GenerationMismatch, Some(metadata)));
+        }
+        if metadata.version == 1 {
+            return Ok(stale(StaleReason::MissingLiveIdentity, Some(metadata)));
+        }
+        if metadata.input_id != input.input_id()
+            || metadata.configured_input.as_ref() != Some(input)
+        {
+            return Ok(stale(StaleReason::InputMismatch, Some(metadata)));
+        }
+        if metadata.resolved_live_input.is_none() {
+            return Ok(stale(StaleReason::MissingLiveIdentity, Some(metadata)));
+        }
+        if metadata.detector_version != WINDOWED_RMS_PEAK_DETECTOR_VERSION {
+            return Ok(stale(StaleReason::DetectorMismatch, Some(metadata)));
+        }
+        if metadata.created_at_unix_seconds > now {
+            return Ok(stale(StaleReason::FutureTimestamp, Some(metadata)));
+        }
+        if metadata.created_at_unix_seconds != threshold.updated_at_unix_seconds {
+            return Ok(stale(StaleReason::IncoherentTimestamp, Some(metadata)));
+        }
+        if f64::from(metadata.threshold_dbfs) != threshold.threshold_dbfs {
+            return Ok(stale(StaleReason::ThresholdMismatch, Some(metadata)));
+        }
+        if now - metadata.created_at_unix_seconds > STALE_SECONDS {
+            return Ok(stale(StaleReason::Expired, Some(metadata)));
+        }
+        let sample_abs_peak = match validate_wav_at(
+            &generation,
+            "sample.wav",
+            &dir.join("sample.wav"),
+            metadata.sample_rate,
+            metadata.frames,
+        ) {
+            Ok(sample_abs_peak) => sample_abs_peak,
+            Err(LambError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(stale(StaleReason::MissingSample, Some(metadata)));
+            }
+            Err(_) => return Ok(stale(StaleReason::CorruptSample, Some(metadata))),
+        };
+        if metadata.observed_peak > sample_abs_peak {
+            return Ok(stale(StaleReason::CorruptMetadata, Some(metadata)));
+        }
+        Ok(CalibrationArtifactInspection {
+            status: CalibrationArtifactStatus::Complete,
+            metadata: Some(metadata),
+        })
+    }
+
+    /// Descriptor-safe cleanup callable during startup/reset without a capture session.
+    pub fn cleanup_offline(&self, referenced: &BTreeSet<(String, String)>) -> Result<Vec<PathBuf>> {
+        self.cleanup_unreferenced(referenced)
     }
 
     /// Startup maintenance for generations which are not referenced by the
@@ -1020,6 +1542,7 @@ pub fn commit_prepared_generation_with_hooks(
         if config_save_failure_outcome(&operation) == ConfigSaveFailureOutcome::NotEstablished {
             // The candidate may still be installed and reference this generation. Preserve the
             // orphan so startup reconciliation can inspect the durable config and remove it safely.
+            prepared.mark_authoritative();
             return Err(operation);
         }
         return Err(cleanup_failed_precommit(operation, prepared, cleanup_hook));
@@ -1375,21 +1898,23 @@ fn write_wav(
 fn validate_generation(
     generation: &File,
     dir: &Path,
-    input: &StableInputIdentity,
+    input: &ConfiguredInputIdentity,
+    live_input: &ResolvedLiveInputIdentity,
     id: &str,
     sample_rate: Option<u32>,
     maximum_frames: u64,
 ) -> Result<CalibrationMetadata> {
     let metadata = read_metadata_at(generation, "metadata.json", &dir.join("metadata.json"))?;
     if metadata.frames > maximum_frames
-        || metadata.version != 1
+        || metadata.version != 2
         || metadata.calibration_id != id
         || metadata.input_id != input.input_id()
-        || metadata.input != *input
+        || metadata.configured_input.as_ref() != Some(input)
+        || metadata.resolved_live_input.as_ref() != Some(live_input)
         || sample_rate.is_some_and(|rate| rate != metadata.sample_rate)
     {
         return Err(LambError::Validation(
-            "calibration metadata does not match live input".into(),
+            "calibration metadata does not match configured and live input".into(),
         ));
     }
     let wav = dir.join("sample.wav");
@@ -1437,18 +1962,30 @@ fn read_metadata(path: &Path) -> Result<CalibrationMetadata> {
     }
     let metadata: CalibrationMetadata = serde_json::from_slice(&bytes)
         .map_err(|e| LambError::Config(format!("invalid calibration metadata: {e}")))?;
-    let canonical_input = StableInputIdentity::new(
-        &metadata.input.backend,
-        &metadata.input.device,
-        &metadata.input.name,
-        &metadata.input.source,
-    )?;
-    if metadata.version != 1
+    let canonical_identity = match metadata.version {
+        1 => {
+            let legacy = metadata.legacy_input.as_ref().ok_or_else(|| {
+                LambError::Validation("metadata v1 lacks its legacy input identity".into())
+            })?;
+            legacy.validate_canonical()?;
+            metadata.input_id == legacy.input_id()
+        }
+        2 => {
+            let input = metadata.configured_input.as_ref().ok_or_else(|| {
+                LambError::Validation("metadata v2 lacks configured input identity".into())
+            })?;
+            input.validate_canonical()?;
+            if let Some(live_input) = metadata.resolved_live_input.as_ref() {
+                live_input.validate_canonical()?;
+            }
+            metadata.input_id == input.input_id()
+        }
+        _ => false,
+    };
+    if !canonical_identity
         || !safe_id(&metadata.calibration_id)
         || metadata.detector_version.is_empty()
         || metadata.detector_version.len() > 128
-        || metadata.input != canonical_input
-        || metadata.input_id != canonical_input.input_id()
         || metadata.input_id.len() != 64
         || !metadata
             .input_id
@@ -2167,13 +2704,8 @@ fn dummy_metadata() -> CalibrationMetadata {
     CalibrationMetadata {
         version: 0,
         calibration_id: String::new(),
-        input: StableInputIdentity {
-            backend: String::new(),
-            device: String::new(),
-            name: String::new(),
-            source: String::new(),
-            input_id: String::new(),
-        },
+        configured_input: None,
+        resolved_live_input: None,
         input_id: String::new(),
         detector_version: String::new(),
         threshold_dbfs: 0.0,
@@ -2185,6 +2717,7 @@ fn dummy_metadata() -> CalibrationMetadata {
         frames: 0,
         sample_rate: 0,
         created_at_unix_seconds: 0,
+        legacy_input: None,
     }
 }
 

@@ -57,6 +57,48 @@ enum Command {
         #[arg(long)]
         socket: PathBuf,
     },
+    Threshold {
+        #[command(subcommand)]
+        command: ThresholdCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThresholdCommand {
+    Calibrate {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=30))]
+        seconds: u32,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    Set {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long, allow_hyphen_values = true)]
+        dbfs: f64,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    Show {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    Reset {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -94,11 +136,72 @@ fn main() {
         } => lamb::control::client_start_capture(&socket, profile, activate),
         Command::StopCapture { socket } => lamb::control::client_stop_capture(&socket),
         Command::Reload { socket } => lamb::control::client_reload(&socket),
+        Command::Threshold { command } => run_threshold_command(command),
     };
 
     if let Err(err) = result {
         eprintln!("lamb: {err}");
         std::process::exit(1);
+    }
+}
+
+fn run_threshold_command(command: ThresholdCommand) -> lamb::error::Result<()> {
+    use lamb::control::ThresholdRequest;
+    let (socket, request) = match command {
+        ThresholdCommand::Calibrate {
+            profile,
+            channel,
+            seconds,
+            socket,
+        } => (
+            resolve_control_socket(socket)?,
+            ThresholdRequest::Calibrate {
+                profile,
+                channel,
+                seconds,
+            },
+        ),
+        ThresholdCommand::Set {
+            profile,
+            channel,
+            dbfs,
+            socket,
+        } => (
+            resolve_control_socket(socket)?,
+            ThresholdRequest::Set {
+                profile,
+                channel,
+                dbfs,
+            },
+        ),
+        ThresholdCommand::Show { profile, socket } => (
+            resolve_control_socket(socket)?,
+            ThresholdRequest::Show { profile },
+        ),
+        ThresholdCommand::Reset {
+            profile,
+            channel,
+            socket,
+        } => (
+            resolve_control_socket(socket)?,
+            ThresholdRequest::Reset { profile, channel },
+        ),
+    };
+    lamb::control::client_threshold(&socket, request)
+}
+
+fn resolve_control_socket(socket: Option<PathBuf>) -> lamb::error::Result<PathBuf> {
+    match socket {
+        Some(socket) => Ok(socket),
+        None => std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .map(|runtime| runtime.join("lamb/control.sock"))
+            .ok_or_else(|| {
+                lamb::error::LambError::Control(
+                    "cannot resolve default control socket: XDG_RUNTIME_DIR is unavailable"
+                        .to_string(),
+                )
+            }),
     }
 }
 

@@ -184,6 +184,17 @@ impl DumpCoordinator {
         coordinator
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_frozen_decision_for_test(
+        &self,
+    ) -> Result<Option<crate::activity::FrozenExportDecisionSnapshot>> {
+        let state = self.lock_state()?;
+        Ok(state
+            .frozen
+            .as_ref()
+            .map(|transaction| transaction.decision.snapshot_for_test()))
+    }
+
     pub fn dump<F>(&self, ring: &SampleRing, publisher: F) -> Result<DumpOutcome>
     where
         F: FnOnce(&SampleSnapshot) -> Result<PublishedOutput>,

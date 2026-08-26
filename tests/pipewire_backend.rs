@@ -1,3 +1,4 @@
+use lamb::calibration::LiveDeviceKeyKind;
 use lamb::capture_arena::{CaptureArena, CaptureRuntimeConfig};
 use lamb::capture_pipewire::{
     plan_explicit_links, process_interleaved_f32_chunk, resolve_target, resolve_target_from_graph,
@@ -228,6 +229,8 @@ fn node(id: u32, object_type: &str, media_class: &str, name: &str) -> AvailableN
         object_type: object_type.to_string(),
         media_class: Some(media_class.to_string()),
         name: Some(name.to_string()),
+        hardware_serial: None,
+        object_path: None,
         description: Some(format!("description for {name}")),
         channels: Some(2),
         sample_rate: Some(48_000),
@@ -300,6 +303,57 @@ fn default_target_selects_first_available_input_source() {
 
     assert_eq!(resolved.id, Some(31));
     assert_eq!(resolved.name, "studio-input");
+}
+
+#[test]
+fn resolved_targets_prefer_and_preserve_durable_live_keys() {
+    // Catches resolving a runtime ID-derived fallback, accepting blank semantic
+    // properties, or collapsing equal key text from different key kinds.
+    let cases = [
+        (
+            Some("  serial-7  "),
+            Some(" /devices/usb-7 "),
+            Some(" node-7 "),
+            Some((LiveDeviceKeyKind::HardwareSerial, "serial-7")),
+        ),
+        (
+            Some("   "),
+            Some(" /devices/usb-7 "),
+            Some(" node-7 "),
+            Some((LiveDeviceKeyKind::ObjectPath, "/devices/usb-7")),
+        ),
+        (
+            None,
+            Some("   "),
+            Some(" node-7 "),
+            Some((LiveDeviceKeyKind::NodeName, "node-7")),
+        ),
+        (None, None, Some("   "), None),
+    ];
+
+    for (serial, object_path, name, expected) in cases {
+        let mut source = node(7, "PipeWire:Interface:Node", "Audio/Source", "unused");
+        source.hardware_serial = serial.map(str::to_string);
+        source.object_path = object_path.map(str::to_string);
+        source.name = name.map(str::to_string);
+        let resolved = resolve_target_from_graph(&cfg(None), &[source], &target_ports(7)).unwrap();
+        assert_eq!(
+            resolved.durable_live_key(),
+            expected.map(|(kind, value)| (kind, value.to_string()))
+        );
+    }
+
+    let mut serial_node = node(8, "PipeWire:Interface:Node", "Audio/Source", "same");
+    serial_node.hardware_serial = Some("same".to_string());
+    let name_node = node(9, "PipeWire:Interface:Node", "Audio/Source", "same");
+    assert_ne!(
+        resolve_target_from_graph(&cfg(None), &[serial_node], &target_ports(8))
+            .unwrap()
+            .durable_live_key(),
+        resolve_target_from_graph(&cfg(None), &[name_node], &target_ports(9))
+            .unwrap()
+            .durable_live_key()
+    );
 }
 
 #[test]
@@ -796,6 +850,7 @@ fn resolved_target_log_message_includes_target_and_negotiated_format() {
         sample_rate: 48_000,
         format: "F32LE".to_string(),
         source_ports: Vec::new(),
+        durable_live_key: None,
     };
 
     assert_eq!(

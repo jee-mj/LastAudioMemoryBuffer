@@ -38,6 +38,7 @@ const CALIBRATION_FAILED: u8 = 7;
 const PRODUCER_OPEN: u64 = 1 << 63;
 const PRODUCER_COUNT_MASK: u64 = PRODUCER_OPEN - 1;
 const WORKER_IDLE_WAIT: Duration = Duration::from_millis(10);
+const CALIBRATION_ABORT_POLL: Duration = Duration::from_millis(50);
 static NEXT_CAPTURE_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +306,8 @@ struct RuntimeShared {
 struct CalibrationSlot {
     state: AtomicU8,
     request: UnsafeCell<MaybeUninit<CalibrationRequest>>,
+    #[cfg(test)]
+    preparing_pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     metadata: UnsafeCell<CalibrationCaptureMetadata>,
     samples: UnsafeCell<MaterializedBuffer<f32>>,
     rms: UnsafeCell<MaterializedBuffer<f32>>,
@@ -854,6 +857,8 @@ impl CalibrationSlot {
         Ok(Self {
             state: AtomicU8::new(CALIBRATION_IDLE),
             request: UnsafeCell::new(MaybeUninit::uninit()),
+            #[cfg(test)]
+            preparing_pause: Mutex::new(None),
             metadata: UnsafeCell::new(CalibrationCaptureMetadata {
                 frames: 0,
                 sample_rate: 0,
@@ -881,10 +886,48 @@ impl CalibrationSlot {
                 Ordering::Acquire,
             )
             .map_err(|_| LambError::ControlInvariant("calibration already pending"))?;
+        #[cfg(test)]
+        CaptureArena::run_calibration_pause(&self.preparing_pause);
         unsafe { (*self.request.get()).write(request) };
-        // The release store publishes the initialized request to the sole worker.
-        self.state.store(CALIBRATION_READY, Ordering::Release);
-        Ok(())
+        // The release CAS publishes the initialized request to the sole worker
+        // without overwriting an external cancellation that won while it was
+        // being initialized.
+        match self.state.compare_exchange(
+            CALIBRATION_PREPARING,
+            CALIBRATION_READY,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(CALIBRATION_CANCELLED | CALIBRATION_IDLE) => {
+                self.state.store(CALIBRATION_IDLE, Ordering::Release);
+                Err(LambError::CaptureInvariant(
+                    "calibration capture was cancelled",
+                ))
+            }
+            Err(_) => Err(LambError::ControlInvariant(
+                "calibration state changed while preparing",
+            )),
+        }
+    }
+
+    fn cancel(&self) -> bool {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            let replacement = match state {
+                CALIBRATION_PREPARING | CALIBRATION_CAPTURING => CALIBRATION_CANCELLED,
+                CALIBRATION_READY => CALIBRATION_IDLE,
+                _ => return false,
+            };
+            if self
+                .state
+                .compare_exchange(state, replacement, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.notify_waiters();
+                return true;
+            }
+        }
     }
 
     fn take_ready(&self) -> Option<CalibrationRequest> {
@@ -1050,6 +1093,36 @@ impl CaptureArena {
         request: CalibrationCaptureRequest,
         timeout: Duration,
     ) -> Result<CalibrationLease<'_>> {
+        self.calibrate_channel_until(request, timeout, || false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_calibration_pause(
+        &self,
+        before_accept: bool,
+    ) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let slot = if before_accept {
+            &self.shared.calibration_before_accept_pause
+        } else {
+            &self.shared.calibration_start_pause
+        };
+        *slot.lock().unwrap() = Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    /// Captures with the fixed deadline while periodically checking a caller
+    /// control-plane predicate. It never executes in realtime worker code.
+    pub fn calibrate_channel_until<F>(
+        &self,
+        request: CalibrationCaptureRequest,
+        timeout: Duration,
+        should_abort: F,
+    ) -> Result<CalibrationLease<'_>>
+    where
+        F: Fn() -> bool,
+    {
         let deadline = command_deadline(timeout)?;
         if request.channel >= self.shared.queue.channels {
             return Err(LambError::Validation(
@@ -1068,6 +1141,17 @@ impl CaptureArena {
         self.shared.wake.condvar.notify_one();
         loop {
             let state = self.shared.calibration.state.load(Ordering::Acquire);
+            if !matches!(state, CALIBRATION_COMPLETE | CALIBRATION_FAILED) && should_abort() {
+                if self.cancel_calibration() {
+                    return Err(LambError::CaptureInvariant(
+                        "calibration capture was cancelled",
+                    ));
+                }
+                // A terminal publication can win after the state load but
+                // before cancellation. Re-read and consume that winner rather
+                // than returning with COMPLETE/FAILED stranded in the slot.
+                continue;
+            }
             match state {
                 CALIBRATION_COMPLETE => {
                     if self
@@ -1171,14 +1255,27 @@ impl CaptureArena {
                         LambError::ControlInvariant("calibration wait mutex poisoned")
                     })?;
                     if self.shared.calibration.state.load(Ordering::Acquire) == state {
+                        let poll_deadline = Instant::now()
+                            .checked_add(CALIBRATION_ABORT_POLL)
+                            .unwrap_or(deadline);
                         let _ = self.shared.calibration.wait_condvar.wait_timeout(
                             guard,
-                            deadline.saturating_duration_since(Instant::now()),
+                            deadline
+                                .min(poll_deadline)
+                                .saturating_duration_since(Instant::now()),
                         );
                     }
                 }
             }
         }
+    }
+
+    pub fn cancel_calibration(&self) -> bool {
+        let cancelled = self.shared.calibration.cancel();
+        if cancelled {
+            self.shared.wake.condvar.notify_all();
+        }
+        cancelled
     }
 
     #[cfg(test)]
@@ -3865,6 +3962,360 @@ mod tests {
         wait_for_calibration_state(&arena, CALIBRATION_IDLE);
         let result = capture_after_worker_acceptance(&arena, &ingress, &[0.5; 20]);
         assert!(result.3.usable);
+    }
+
+    #[test]
+    fn external_cancellation_before_acceptance_is_idempotent_and_allows_reuse() {
+        // Catches external cancellation leaving a READY calibration admitted, or
+        // clearing it through the command slot instead of the calibration state.
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        arena.cancel_calibration();
+        arena.cancel_calibration();
+        let (entered, release) = install_pause(&arena.shared.calibration_before_accept_pause);
+        let request_arena = Arc::clone(&arena);
+        let cancelled = thread::spawn(move || {
+            request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    DEADLINE,
+                )
+                .map(|_| ())
+        });
+        entered.wait();
+        arena.cancel_calibration();
+        assert!(matches!(
+            cancelled.join().unwrap(),
+            Err(LambError::CaptureInvariant(
+                "calibration capture was cancelled"
+            ))
+        ));
+        release.wait();
+        wait_for_calibration_state(&arena, CALIBRATION_IDLE);
+        assert!(
+            capture_after_worker_acceptance(&arena, &ingress, &[0.5; 20])
+                .3
+                .usable
+        );
+    }
+
+    #[test]
+    fn external_cancellation_predicate_is_polled_and_cancels_before_deadline() {
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let checks = AtomicU64::new(0);
+
+        let error = arena
+            .calibrate_channel_until(
+                CalibrationCaptureRequest {
+                    channel: 0,
+                    frames: 20,
+                },
+                Duration::from_secs(2),
+                || checks.fetch_add(1, Ordering::AcqRel) >= 1,
+            )
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            error,
+            LambError::CaptureInvariant("calibration capture was cancelled")
+        ));
+        assert!(checks.load(Ordering::Acquire) >= 2);
+        assert!(
+            capture_after_worker_acceptance(&arena, &ingress, &[0.5; 20])
+                .3
+                .usable
+        );
+    }
+
+    #[test]
+    fn external_cancellation_during_preparing_never_publishes_the_request() {
+        // Catches changing begin's release CAS back to a release store: after
+        // PREPARING cancellation wins, no request may become READY for worker
+        // acceptance.
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let (entered, release) = install_pause(&arena.shared.calibration.preparing_pause);
+        let request_arena = Arc::clone(&arena);
+        let cancelled = thread::spawn(move || {
+            request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    DEADLINE,
+                )
+                .map(|_| ())
+        });
+        entered.wait();
+        assert_eq!(
+            arena.shared.calibration.state.load(Ordering::Acquire),
+            CALIBRATION_PREPARING
+        );
+        assert!(arena.cancel_calibration());
+        release.wait();
+        assert!(matches!(
+            cancelled.join().unwrap(),
+            Err(LambError::CaptureInvariant(
+                "calibration capture was cancelled"
+            ))
+        ));
+        assert_eq!(
+            arena.shared.calibration.state.load(Ordering::Acquire),
+            CALIBRATION_IDLE
+        );
+        assert!(
+            capture_after_worker_acceptance(&arena, &ingress, &[0.5; 20])
+                .3
+                .usable
+        );
+    }
+
+    #[test]
+    fn external_cancellation_waits_for_writer_relinquishment_and_keeps_status_available() {
+        // Catches treating CAPTURING as reusable before the worker has released
+        // its request ownership, or borrowing the ordinary command slot.
+        let (arena, _ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let (entered, release) = install_pause(&arena.shared.calibration_start_pause);
+        let request_arena = Arc::clone(&arena);
+        let cancelled = thread::spawn(move || {
+            request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    DEADLINE,
+                )
+                .map(|_| ())
+        });
+        entered.wait();
+        arena.cancel_calibration();
+        assert!(arena
+            .calibrate_channel(
+                CalibrationCaptureRequest {
+                    channel: 0,
+                    frames: 20,
+                },
+                DEADLINE,
+            )
+            .is_err());
+        release.wait();
+        assert!(matches!(
+            cancelled.join().unwrap(),
+            Err(LambError::CaptureInvariant(
+                "calibration capture was cancelled"
+            ))
+        ));
+        assert!(arena.status(DEADLINE).is_ok());
+    }
+
+    #[test]
+    fn external_cancellation_after_partial_writes_blocks_reuse_until_worker_relinquishes() {
+        // Catches cancelling only before the writer owns its sample buffer, or
+        // exposing the partial capture as a result/reusable slot.
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 10);
+        let (accepted, accepted_release) = install_pause(&arena.shared.calibration_start_pause);
+        let (partial, partial_release) =
+            install_pause(&arena.shared.calibration_after_consume_pause);
+        let request_arena = Arc::clone(&arena);
+        let cancelled = thread::spawn(move || {
+            request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 40,
+                    },
+                    DEADLINE,
+                )
+                .map(|_| ())
+        });
+        accepted.wait();
+        ingress.try_push_interleaved(&[0.25; 10], 1).unwrap();
+        accepted_release.wait();
+        partial.wait();
+        ingress.try_push_interleaved(&[0.75; 10], 1).unwrap();
+        let (second_partial, second_partial_release) =
+            install_pause(&arena.shared.calibration_after_consume_pause);
+        partial_release.wait();
+        second_partial.wait();
+        assert_eq!(
+            arena.shared.calibration.state.load(Ordering::Acquire),
+            CALIBRATION_CAPTURING
+        );
+        assert_eq!(
+            unsafe { (&*arena.shared.calibration.samples.get()).as_slice() }[..10],
+            [0.25; 10]
+        );
+        assert_eq!(
+            unsafe { (&*arena.shared.calibration.samples.get()).as_slice() }[10..20],
+            [0.75; 10]
+        );
+        assert!(arena.cancel_calibration());
+        assert!(arena
+            .calibrate_channel(
+                CalibrationCaptureRequest {
+                    channel: 0,
+                    frames: 40,
+                },
+                DEADLINE,
+            )
+            .is_err());
+        second_partial_release.wait();
+        assert!(matches!(
+            cancelled.join().unwrap(),
+            Err(LambError::CaptureInvariant(
+                "calibration capture was cancelled"
+            ))
+        ));
+        wait_for_calibration_state(&arena, CALIBRATION_IDLE);
+        let reused = capture_after_worker_acceptance(&arena, &ingress, &[0.5; 40]);
+        assert_eq!(reused.0, [0.5; 40]);
+        assert!(reused.3.usable);
+    }
+
+    #[test]
+    fn external_cancellation_does_not_overwrite_completed_calibration() {
+        // Catches cancellation replacing a completion that became terminal
+        // before the external signal was observed.
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let (accepted, accepted_release) = install_pause(&arena.shared.calibration_start_pause);
+        let (completed, completed_release) =
+            install_pause(&arena.shared.calibration_after_consume_pause);
+        let request_arena = Arc::clone(&arena);
+        let capture = thread::spawn(move || {
+            request_arena
+                .calibrate_channel(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    DEADLINE,
+                )
+                .map(|lease| lease.metadata())
+        });
+        accepted.wait();
+        ingress.try_push_interleaved(&[0.5; 20], 1).unwrap();
+        accepted_release.wait();
+        completed.wait();
+        arena.cancel_calibration();
+        completed_release.wait();
+        assert!(capture.join().unwrap().unwrap().usable);
+    }
+
+    #[test]
+    fn abort_predicate_after_complete_consumes_lease_and_allows_reuse() {
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let (accepted, accepted_release) = install_pause(&arena.shared.calibration_start_pause);
+        let (completed, completed_release) =
+            install_pause(&arena.shared.calibration_after_consume_pause);
+        let predicate_entered = Arc::new(Barrier::new(2));
+        let predicate_release = Arc::new(Barrier::new(2));
+        let entered = Arc::clone(&predicate_entered);
+        let release = Arc::clone(&predicate_release);
+        let request_arena = Arc::clone(&arena);
+        let capture = thread::spawn(move || {
+            request_arena
+                .calibrate_channel_until(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    DEADLINE,
+                    || {
+                        entered.wait();
+                        release.wait();
+                        true
+                    },
+                )
+                .map(|lease| lease.metadata())
+        });
+
+        predicate_entered.wait();
+        accepted.wait();
+        ingress.try_push_interleaved(&[0.25; 20], 1).unwrap();
+        accepted_release.wait();
+        completed.wait();
+        assert_eq!(
+            arena.shared.calibration.state.load(Ordering::Acquire),
+            CALIBRATION_COMPLETE
+        );
+        predicate_release.wait();
+        completed_release.wait();
+
+        assert!(capture.join().unwrap().unwrap().usable);
+        assert_eq!(
+            arena.shared.calibration.state.load(Ordering::Acquire),
+            CALIBRATION_IDLE
+        );
+        assert!(
+            capture_after_worker_acceptance(&arena, &ingress, &[0.5; 20])
+                .3
+                .usable
+        );
+    }
+
+    #[test]
+    fn abort_predicate_after_failed_consumes_failure_and_allows_reuse() {
+        let (arena, ingress) = calibration_runtime(1_000, 1, 4, 20);
+        let (before_accept, before_accept_release) =
+            install_pause(&arena.shared.calibration_before_accept_pause);
+        let predicate_entered = Arc::new(Barrier::new(2));
+        let predicate_release = Arc::new(Barrier::new(2));
+        let entered = Arc::clone(&predicate_entered);
+        let release = Arc::clone(&predicate_release);
+        let request_arena = Arc::clone(&arena);
+        let capture = thread::spawn(move || {
+            request_arena
+                .calibrate_channel_until(
+                    CalibrationCaptureRequest {
+                        channel: 0,
+                        frames: 20,
+                    },
+                    DEADLINE,
+                    || {
+                        entered.wait();
+                        release.wait();
+                        true
+                    },
+                )
+                .map(|_| ())
+        });
+
+        predicate_entered.wait();
+        before_accept.wait();
+        assert!(arena
+            .shared
+            .calibration
+            .state
+            .compare_exchange(
+                CALIBRATION_READY,
+                CALIBRATION_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok());
+        arena.shared.calibration.notify_waiters();
+        predicate_release.wait();
+        before_accept_release.wait();
+
+        assert!(matches!(
+            capture.join().unwrap(),
+            Err(LambError::CaptureInvariant(
+                "capture worker failed during calibration"
+            ))
+        ));
+        assert_eq!(
+            arena.shared.calibration.state.load(Ordering::Acquire),
+            CALIBRATION_IDLE
+        );
+        assert!(
+            capture_after_worker_acceptance(&arena, &ingress, &[0.5; 20])
+                .3
+                .usable
+        );
     }
 
     #[test]
