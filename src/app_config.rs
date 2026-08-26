@@ -279,11 +279,66 @@ pub fn write_default_config(path: &Path, force: bool) -> Result<()> {
     fs::write(path, default_config_text()).map_err(|source| io_error(path, source))
 }
 
-fn validate_app_config(cfg: &AppConfig) -> Result<()> {
+pub(crate) fn validate_app_config(cfg: &AppConfig) -> Result<()> {
     match cfg.daemon.start_mode.as_str() {
         "manual" | "auto" => Ok(()),
         other => Err(LambError::Validation(format!(
             "daemon.startMode must be manual or auto, got {other}"
         ))),
     }
+}
+
+pub(crate) fn is_valid_input_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn is_valid_calibration_id(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+pub(crate) fn validate_persisted_config(cfg: &AppConfig) -> Result<()> {
+    validate_app_config(cfg)?;
+    for (profile_name, profile) in &cfg.profiles {
+        for (channel_name, channel) in &profile.channels {
+            let Some(activity) = &channel.activity else {
+                continue;
+            };
+            let field = format!("profile {profile_name}: channels.{channel_name}.activity");
+            if !activity.threshold_dbfs.is_finite()
+                || !(-120.0..=0.0).contains(&activity.threshold_dbfs)
+            {
+                return Err(LambError::Validation(format!(
+                    "{field}.thresholdDbFS must be finite and within [-120.0, 0.0]"
+                )));
+            }
+            if !is_valid_input_id(&activity.input_id) {
+                return Err(LambError::Validation(format!(
+                    "{field}.inputId must be exactly 64 lowercase hexadecimal characters"
+                )));
+            }
+            if activity
+                .calibration_id
+                .as_deref()
+                .is_some_and(|id| !is_valid_calibration_id(id))
+            {
+                return Err(LambError::Validation(format!(
+                    "{field}.calibrationId must be 1 to 128 ASCII alphanumeric, '-' or '_' characters when present"
+                )));
+            }
+            if activity.threshold_source == ThresholdSource::Calibrated
+                && activity.calibration_id.is_none()
+            {
+                return Err(LambError::Validation(format!(
+                    "{field}.calibrationId is required for calibrated thresholds"
+                )));
+            }
+        }
+    }
+    Ok(())
 }

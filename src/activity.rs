@@ -10,6 +10,9 @@ use std::mem::size_of;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Version of the implemented 20 ms / 10 ms windowed RMS/peak detector.
+pub const WINDOWED_RMS_PEAK_DETECTOR_VERSION: &str = "windowed-rms-peak-v1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChannelExportMode {

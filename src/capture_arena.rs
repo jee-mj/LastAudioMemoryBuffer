@@ -136,6 +136,26 @@ impl CalibrationLease<'_> {
     pub fn rms(&self) -> &[f32] {
         unsafe { &(*self.slot.rms.get()).as_slice()[..self.metadata.complete_windows as usize] }
     }
+    /// The lease is the sole owner while the calibration slot is `LEASED`, so
+    /// percentile selection may reorder the complete RMS prefix in place.
+    pub fn rms_mut(&mut self) -> &mut [f32] {
+        unsafe {
+            &mut (*self.slot.rms.get()).as_mut_slice()[..self.metadata.complete_windows as usize]
+        }
+    }
+    /// Returns disjoint leased buffers for persistence without allocating a
+    /// recording-sized copy. The slot cannot be reused until this lease drops.
+    pub fn persistence_parts_mut(&mut self) -> (&[f32], &mut [f32], &[f32]) {
+        unsafe {
+            let frames = self.metadata.frames as usize;
+            let windows = self.metadata.complete_windows as usize;
+            (
+                &(*self.slot.samples.get()).as_slice()[..frames],
+                &mut (*self.slot.rms.get()).as_mut_slice()[..windows],
+                &(*self.slot.peak.get()).as_slice()[..windows],
+            )
+        }
+    }
     pub fn peak(&self) -> &[f32] {
         unsafe { &(*self.slot.peak.get()).as_slice()[..self.metadata.complete_windows as usize] }
     }

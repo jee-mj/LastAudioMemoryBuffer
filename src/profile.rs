@@ -1,15 +1,16 @@
-use crate::activity::{ActivityDetectorKind, ChannelExportMode, SilencePolicyPreset};
+use crate::activity::{
+    ActivityDetectorKind, ChannelExportMode, SilencePolicyPreset, ThresholdSource,
+};
 use crate::app_config::{
     self, AppConfig, CapturePort, ConfigLoadState, ExportLayoutKind, ProfileConfig,
 };
 use crate::capture_pipewire::PipeWireCaptureConfig;
 use crate::config::{normalize_capture_ports, ConfiguredCapturePort};
-use crate::error::{io_error, LambError, Result};
+use crate::error::{LambError, Result};
 use crate::export_policy::{
     ChannelActivityPolicy, ResolvedActivityPolicy, ResolvedExportPolicy, ResolvedLayout,
     ValidatedPattern,
 };
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,18 +239,25 @@ fn resolve_export_policy(
                     "profile {name}: channels.{channel_name}.activity.thresholdDbFS must be finite and within [-120.0, 0.0]"
                 )));
             }
-            if activity.input_id.trim().is_empty() {
+            if !app_config::is_valid_input_id(&activity.input_id) {
                 return Err(LambError::Validation(format!(
-                    "profile {name}: channels.{channel_name}.activity.inputId must be non-empty"
+                    "profile {name}: channels.{channel_name}.activity.inputId must be exactly 64 lowercase hexadecimal characters"
                 )));
             }
             if activity
                 .calibration_id
                 .as_deref()
-                .is_some_and(|value| value.trim().is_empty())
+                .is_some_and(|value| !app_config::is_valid_calibration_id(value))
             {
                 return Err(LambError::Validation(format!(
-                    "profile {name}: channels.{channel_name}.activity.calibrationId must be non-empty when present"
+                    "profile {name}: channels.{channel_name}.activity.calibrationId must be 1 to 128 ASCII alphanumeric, '-' or '_' characters when present"
+                )));
+            }
+            if activity.threshold_source == ThresholdSource::Calibrated
+                && activity.calibration_id.is_none()
+            {
+                return Err(LambError::Validation(format!(
+                    "profile {name}: channels.{channel_name}.activity.calibrationId is required for calibrated thresholds"
                 )));
             }
         }
@@ -344,15 +352,7 @@ pub fn load_config_for_mutation(path: &Path) -> Result<AppConfig> {
 }
 
 pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
-    }
-    let mut text = toml::to_string_pretty(cfg)
-        .map_err(|err| LambError::Config(format!("failed to serialize app config: {err}")))?;
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
-    fs::write(path, text).map_err(|source| io_error(path, source))
+    crate::calibration::save_config_atomic(path, cfg)
 }
 
 pub fn create_profile(cfg: &mut AppConfig, name: &str, backend: &str) -> Result<()> {

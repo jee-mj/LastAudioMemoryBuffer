@@ -8,6 +8,8 @@ use lamb::profile;
 use std::collections::BTreeMap;
 use std::fs;
 
+const VALID_INPUT_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 #[test]
 fn default_config_text_parses_as_manual_unconfigured() {
     let cfg: AppConfig = toml::from_str(default_config_text()).unwrap();
@@ -349,7 +351,8 @@ thresholdSource = "calibrated"
 updatedAtUnixSeconds = 1787616000
 inputId = "input-1"
 calibrationId = "calibration-1""#,
-        );
+        )
+        .replace("input-1", VALID_INPUT_ID);
     let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
     let raw = &cfg.profiles["scarlett"];
 
@@ -589,7 +592,7 @@ fn activity_threshold_must_be_finite_and_in_dbfs_range() {
 thresholdDbFS = {threshold}
 thresholdSource = "manual"
 updatedAtUnixSeconds = 1
-inputId = "input-1""#
+inputId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef""#
             ),
         );
         let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
@@ -612,7 +615,7 @@ fn activity_channel_keys_must_match_one_configured_port_exactly() {
 thresholdDbFS = -60.0
 thresholdSource = "manual"
 updatedAtUnixSeconds = 1
-inputId = "input-1""#,
+inputId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef""#,
     );
     let cfg = parse_config_text(std::path::Path::new("profile.toml"), &text).unwrap();
 
@@ -622,4 +625,81 @@ inputId = "input-1""#,
             .to_string(),
         "validation error: profile scarlett: channels.PERCL does not match exactly one configured port name"
     );
+}
+
+#[test]
+fn calibrated_threshold_requires_calibration_id_but_manual_may_retain_one() {
+    let base = pipewire_profile_text("");
+    let calibrated_without_id = base.replace(
+        "format = \"wav\"",
+        &format!("format = \"wav\"\n\n[profiles.scarlett.channels.percL.activity]\nthresholdDbFS = -60.0\nthresholdSource = \"calibrated\"\nupdatedAtUnixSeconds = 1\ninputId = \"{VALID_INPUT_ID}\""),
+    );
+    let cfg =
+        parse_config_text(std::path::Path::new("profile.toml"), &calibrated_without_id).unwrap();
+    assert!(profile::resolve_active_profile(&cfg).is_err());
+    let manual_with_id = calibrated_without_id.replace(
+        "thresholdSource = \"calibrated\"",
+        "thresholdSource = \"manual\"\ncalibrationId = \"old-generation\"",
+    );
+    let cfg = parse_config_text(std::path::Path::new("profile.toml"), &manual_with_id).unwrap();
+    assert!(profile::resolve_active_profile(&cfg).is_ok());
+}
+
+#[test]
+fn activity_binding_ids_use_stable_safe_grammars_in_profile_resolution() {
+    fn config(source: ThresholdSource, calibration_id: Option<&str>) -> AppConfig {
+        let mut cfg = parsed_pipewire_profile();
+        cfg.profiles.get_mut("scarlett").unwrap().channels.insert(
+            "percL".into(),
+            lamb::app_config::ProfileChannelConfig {
+                activity: Some(lamb::app_config::ActivityThresholdConfig {
+                    threshold_dbfs: -60.0,
+                    threshold_source: source,
+                    updated_at_unix_seconds: 1,
+                    input_id: VALID_INPUT_ID.into(),
+                    calibration_id: calibration_id.map(str::to_owned),
+                }),
+            },
+        );
+        cfg
+    }
+
+    for malformed in [
+        "short".to_owned(),
+        "A".repeat(64),
+        "g".repeat(64),
+        "a".repeat(63) + "/",
+    ] {
+        let mut cfg = config(ThresholdSource::Manual, None);
+        cfg.profiles
+            .get_mut("scarlett")
+            .unwrap()
+            .channels
+            .get_mut("percL")
+            .unwrap()
+            .activity
+            .as_mut()
+            .unwrap()
+            .input_id = malformed;
+        assert!(profile::resolve_active_profile(&cfg).is_err());
+    }
+
+    for source in [ThresholdSource::Manual, ThresholdSource::Calibrated] {
+        for malformed in [
+            String::new(),
+            "   ".to_owned(),
+            "a".repeat(129),
+            "unsafe/path".to_owned(),
+            "surrounding-space ".to_owned(),
+        ] {
+            assert!(profile::resolve_active_profile(&config(source, Some(&malformed))).is_err());
+        }
+    }
+
+    assert!(profile::resolve_active_profile(&config(ThresholdSource::Calibrated, None)).is_err());
+    assert!(profile::resolve_active_profile(&config(
+        ThresholdSource::Manual,
+        Some("old_generation-1"),
+    ))
+    .is_ok());
 }

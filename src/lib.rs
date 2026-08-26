@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod app_config;
+pub mod calibration;
 pub mod capture_arena;
 pub mod capture_fake;
 pub mod capture_jack;
