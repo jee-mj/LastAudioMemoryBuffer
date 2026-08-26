@@ -1,3 +1,4 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -12,11 +13,14 @@ use lamb::activity::{
 use lamb::app_config::ActivityThresholdConfig;
 use lamb::capture_arena::{CaptureArena, CaptureIngress, CaptureRuntimeConfig};
 use lamb::dump::{
-    DecisionPreparation, DumpCoordinator, DumpOutcome, FrameRange, LossBreakdown, PublishedOutput,
-    SampleSnapshot,
+    CommittedPersistenceRef, DecisionPreparation, DumpCoordinator, DumpOutcome, FrameRange,
+    LossBreakdown, PolicyPersistenceRequest, PublishedOutput, SampleSnapshot,
 };
 use lamb::error::{LambError, Result};
-use lamb::export_policy::{ChannelActivityPolicy, ResolvedActivityPolicy};
+use lamb::export_policy::{
+    ChannelActivityPolicy, ExportCommand, ResolvedActivityPolicy, ResolvedExportPolicy,
+    ResolvedLayout,
+};
 use lamb::export_wav::{
     publish_dump, publish_prepared, publish_prepared_with_hook, DumpPublishRequest,
     PreparedPublication, PreparedPublicationHook, PublicationCheckpoint,
@@ -179,6 +183,15 @@ fn exact_zero_policy(mode: ChannelExportMode) -> ResolvedActivityPolicy {
         whole_export_exact_zero_gate: false,
         trim_leading_silence: true,
     }
+}
+
+fn prepared_policy(output_dir: PathBuf, mode: ChannelExportMode) -> ResolvedExportPolicy {
+    ResolvedExportPolicy::new(
+        output_dir,
+        ResolvedLayout::FlatDetailed,
+        exact_zero_policy(mode),
+    )
+    .unwrap()
 }
 
 struct SecondRenameCollision;
@@ -2586,4 +2599,248 @@ fn every_dump_checkpoint_rolls_back_or_completes_without_duplicate_directory() {
         assert_eq!(calls.load(Ordering::SeqCst), usize::from(expects_retry));
         assert_eq!(std::fs::read_dir(&output_parent).unwrap().count(), 1);
     }
+}
+
+#[test]
+fn borrowed_delivery_written_commits_before_workspace_finalization() {
+    let mut fixture = FrozenFixture::new(8, 8, 2);
+    fixture.push(&[0.25, 0.5]);
+    let output_dir = fixture.root.path().join("borrowed-recall");
+    let staging = fixture.root.path().join("borrowed-staging");
+    let policy = prepared_policy(output_dir.clone(), ChannelExportMode::Auto);
+
+    fixture
+        .coordinator
+        .persist_policy_with_delivery(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PolicyPersistenceRequest {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "borrowed-delivery",
+                staging_root: &staging,
+                timestamp: TIMESTAMP_A,
+            },
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                let CommittedPersistenceRef::Written {
+                    range,
+                    export_range,
+                    output,
+                    ..
+                } = outcome
+                else {
+                    panic!("active capture must publish through the borrowed visitor")
+                };
+                assert_eq!(range, FrameRange { start: 0, end: 2 });
+                assert_eq!(export_range, FrameRange { start: 0, end: 2 });
+                assert_eq!(output.output_directory, output_dir.as_path());
+                assert_eq!(output.files.len(), 1);
+                assert!(output.files.get(0).unwrap().final_path().exists());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert!(std::fs::read_dir(&output_dir).unwrap().next().is_some());
+}
+
+fn borrowed_request<'a>(
+    policy: &'a ResolvedExportPolicy,
+    staging: &'a std::path::Path,
+    timestamp: &'a str,
+) -> PolicyPersistenceRequest<'a> {
+    PolicyPersistenceRequest {
+        command: ExportCommand::Recall,
+        policy,
+        profile: "borrowed-delivery",
+        staging_root: staging,
+        timestamp,
+    }
+}
+
+#[test]
+fn borrowed_delivery_error_commits_then_reuses_workspace_without_republishing() {
+    let mut fixture = FrozenFixture::new(8, 8, 2);
+    let output = fixture.root.path().join("borrowed-error");
+    let staging = fixture.root.path().join("borrowed-error-staging");
+    let policy = prepared_policy(output.clone(), ChannelExportMode::Auto);
+    fixture.push(&[0.25, 0.5]);
+    let error = fixture.coordinator.persist_policy_with_delivery(
+        &fixture.arena,
+        &mut fixture.workspace,
+        borrowed_request(&policy, &staging, TIMESTAMP_A),
+        DEADLINE,
+        DEADLINE,
+        |outcome| {
+            let CommittedPersistenceRef::Written { output, .. } = outcome else {
+                panic!("expected written borrowed delivery")
+            };
+            assert_eq!(output.files.iter().count(), 1);
+            assert!(output.files.get(0).unwrap().final_path().is_file());
+            Err(LambError::Control("injected delivery error".to_string()))
+        },
+    );
+    assert!(
+        matches!(error, Err(LambError::Control(message)) if message == "injected delivery error")
+    );
+
+    fixture
+        .coordinator
+        .persist_policy_with_delivery(
+            &fixture.arena,
+            &mut fixture.workspace,
+            borrowed_request(&policy, &staging, TIMESTAMP_A),
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                assert!(matches!(
+                    outcome,
+                    CommittedPersistenceRef::NoNewAudio { .. }
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+
+    fixture.push(&[0.75, 0.5]);
+    fixture
+        .coordinator
+        .persist_policy_with_delivery(
+            &fixture.arena,
+            &mut fixture.workspace,
+            borrowed_request(&policy, &staging, TIMESTAMP_B),
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                let CommittedPersistenceRef::Written { range, .. } = outcome else {
+                    panic!("new audio must publish")
+                };
+                assert_eq!(range, FrameRange { start: 2, end: 4 });
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 2);
+}
+
+#[test]
+fn borrowed_delivery_panic_finalizes_before_the_next_command() {
+    let mut fixture = FrozenFixture::new(8, 8, 2);
+    let output = fixture.root.path().join("borrowed-panic");
+    let staging = fixture.root.path().join("borrowed-panic-staging");
+    let policy = prepared_policy(output.clone(), ChannelExportMode::Auto);
+    fixture.push(&[0.25, 0.5]);
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        fixture
+            .coordinator
+            .persist_policy_with_delivery(
+                &fixture.arena,
+                &mut fixture.workspace,
+                borrowed_request(&policy, &staging, TIMESTAMP_A),
+                DEADLINE,
+                DEADLINE,
+                |_| panic!("injected borrowed delivery panic"),
+            )
+            .unwrap();
+    }));
+    assert!(panic.is_err());
+    fixture
+        .coordinator
+        .persist_policy_with_delivery(
+            &fixture.arena,
+            &mut fixture.workspace,
+            borrowed_request(&policy, &staging, TIMESTAMP_A),
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                assert!(matches!(
+                    outcome,
+                    CommittedPersistenceRef::NoNewAudio { .. }
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+    fixture.push(&[0.75, 0.5]);
+    fixture
+        .coordinator
+        .persist_policy_with_delivery(
+            &fixture.arena,
+            &mut fixture.workspace,
+            borrowed_request(&policy, &staging, TIMESTAMP_B),
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                assert!(matches!(
+                    outcome,
+                    CommittedPersistenceRef::Written {
+                        range: FrameRange { start: 2, end: 4 },
+                        ..
+                    }
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 2);
+}
+
+#[test]
+fn borrowed_delivery_reports_skip_and_no_audio_outcomes_without_output() {
+    let mut silent = FrozenFixture::new(8, 8, 2);
+    let silent_output = silent.root.path().join("borrowed-silent");
+    let silent_staging = silent.root.path().join("borrowed-silent-staging");
+    let silent_policy = prepared_policy(silent_output, ChannelExportMode::Auto);
+    silent.push(&[0.0, 0.0]);
+    silent
+        .coordinator
+        .persist_policy_with_delivery(
+            &silent.arena,
+            &mut silent.workspace,
+            borrowed_request(&silent_policy, &silent_staging, TIMESTAMP_A),
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                assert!(matches!(outcome, CommittedPersistenceRef::SkippedSilent { range: FrameRange { start: 0, end: 2 }, frames: 2, losses } if losses == LossBreakdown::default()));
+                Ok(())
+            },
+        )
+        .unwrap();
+    silent
+        .coordinator
+        .persist_policy_with_delivery(
+            &silent.arena,
+            &mut silent.workspace,
+            borrowed_request(&silent_policy, &silent_staging, TIMESTAMP_A),
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                assert!(matches!(outcome, CommittedPersistenceRef::NoNewAudio { losses } if losses == LossBreakdown::default()));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    let mut skipped = FrozenFixture::new(8, 8, 2);
+    let skipped_output = skipped.root.path().join("borrowed-policy-skip");
+    let skipped_staging = skipped.root.path().join("borrowed-policy-skip-staging");
+    let skipped_policy = prepared_policy(skipped_output, ChannelExportMode::Never);
+    skipped.push(&[0.25, 0.5]);
+    skipped
+        .coordinator
+        .persist_policy_with_delivery(
+            &skipped.arena,
+            &mut skipped.workspace,
+            borrowed_request(&skipped_policy, &skipped_staging, TIMESTAMP_A),
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                assert!(matches!(outcome, CommittedPersistenceRef::SkippedByPolicy { range: FrameRange { start: 0, end: 2 }, frames: 2, losses } if losses == LossBreakdown::default()));
+                Ok(())
+            },
+        )
+        .unwrap();
 }

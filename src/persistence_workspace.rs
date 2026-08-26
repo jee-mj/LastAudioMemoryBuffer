@@ -2,7 +2,6 @@ use crate::activity::{
     classify_frozen_epoch, ChannelDisposition, DetectorWorkspace, FrozenExportDecision,
 };
 use crate::capture_arena::FrozenCaptureEpoch;
-use crate::dump::PublishedOutput;
 use crate::error::{io_error, LambError, Result};
 use crate::export_policy::{
     render_policy_output_into, validate_rendered_output_path, ExportCommand, PublicationStrategy,
@@ -2084,7 +2083,7 @@ impl PersistenceWorkspace {
     pub fn recover_indeterminate_publication(
         &mut self,
         publication: &mut IndeterminatePublication,
-    ) -> Result<PublicationRecovery> {
+    ) -> Result<PublicationRecovery<'_>> {
         if publication.workspace_id != self.workspace_id
             || publication.transaction_generation != self.transaction_generation
         {
@@ -2119,9 +2118,15 @@ impl PersistenceWorkspace {
         };
         match outcome {
             RecoveryOutcome::Complete => {
-                let output = self.collect_completed_output_for_legacy_test_adapter();
-                self.clear_recovered_transaction();
-                Ok(PublicationRecovery::Complete(output))
+                self.completed_publication = Some(CompletedPublicationCleanup {
+                    kind: publication.kind,
+                });
+                let output_directory = self.completed_output_directory();
+                let files = self.completed_file_plan();
+                Ok(PublicationRecovery::Complete(CompletedOutput {
+                    output_directory,
+                    files,
+                }))
             }
             RecoveryOutcome::RolledBack => {
                 self.clear_recovered_transaction();
@@ -2215,19 +2220,21 @@ impl PersistenceWorkspace {
         Ok(resolved)
     }
 
-    /// Temporary bridge for coordinators that still expose owned outcomes.
-    /// Task 3 removes this adapter after response serialization becomes borrowed.
-    pub(crate) fn collect_completed_output_for_legacy_test_adapter(&self) -> PublishedOutput {
-        PublishedOutput {
-            output_directory: self.paths[FINAL_ROOT_PATH].as_path().to_path_buf(),
-            files: (0..self.output_count)
-                .map(|index| {
-                    self.paths[self.outputs[index].final_path as usize]
-                        .as_path()
-                        .to_path_buf()
-                })
-                .collect(),
+    pub(crate) fn completed_file_plan(&self) -> FilePlan<'_> {
+        let (fixed_paths, scratch_and_outputs) =
+            self.paths.as_slice().split_at(PARTIAL_SCRATCH_PATH);
+        let (_, output_paths) =
+            scratch_and_outputs.split_at(OUTPUT_PATH_START - PARTIAL_SCRATCH_PATH);
+        FilePlan {
+            outputs: &self.outputs.as_slice()[..self.output_count],
+            fixed_paths,
+            output_paths,
+            len: self.output_count,
         }
+    }
+
+    pub(crate) fn completed_output_directory(&self) -> &Path {
+        self.paths[FINAL_ROOT_PATH].as_path()
     }
 
     /// Recovers marked recall transactions under `staging_root` using this
@@ -2524,8 +2531,14 @@ pub struct IndeterminatePublication {
     kind: PersistenceKind,
 }
 
-pub enum PublicationRecovery {
-    Complete(PublishedOutput),
+/// Borrowed canonical output retained by an in-process completed recovery.
+pub struct CompletedOutput<'a> {
+    pub output_directory: &'a Path,
+    pub files: FilePlan<'a>,
+}
+
+pub enum PublicationRecovery<'a> {
+    Complete(CompletedOutput<'a>),
     RolledBack,
     Pending,
 }
@@ -2578,6 +2591,10 @@ impl FilePlan<'_> {
             output_paths: self.output_paths,
             index,
         })
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = PreparedFile<'_>> + '_ {
+        (0..self.len()).map(|index| self.get(index).expect("bounded file-plan index"))
     }
 }
 

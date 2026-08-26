@@ -170,6 +170,25 @@ impl FrozenExportDecision {
         self.frozen_epoch = None;
     }
 
+    /// Proves that dropping one reset coordinator buffer leaves equivalent
+    /// fixed storage geometry available for the bound capture runtime.
+    pub(crate) fn compatible_reset_with(&self, other: &Self) -> bool {
+        let reset = |decision: &Self| {
+            !decision.valid
+                && decision.export_range == (0..0)
+                && decision.frozen_epoch.is_none()
+                && decision
+                    .channels
+                    .as_slice()
+                    .iter()
+                    .all(|channel| *channel == FrozenChannelDecision::empty())
+        };
+        reset(self)
+            && reset(other)
+            && self.sample_rate == other.sample_rate
+            && self.channels.as_slice().len() == other.channels.as_slice().len()
+    }
+
     pub fn finalize(
         &mut self,
         frozen_range: Range<u64>,

@@ -1,4 +1,17 @@
-use lamb::error::LambError;
+use lamb::activity::{ActivityDetectorKind, ChannelExportMode, FrozenExportDecision};
+use lamb::capture_arena::{CaptureArena, CaptureRuntimeConfig};
+use lamb::error::{LambError, Result};
+use lamb::export_policy::{
+    ChannelActivityPolicy, ExportCommand, ResolvedActivityPolicy, ResolvedExportPolicy,
+    ResolvedLayout,
+};
+use lamb::export_wav::{
+    publish_prepared_with_hook, PreparedPublication, PreparedPublicationHook, PublicationCheckpoint,
+};
+use lamb::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
+use lamb::persistence_workspace::{
+    PersistenceWorkspace, PersistenceWorkspaceConfig, PrepareRequest, PublicationRecovery,
+};
 use lamb::recovery::{
     capture_identity, recover_dump_parent, recover_dump_root, recover_recall_root,
     recover_recall_root_with_directories, recover_recall_staging_root, FileIdentity,
@@ -8,11 +21,308 @@ use lamb::recovery::{
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const BUFFER_BYTES: usize = 64 * 1024;
 const PATH_ARENA_BYTES: usize = 512 * 1024;
 const ENTRY_CAPACITY: usize = 16;
 const DIRECTORY_CAPACITY: usize = 64;
+
+const DEADLINE: Duration = Duration::from_secs(2);
+
+struct Interrupt(PublicationCheckpoint);
+
+impl PreparedPublicationHook for Interrupt {
+    fn checkpoint(&mut self, checkpoint: PublicationCheckpoint) -> Result<()> {
+        if checkpoint == self.0 {
+            return Err(LambError::Export(
+                "compact recovery interruption".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn compact_recovery_case(command: ExportCommand, checkpoint: PublicationCheckpoint) {
+    let plan = SessionMemoryPlan::calculate(SessionMemoryInputs {
+        retention_frames: 2,
+        channels: 1,
+        sample_rate: 48_000,
+        sample_format: lamb::sample_ring::SampleFormat::F32Le,
+        chunk_frames: 2,
+        max_active_snapshots: 1,
+        sample_bytes: 4,
+        split_when_over_bytes: 47,
+        control_queue_capacity: 2,
+        worker_stack_bytes: 64 * 1024,
+        capture_queue_slots: 4,
+        capture_slot_frames: 2,
+        capture_worker_stack_bytes: 64 * 1024,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 512,
+        maximum_calibration_seconds: 0,
+        headroom: 1.0,
+    })
+    .unwrap();
+    let (mut arena, ingress) = CaptureArena::new(
+        &plan,
+        CaptureRuntimeConfig {
+            ring: lamb::sample_ring::RingConfig {
+                channels: 1,
+                sample_rate: 48_000,
+                format: lamb::sample_ring::SampleFormat::F32Le,
+                chunk_frames: 2,
+                chunk_count: 1,
+                max_active_snapshots: 1,
+            },
+            queue_slots: 4,
+            slot_frames: 2,
+            sample_bytes: 4,
+            worker_stack_bytes: 64 * 1024,
+        },
+    )
+    .unwrap();
+    let mut workspace = PersistenceWorkspace::new(
+        &plan,
+        PersistenceWorkspaceConfig {
+            retention_frames: 2,
+            channels: 1,
+            sample_rate: 48_000,
+            sample_format: lamb::sample_ring::SampleFormat::F32Le,
+            chunk_frames: 2,
+            sample_bytes: 4,
+            split_when_over_bytes: 47,
+            io_buffer_bytes_per_channel: 6,
+            maximum_path_bytes: 512,
+        },
+    )
+    .unwrap();
+    let addresses = workspace.allocation_addresses();
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("output");
+    let staging = root.path().join("staging");
+    ingress.try_push_interleaved(&[0.5, 0.25], 1).unwrap();
+    let mut frozen = arena.freeze_since(None, DEADLINE).unwrap().unwrap();
+    let frozen_range = frozen.absolute_range().clone();
+    let layout = if command == ExportCommand::Dump {
+        ResolvedLayout::TimestampDirectory
+    } else {
+        ResolvedLayout::FlatDetailed
+    };
+    let policy = ResolvedExportPolicy::new(
+        output.clone(),
+        layout,
+        ResolvedActivityPolicy {
+            detector: ActivityDetectorKind::ExactZero,
+            channels: vec![ChannelActivityPolicy {
+                name: "mic".to_string(),
+                mode: ChannelExportMode::Always,
+                threshold: None,
+            }],
+            whole_export_exact_zero_gate: false,
+            trim_leading_silence: false,
+        },
+    )
+    .unwrap();
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let prepared = workspace
+        .prepare(
+            &frozen,
+            PrepareRequest::Policy {
+                command,
+                policy: &policy,
+                profile: "compact-recovery",
+                staging_root: &staging,
+                timestamp: "20260826T120000",
+                decision: &mut decision,
+            },
+        )
+        .unwrap();
+    let expected: Vec<PathBuf> = prepared
+        .files()
+        .unwrap()
+        .iter()
+        .map(|file| file.final_path().to_path_buf())
+        .collect();
+    let transaction_root = prepared.staging_directory().unwrap().to_path_buf();
+    let atomic_manifest = (command == ExportCommand::Dump).then(|| {
+        let transaction_id = transaction_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(".tmp-lamb-"))
+            .expect("prepared atomic transaction has the documented staging name");
+        output.join(format!(".{transaction_id}.manifest.json"))
+    });
+    let decision_before = (
+        decision.valid(),
+        decision.export_range(),
+        decision.channels().to_vec(),
+        decision.storage_id(),
+    );
+    assert!(
+        expected.len() >= 2,
+        "compact recovery must prove canonical ordering"
+    );
+    let PreparedPublication::Indeterminate {
+        cleanup: mut descriptor,
+        ..
+    } = publish_prepared_with_hook(prepared, &mut Interrupt(checkpoint))
+    else {
+        panic!("durable checkpoint must be indeterminate")
+    };
+    if let Some(manifest) = atomic_manifest.as_ref() {
+        assert!(manifest.is_file());
+    }
+    if checkpoint == PublicationCheckpoint::RecallManifestPrepared {
+        assert!(matches!(
+            workspace
+                .recover_indeterminate_publication(&mut descriptor)
+                .unwrap(),
+            PublicationRecovery::RolledBack
+        ));
+        assert_eq!(frozen.absolute_range(), frozen_range);
+        assert_eq!(
+            (
+                decision.valid(),
+                decision.export_range(),
+                decision.channels().to_vec(),
+                decision.storage_id(),
+            ),
+            decision_before
+        );
+        assert!(!transaction_root.exists());
+        let retry = workspace
+            .prepare(
+                &frozen,
+                PrepareRequest::Policy {
+                    command,
+                    policy: &policy,
+                    profile: "compact-recovery",
+                    staging_root: &staging,
+                    timestamp: "20260826T120000",
+                    decision: &mut decision,
+                },
+            )
+            .unwrap();
+        let retry_paths: Vec<PathBuf> = retry
+            .files()
+            .unwrap()
+            .iter()
+            .map(|file| file.final_path().to_path_buf())
+            .collect();
+        assert_eq!(retry_paths, expected);
+        assert_eq!(
+            (
+                decision.valid(),
+                decision.export_range(),
+                decision.channels().to_vec(),
+                decision.storage_id(),
+            ),
+            decision_before
+        );
+        assert!(matches!(
+            lamb::export_wav::publish_prepared(retry),
+            PreparedPublication::Published
+        ));
+        assert_eq!(fs::read_dir(&output).unwrap().count(), expected.len());
+        assert!(expected.iter().all(|path| path.is_file()));
+        assert_eq!(workspace.allocation_addresses(), addresses);
+        arena.release_frozen(&mut frozen, DEADLINE).unwrap();
+        arena.shutdown(DEADLINE).unwrap();
+        return;
+    }
+    {
+        let PublicationRecovery::Complete(output_view) = workspace
+            .recover_indeterminate_publication(&mut descriptor)
+            .unwrap()
+        else {
+            panic!("durable checkpoint must recover complete")
+        };
+        let actual: Vec<PathBuf> = output_view
+            .files
+            .iter()
+            .map(|file| file.final_path().to_path_buf())
+            .collect();
+        assert!(actual.len() >= 2);
+        assert_eq!(actual, expected);
+        let expected_directory = if command == ExportCommand::Dump {
+            output.join("20260826T120000")
+        } else {
+            output.clone()
+        };
+        assert_eq!(output_view.output_directory, expected_directory.as_path());
+        assert!(actual.iter().all(|path| path.is_file()));
+    }
+    assert_eq!(workspace.allocation_addresses(), addresses);
+    assert!(workspace
+        .prepare(
+            &frozen,
+            PrepareRequest::Policy {
+                command,
+                policy: &policy,
+                profile: "compact-recovery",
+                staging_root: &staging,
+                timestamp: "20260826T120000",
+                decision: &mut decision,
+            },
+        )
+        .is_err());
+    assert!(!transaction_root.exists());
+    if let Some(manifest) = atomic_manifest {
+        assert!(!manifest.exists());
+    }
+    let visible: Vec<PathBuf> = expected
+        .iter()
+        .filter(|path| path.is_file())
+        .cloned()
+        .collect();
+    assert_eq!(visible, expected);
+    let mut actual_parent: Vec<PathBuf> = fs::read_dir(&output)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    actual_parent.sort();
+    if command == ExportCommand::Dump {
+        let final_directory = output.join("20260826T120000");
+        assert_eq!(actual_parent, vec![final_directory.clone()]);
+        let mut actual_files: Vec<PathBuf> = fs::read_dir(final_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        actual_files.sort();
+        let mut expected_files = expected.clone();
+        expected_files.sort();
+        assert_eq!(actual_files, expected_files);
+    } else {
+        let mut expected_files = expected.clone();
+        expected_files.sort();
+        assert_eq!(actual_parent, expected_files);
+    }
+    assert_eq!(workspace.allocation_addresses(), addresses);
+    arena.release_frozen(&mut frozen, DEADLINE).unwrap();
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn compact_indeterminate_complete_retains_borrowed_fileset_plan() {
+    compact_recovery_case(
+        ExportCommand::Recall,
+        PublicationCheckpoint::RecallFilesSynced,
+    );
+}
+
+#[test]
+fn compact_indeterminate_complete_retains_borrowed_atomic_plan() {
+    compact_recovery_case(ExportCommand::Dump, PublicationCheckpoint::DumpAfterRename);
+}
+
+#[test]
+fn compact_indeterminate_rollback_retries_the_same_frozen_decision() {
+    compact_recovery_case(
+        ExportCommand::Recall,
+        PublicationCheckpoint::RecallManifestPrepared,
+    );
+}
 
 #[test]
 fn current_manifest_schema_is_version_two() {
