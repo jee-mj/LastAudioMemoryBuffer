@@ -160,23 +160,74 @@ pub trait CleanupIo: Send {
         Ok(())
     }
 
+    fn before_current_artifact_private_cleanup(
+        &mut self,
+        _quarantine_directory: &File,
+        _artifact_name: &CStr,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn open_current_artifact_quarantine(
+        &mut self,
+        parent: &File,
+        quarantine_name: &CStr,
+    ) -> io::Result<File> {
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                quarantine_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn normalize_current_artifact_quarantine(
+        &mut self,
+        quarantine_directory: &File,
+        mode: libc::mode_t,
+    ) -> io::Result<()> {
+        if unsafe { libc::fchmod(quarantine_directory.as_raw_fd(), mode) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn sync_current_artifact_quarantine_parent(&mut self, parent: &File) -> io::Result<()> {
+        parent.sync_all()
+    }
+
+    fn before_current_artifact_quarantine_removal(
+        &mut self,
+        _parent: &File,
+        _quarantine_name: &CStr,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     fn resolve_current_artifact(
         &mut self,
         path: &Path,
         expected: FileIdentity,
-        component_a: &mut [u8],
-        component_b: &mut [u8],
+        components: (&mut [u8], &mut [u8]),
         workspace_id: u64,
         transaction_generation: u64,
-    ) -> io::Result<()> {
+        quarantine: ArtifactQuarantineState<'_>,
+    ) -> io::Result<bool> {
+        let (component_a, component_b) = components;
         resolve_current_artifact_by_handoff(
+            self,
             path,
             expected,
             component_a,
             component_b,
             workspace_id,
             transaction_generation,
-            || self.after_current_artifact_handoff(path),
+            quarantine,
         )
     }
 }
@@ -194,15 +245,18 @@ impl CleanupIo for FileCleanupIo {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_current_artifact_by_handoff(
+fn resolve_current_artifact_by_handoff<C: CleanupIo + ?Sized>(
+    cleanup_io: &mut C,
     path: &Path,
     expected: FileIdentity,
     component_a: &mut [u8],
     component_b: &mut [u8],
     workspace_id: u64,
     transaction_generation: u64,
-    after_handoff: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
+    mut state: ArtifactQuarantineState<'_>,
+) -> io::Result<bool> {
+    const QUARANTINE_MODE: libc::mode_t = 0o700;
+    let artifact_name = c"artifact";
     let parent = open_parent_without_symlinks(path, component_a)?;
     let public_name = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -211,70 +265,277 @@ fn resolve_current_artifact_by_handoff(
         )
     })?;
     let public_name = prepare_cleanup_component(component_a, public_name)?;
-    let private_name =
+    let quarantine_name =
         prepare_recovery_component(component_b, workspace_id, transaction_generation)?;
-
-    match identity_at_component(&parent, private_name) {
-        Ok(_) => return resolve_private_artifact(&parent, public_name, private_name, expected),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    if !retain_and_validate_quarantine_parent(&parent, &mut state)? {
+        return Ok(false);
+    }
+    if *state.removed {
+        parent.sync_all()?;
+        return Ok(true);
     }
 
-    let moved = unsafe {
-        libc::renameat2(
-            parent.as_raw_fd(),
-            public_name.as_ptr(),
-            parent.as_raw_fd(),
-            private_name.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
+    let Some(quarantine) = open_authoritative_quarantine(
+        cleanup_io,
+        &parent,
+        quarantine_name,
+        QUARANTINE_MODE,
+        &mut state,
+    )?
+    else {
+        return Ok(false);
     };
-    if moved != 0 {
-        let error = io::Error::last_os_error();
-        return match error.kind() {
-            io::ErrorKind::NotFound => Ok(()),
-            io::ErrorKind::AlreadyExists => {
-                resolve_private_artifact(&parent, public_name, private_name, expected)
+
+    if !*state.handoff {
+        match identity_at_component(&quarantine, artifact_name) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        match identity_at_component(&parent, public_name) {
+            Ok(identity) if identity == expected => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return remove_empty_quarantine(
+                    &parent,
+                    quarantine_name,
+                    &quarantine,
+                    cleanup_io,
+                    &mut state,
+                );
             }
-            _ => Err(error),
-        };
+            Err(error) => return Err(error),
+        }
+
+        if unsafe {
+            libc::renameat2(
+                parent.as_raw_fd(),
+                public_name.as_ptr(),
+                quarantine.as_raw_fd(),
+                artifact_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            return match error.kind() {
+                io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists => Ok(false),
+                _ => Err(error),
+            };
+        }
+        *state.handoff = true;
+        cleanup_io.after_current_artifact_handoff(path)?;
     }
 
-    after_handoff()?;
-    resolve_private_artifact(&parent, public_name, private_name, expected)
+    resolve_private_artifact(
+        cleanup_io,
+        OpenedQuarantine {
+            parent: &parent,
+            name: quarantine_name,
+            directory: &quarantine,
+        },
+        artifact_name,
+        expected,
+        &mut state,
+    )
 }
 
-fn resolve_private_artifact(
-    parent: &File,
-    public_name: &CStr,
-    private_name: &CStr,
+struct OpenedQuarantine<'a> {
+    parent: &'a File,
+    name: &'a CStr,
+    directory: &'a File,
+}
+
+fn resolve_private_artifact<C: CleanupIo + ?Sized>(
+    cleanup_io: &mut C,
+    quarantine: OpenedQuarantine<'_>,
+    artifact_name: &CStr,
     expected: FileIdentity,
-) -> io::Result<()> {
-    if identity_at_component(parent, private_name)? == expected {
-        if identity_at_component(parent, private_name)? != expected {
-            return Err(io::Error::other(
-                "private active artifact identity changed before removal",
-            ));
+    state: &mut ArtifactQuarantineState<'_>,
+) -> io::Result<bool> {
+    if !*state.artifact_removed {
+        match identity_at_component(quarantine.directory, artifact_name) {
+            Ok(identity) if identity == expected => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
         }
-        if unsafe { libc::unlinkat(parent.as_raw_fd(), private_name.as_ptr(), 0) } != 0 {
-            return Err(io::Error::last_os_error());
+        cleanup_io.before_current_artifact_private_cleanup(quarantine.directory, artifact_name)?;
+        match identity_at_component(quarantine.directory, artifact_name) {
+            Ok(identity) if identity == expected => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
         }
-        return Ok(());
+        // This unlink is resolved by the already-open 0700 quarantine. The
+        // caller-owned seam runs before this final identity check.
+        if unsafe { libc::unlinkat(quarantine.directory.as_raw_fd(), artifact_name.as_ptr(), 0) }
+            != 0
+        {
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        *state.artifact_removed = true;
+        quarantine.directory.sync_all()?;
+    }
+    remove_empty_quarantine(
+        quarantine.parent,
+        quarantine.name,
+        quarantine.directory,
+        cleanup_io,
+        state,
+    )
+}
+
+fn retain_and_validate_quarantine_parent(
+    parent: &File,
+    state: &mut ArtifactQuarantineState<'_>,
+) -> io::Result<bool> {
+    let stat = stat_file(parent)?;
+    let identity = FileIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    };
+    match *state.parent_identity {
+        Some(expected) if expected != identity => return Ok(false),
+        None => *state.parent_identity = Some(identity),
+        Some(_) => {}
+    }
+    Ok(stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+        && stat.st_uid == unsafe { libc::geteuid() }
+        && stat.st_mode & 0o022 == 0)
+}
+
+fn open_authoritative_quarantine<C: CleanupIo + ?Sized>(
+    cleanup_io: &mut C,
+    parent: &File,
+    quarantine_name: &CStr,
+    mode: libc::mode_t,
+    state: &mut ArtifactQuarantineState<'_>,
+) -> io::Result<Option<File>> {
+    if !*state.created {
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), quarantine_name.as_ptr(), mode) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        // Record creation before every fallible open/validation/normalization
+        // step so a retry can reopen only this retained parent coordinate.
+        *state.created = true;
     }
 
+    let directory = cleanup_io.open_current_artifact_quarantine(parent, quarantine_name)?;
+    let parent_stat = stat_file(parent)?;
+    let directory_stat = stat_file(&directory)?;
+    let identity = FileIdentity {
+        device: directory_stat.st_dev,
+        inode: directory_stat.st_ino,
+    };
+    let initially_valid = directory_stat.st_dev == parent_stat.st_dev
+        && directory_stat.st_uid == unsafe { libc::geteuid() }
+        && directory_stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+        && directory_stat.st_mode & 0o077 == 0;
+    if !initially_valid || state.identity.is_some_and(|expected| expected != identity) {
+        return Ok(None);
+    }
+    if state.identity.is_none() {
+        // Capture descriptor authority before fallible normalization/durability.
+        *state.identity = Some(identity);
+    }
+    if !*state.setup_complete {
+        cleanup_io.normalize_current_artifact_quarantine(&directory, mode)?;
+        let normalized = stat_file(&directory)?;
+        let normalized_identity = FileIdentity {
+            device: normalized.st_dev,
+            inode: normalized.st_ino,
+        };
+        if normalized_identity != identity
+            || normalized.st_dev != parent_stat.st_dev
+            || normalized.st_uid != unsafe { libc::geteuid() }
+            || normalized.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || normalized.st_mode & 0o7777 != mode
+        {
+            return Ok(None);
+        }
+        cleanup_io.sync_current_artifact_quarantine_parent(parent)?;
+        *state.setup_complete = true;
+    } else if directory_stat.st_mode & 0o7777 != mode {
+        return Ok(None);
+    }
+    Ok(Some(directory))
+}
+
+fn remove_empty_quarantine<C: CleanupIo + ?Sized>(
+    parent: &File,
+    quarantine_name: &CStr,
+    quarantine: &File,
+    cleanup_io: &mut C,
+    state: &mut ArtifactQuarantineState<'_>,
+) -> io::Result<bool> {
+    let Some(authority) = *state.identity else {
+        return Ok(false);
+    };
+    cleanup_io.before_current_artifact_quarantine_removal(parent, quarantine_name)?;
+    if !retain_and_validate_quarantine_parent(parent, state)? {
+        return Ok(false);
+    }
+    // Both checks are after the teardown seam. The retained parent is euid-owned
+    // and has no group/other write, so no actor outside the accepted same-euid
+    // trust boundary can replace the name between these checks and unlinkat.
+    if file_identity(quarantine)? != authority {
+        return Ok(false);
+    }
+    match identity_at_component(parent, quarantine_name) {
+        Ok(identity) if identity == authority => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
     if unsafe {
-        libc::renameat2(
+        libc::unlinkat(
             parent.as_raw_fd(),
-            private_name.as_ptr(),
-            parent.as_raw_fd(),
-            public_name.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            quarantine_name.as_ptr(),
+            libc::AT_REMOVEDIR,
         )
     } != 0
     {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+        ) {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    *state.removed = true;
+    parent.sync_all()?;
+    Ok(true)
+}
+
+fn stat_file(file: &File) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    let stat = stat_file(file)?;
+    Ok(FileIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
 }
 
 fn open_parent_without_symlinks(path: &Path, component: &mut [u8]) -> io::Result<File> {
@@ -468,13 +729,31 @@ pub(crate) struct DirectorySyncSlot {
 pub(crate) struct CurrentArtifactSlot {
     pub path: PathRef,
     pub identity: Option<FileIdentity>,
+    pub quarantine_parent_identity: Option<FileIdentity>,
+    pub quarantine_identity: Option<FileIdentity>,
     pub final_name: bool,
+    pub quarantine_created: bool,
+    pub quarantine_setup_complete: bool,
+    pub quarantine_handoff: bool,
+    pub quarantine_artifact_removed: bool,
+    pub quarantine_removed: bool,
+}
+
+#[doc(hidden)]
+pub struct ArtifactQuarantineState<'a> {
+    parent_identity: &'a mut Option<FileIdentity>,
+    identity: &'a mut Option<FileIdentity>,
+    created: &'a mut bool,
+    setup_complete: &'a mut bool,
+    handoff: &'a mut bool,
+    artifact_removed: &'a mut bool,
+    removed: &'a mut bool,
 }
 
 const _: () =
     assert!(std::mem::size_of::<DirectorySyncSlot>() <= PUBLICATION_SYNC_SLOT_BYTES as usize);
 const _: () =
-    assert!(std::mem::size_of::<CurrentArtifactSlot>() <= PUBLICATION_ARTIFACT_SLOT_BYTES as usize);
+    assert!(std::mem::size_of::<CurrentArtifactSlot>() == PUBLICATION_ARTIFACT_SLOT_BYTES as usize);
 
 pub(crate) struct PublicationScratch {
     sync_slots: ExactArray<DirectorySyncSlot>,
@@ -506,6 +785,14 @@ impl PublicationScratch {
 
     pub(crate) fn component_pair(&mut self) -> (&mut [u8], &mut [u8]) {
         (
+            self.component_a.as_mut_slice(),
+            self.component_b.as_mut_slice(),
+        )
+    }
+
+    fn artifact_recovery_parts(&mut self) -> (&mut CurrentArtifactSlot, &mut [u8], &mut [u8]) {
+        (
+            &mut self.current_artifact[0],
             self.component_a.as_mut_slice(),
             self.component_b.as_mut_slice(),
         )
@@ -1805,7 +2092,9 @@ impl PersistenceWorkspace {
                 "indeterminate publication does not belong to this workspace transaction",
             ));
         }
-        self.resolve_current_artifact()?;
+        if !self.resolve_current_artifact()? {
+            return Ok(PublicationRecovery::Pending);
+        }
         let outcome = match publication.kind {
             PersistenceKind::Recall => recover_recall_root_with_directories(
                 self.paths[TRANSACTION_ROOT_PATH].as_path(),
@@ -1842,10 +2131,10 @@ impl PersistenceWorkspace {
         }
     }
 
-    fn resolve_current_artifact(&mut self) -> Result<()> {
+    fn resolve_current_artifact(&mut self) -> Result<bool> {
         let active = self.publication.current_artifact[0];
         let Some(identity) = active.identity else {
-            return Ok(());
+            return Ok(true);
         };
 
         let offset = usize::try_from(active.path.offset)
@@ -1900,19 +2189,30 @@ impl PersistenceWorkspace {
             ));
         }
 
-        let (component_a, component_b) = self.publication.component_pair();
-        self.cleanup_io
+        let (active, component_a, component_b) = self.publication.artifact_recovery_parts();
+        let resolved = self
+            .cleanup_io
             .resolve_current_artifact(
                 path,
                 identity,
-                component_a,
-                component_b,
+                (component_a, component_b),
                 self.workspace_id,
                 self.transaction_generation,
+                ArtifactQuarantineState {
+                    parent_identity: &mut active.quarantine_parent_identity,
+                    identity: &mut active.quarantine_identity,
+                    created: &mut active.quarantine_created,
+                    setup_complete: &mut active.quarantine_setup_complete,
+                    handoff: &mut active.quarantine_handoff,
+                    artifact_removed: &mut active.quarantine_artifact_removed,
+                    removed: &mut active.quarantine_removed,
+                },
             )
             .map_err(|source| io_error(path, source))?;
-        self.publication.current_artifact[0] = CurrentArtifactSlot::default();
-        Ok(())
+        if resolved {
+            self.publication.current_artifact[0] = CurrentArtifactSlot::default();
+        }
+        Ok(resolved)
     }
 
     /// Temporary bridge for coordinators that still expose owned outcomes.
@@ -2372,7 +2672,11 @@ fn validate_workspace_plan(
         .ok_or_else(|| {
             LambError::Validation("publication component buffer storage overflow".to_string())
         })?;
-    let artifact_storage = allocation_budget_bytes(PUBLICATION_ARTIFACT_SLOT_BYTES)?;
+    let artifact_slot_bytes =
+        u64::try_from(std::mem::size_of::<CurrentArtifactSlot>()).map_err(|_| {
+            LambError::Validation("publication current artifact slot byte count overflow".into())
+        })?;
+    let artifact_storage = allocation_budget_bytes(artifact_slot_bytes)?;
     let expected_publication_scratch = allocation_budget_bytes(sync_payload)?
         .checked_add(component_storage)
         .and_then(|bytes| bytes.checked_add(artifact_storage))
@@ -2625,6 +2929,7 @@ mod tests {
     use super::*;
     use crate::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
     use crate::recovery::{ManifestEntrySlot, TransactionManifest, MANIFEST_VERSION};
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -2685,7 +2990,14 @@ mod tests {
         workspace.publication.current_artifact[0] = CurrentArtifactSlot {
             path: path_ref,
             identity: Some(identity),
+            quarantine_parent_identity: None,
+            quarantine_identity: None,
             final_name,
+            quarantine_created: false,
+            quarantine_setup_complete: false,
+            quarantine_handoff: false,
+            quarantine_artifact_removed: false,
+            quarantine_removed: false,
         };
         path_ref
     }
@@ -2781,6 +3093,15 @@ mod tests {
     }
 
     #[test]
+    fn current_artifact_slot_accounting_matches_concrete_size() {
+        assert_eq!(std::mem::size_of::<CurrentArtifactSlot>(), 88);
+        assert_eq!(
+            std::mem::size_of::<CurrentArtifactSlot>(),
+            usize::try_from(PUBLICATION_ARTIFACT_SLOT_BYTES).unwrap()
+        );
+    }
+
+    #[test]
     fn missing_or_replaced_active_artifact_is_resolved_without_foreign_deletion() {
         let root = tempfile::tempdir().unwrap();
 
@@ -2795,7 +3116,7 @@ mod tests {
             },
             false,
         );
-        missing_workspace.resolve_current_artifact().unwrap();
+        assert!(missing_workspace.resolve_current_artifact().unwrap());
         assert!(missing_workspace.publication.current_artifact[0]
             .identity
             .is_none());
@@ -2816,11 +3137,11 @@ mod tests {
             },
             false,
         );
-        replaced_workspace.resolve_current_artifact().unwrap();
+        assert!(!replaced_workspace.resolve_current_artifact().unwrap());
         assert_eq!(fs::read(&replaced).unwrap(), b"foreign");
         assert!(replaced_workspace.publication.current_artifact[0]
             .identity
-            .is_none());
+            .is_some());
     }
 
     #[test]
@@ -2902,9 +3223,133 @@ mod tests {
         assert!(workspace.publication.current_artifact[0].identity.is_some());
 
         fail.store(false, Ordering::Release);
-        workspace.resolve_current_artifact().unwrap();
+        assert!(workspace.resolve_current_artifact().unwrap());
         assert!(!path.exists());
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
         assert!(workspace.publication.current_artifact[0].identity.is_none());
+    }
+
+    #[test]
+    fn preexisting_quarantine_and_inner_candidate_are_never_touched_without_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owned.partial");
+        fs::write(&path, b"owned").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let (_plan, mut workspace) = test_workspace();
+        seed_active_artifact(
+            &mut workspace,
+            &path,
+            FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            false,
+        );
+        let mut component = [0_u8; 128];
+        let quarantine_name = prepare_recovery_component(
+            &mut component,
+            workspace.workspace_id,
+            workspace.transaction_generation,
+        )
+        .unwrap();
+        let quarantine_path = root
+            .path()
+            .join(OsStr::from_bytes(quarantine_name.to_bytes()));
+        fs::create_dir(&quarantine_path).unwrap();
+        fs::set_permissions(&quarantine_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let foreign = quarantine_path.join("artifact");
+        fs::write(&foreign, b"foreign").unwrap();
+
+        assert!(!workspace.resolve_current_artifact().unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"owned");
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign");
+        assert!(workspace.publication.current_artifact[0].identity.is_some());
+        assert!(workspace.publication.current_artifact[0]
+            .quarantine_identity
+            .is_none());
+    }
+
+    #[test]
+    fn unsafe_or_replaced_quarantine_parent_blocks_destructive_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("artifact-parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let path = parent.join("owned.partial");
+        fs::write(&path, b"owned").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let (_plan, mut workspace) = test_workspace();
+        seed_active_artifact(
+            &mut workspace,
+            &path,
+            FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            false,
+        );
+
+        assert!(!workspace.resolve_current_artifact().unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"owned");
+        assert!(workspace.publication.current_artifact[0]
+            .quarantine_parent_identity
+            .is_some());
+        assert!(!workspace.publication.current_artifact[0].quarantine_created);
+
+        let retained = root.path().join("retained-parent");
+        fs::rename(&parent, &retained).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(parent.join("owned.partial"), b"foreign").unwrap();
+
+        assert!(!workspace.resolve_current_artifact().unwrap());
+        assert_eq!(fs::read(retained.join("owned.partial")).unwrap(), b"owned");
+        assert_eq!(fs::read(parent.join("owned.partial")).unwrap(), b"foreign");
+        assert!(!workspace.publication.current_artifact[0].quarantine_created);
+    }
+
+    #[test]
+    fn retained_quarantine_identity_mismatch_preserves_both_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owned.partial");
+        fs::write(&path, b"owned").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let fail = Arc::new(AtomicBool::new(true));
+        let (_plan, mut workspace) = test_workspace();
+        workspace.cleanup_io = Box::new(ToggleRemoveFileIo {
+            fail: Arc::clone(&fail),
+        });
+        seed_active_artifact(
+            &mut workspace,
+            &path,
+            FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            false,
+        );
+
+        assert!(workspace.resolve_current_artifact().is_err());
+        let mut component = [0_u8; 128];
+        let quarantine_name = prepare_recovery_component(
+            &mut component,
+            workspace.workspace_id,
+            workspace.transaction_generation,
+        )
+        .unwrap();
+        let quarantine_path = root
+            .path()
+            .join(OsStr::from_bytes(quarantine_name.to_bytes()));
+        let retained_path = root.path().join("retained-authority");
+        fs::rename(&quarantine_path, &retained_path).unwrap();
+        fs::create_dir(&quarantine_path).unwrap();
+        fs::set_permissions(&quarantine_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let foreign = quarantine_path.join("artifact");
+        fs::write(&foreign, b"foreign").unwrap();
+        fail.store(false, Ordering::Release);
+
+        assert!(!workspace.resolve_current_artifact().unwrap());
+        assert_eq!(fs::read(retained_path.join("artifact")).unwrap(), b"owned");
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign");
+        assert!(workspace.publication.current_artifact[0].identity.is_some());
     }
 }

@@ -1184,7 +1184,14 @@ fn publish_recall_inner(
                     device: partial_metadata.dev(),
                     inode: partial_metadata.ino(),
                 }),
+                quarantine_parent_identity: None,
+                quarantine_identity: None,
                 final_name: false,
+                quarantine_created: false,
+                quarantine_setup_complete: false,
+                quarantine_handoff: false,
+                quarantine_artifact_removed: false,
+                quarantine_removed: false,
             };
             io::copy(&mut source, &mut partial)
                 .map_err(|source| io_error(partial_path.as_path(), source))?;
@@ -1227,7 +1234,14 @@ fn publish_recall_inner(
                     device: partial_metadata.dev(),
                     inode: partial_metadata.ino(),
                 }),
+                quarantine_parent_identity: None,
+                quarantine_identity: None,
                 final_name: true,
+                quarantine_created: false,
+                quarantine_setup_complete: false,
+                quarantine_handoff: false,
+                quarantine_artifact_removed: false,
+                quarantine_removed: false,
             };
             hook.checkpoint(PublicationCheckpoint::RecallRenamedBeforeManifest { index })?;
             manifest.entry_mut(index).final_identity = Some(ManifestIdentity {

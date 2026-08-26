@@ -39,7 +39,8 @@ pub const FROZEN_EXPORT_DECISION_SLOT_BYTES: u64 = 24;
 pub const ACTIVITY_DETECTOR_STATE_SLOT_BYTES: u64 = 104;
 pub const CALIBRATION_SLOT_METADATA_BYTES: u64 = 256;
 pub const PUBLICATION_SYNC_SLOT_BYTES: u64 = 16;
-pub const PUBLICATION_ARTIFACT_SLOT_BYTES: u64 = 40;
+pub const PUBLICATION_ARTIFACT_SLOT_BYTES: u64 =
+    size_of::<crate::persistence_workspace::CurrentArtifactSlot>() as u64;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SessionMemoryInputs {
@@ -367,6 +368,14 @@ impl SessionMemoryPlan {
             manifest_directory_slots,
             PUBLICATION_SYNC_SLOT_BYTES,
         )?;
+        let current_artifact_slot_bytes = u64::try_from(size_of::<
+            crate::persistence_workspace::CurrentArtifactSlot,
+        >())
+        .map_err(|_| {
+            LambError::Validation(
+                "publication current artifact slot byte count overflow".to_string(),
+            )
+        })?;
         let publication_scratch = checked_add(
             "publication scratch overflow",
             checked_add(
@@ -378,7 +387,7 @@ impl SessionMemoryPlan {
                     allocation_budget_bytes(component_bytes)?,
                 )?,
             )?,
-            allocation_budget_bytes(PUBLICATION_ARTIFACT_SLOT_BYTES)?,
+            allocation_budget_bytes(current_artifact_slot_bytes)?,
         )?;
         let manifest_path_entries = checked_add(
             "manifest entry path slot count overflow",

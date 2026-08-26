@@ -20,8 +20,10 @@ use lamb::persistence_workspace::{
 use lamb::sample_ring::{RingConfig, SampleFormat};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::ffi::CStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -90,6 +92,7 @@ struct CleanupRaceState {
 
 struct ReplaceAtCleanupCheckRemoveBoundary {
     state: Arc<Mutex<CleanupRaceState>>,
+    fail_after_replace: bool,
 }
 
 impl CleanupIo for ReplaceAtCleanupCheckRemoveBoundary {
@@ -97,17 +100,164 @@ impl CleanupIo for ReplaceAtCleanupCheckRemoveBoundary {
         fs::symlink_metadata(path)
     }
 
-    fn after_current_artifact_handoff(&mut self, path: &Path) -> io::Result<()> {
+    fn before_current_artifact_private_cleanup(
+        &mut self,
+        quarantine_directory: &File,
+        artifact_name: &CStr,
+    ) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
         if state.replaced_path.is_none() {
-            fs::write(path, b"foreign cleanup race inode")?;
-            state.replaced_path = Some(path.to_path_buf());
+            let replacement_name = c"replacement";
+            let replacement_fd = unsafe {
+                libc::openat(
+                    quarantine_directory.as_raw_fd(),
+                    replacement_name.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if replacement_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut replacement = unsafe { File::from_raw_fd(replacement_fd) };
+            replacement.write_all(b"foreign private cleanup race inode")?;
+            replacement.sync_all()?;
+            drop(replacement);
+            if unsafe {
+                libc::unlinkat(quarantine_directory.as_raw_fd(), artifact_name.as_ptr(), 0)
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe {
+                libc::renameat2(
+                    quarantine_directory.as_raw_fd(),
+                    replacement_name.as_ptr(),
+                    quarantine_directory.as_raw_fd(),
+                    artifact_name.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let quarantine_path = fs::read_link(format!(
+                "/proc/self/fd/{}",
+                quarantine_directory.as_raw_fd()
+            ))?;
+            let private_path =
+                quarantine_path.join(std::ffi::OsStr::from_bytes(artifact_name.to_bytes()));
+            state.replaced_path = Some(private_path);
+            if self.fail_after_replace {
+                return Err(io::Error::other(
+                    "injected failure after private candidate replacement",
+                ));
+            }
         }
         Ok(())
     }
 
     fn remove_dir_all(&mut self, path: &Path) -> io::Result<()> {
         fs::remove_dir_all(path)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum QuarantineSetupFailure {
+    Open,
+    Normalize,
+}
+
+struct FailQuarantineSetupOnce {
+    stage: QuarantineSetupFailure,
+    failed: bool,
+}
+
+impl CleanupIo for FailQuarantineSetupOnce {
+    fn symlink_metadata(&mut self, path: &Path) -> io::Result<fs::Metadata> {
+        fs::symlink_metadata(path)
+    }
+
+    fn remove_dir_all(&mut self, path: &Path) -> io::Result<()> {
+        fs::remove_dir_all(path)
+    }
+
+    fn open_current_artifact_quarantine(
+        &mut self,
+        parent: &File,
+        quarantine_name: &CStr,
+    ) -> io::Result<File> {
+        if matches!(self.stage, QuarantineSetupFailure::Open) && !self.failed {
+            self.failed = true;
+            return Err(io::Error::other("injected quarantine open failure"));
+        }
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                quarantine_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn normalize_current_artifact_quarantine(
+        &mut self,
+        quarantine_directory: &File,
+        mode: libc::mode_t,
+    ) -> io::Result<()> {
+        if matches!(self.stage, QuarantineSetupFailure::Normalize) && !self.failed {
+            self.failed = true;
+            return Err(io::Error::other(
+                "injected quarantine normalization failure",
+            ));
+        }
+        if unsafe { libc::fchmod(quarantine_directory.as_raw_fd(), mode) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct QuarantineRemovalRaceState {
+    replacement: Option<PathBuf>,
+    retained: Option<PathBuf>,
+}
+
+struct ReplaceQuarantineAtRemoval {
+    state: Arc<Mutex<QuarantineRemovalRaceState>>,
+}
+
+impl CleanupIo for ReplaceQuarantineAtRemoval {
+    fn symlink_metadata(&mut self, path: &Path) -> io::Result<fs::Metadata> {
+        fs::symlink_metadata(path)
+    }
+
+    fn remove_dir_all(&mut self, path: &Path) -> io::Result<()> {
+        fs::remove_dir_all(path)
+    }
+
+    fn before_current_artifact_quarantine_removal(
+        &mut self,
+        parent: &File,
+        quarantine_name: &CStr,
+    ) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.replacement.is_some() {
+            return Ok(());
+        }
+        let parent_path = fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))?;
+        let replacement = parent_path.join(std::ffi::OsStr::from_bytes(quarantine_name.to_bytes()));
+        let retained = parent_path.join("retained-empty-quarantine");
+        fs::rename(&replacement, &retained)?;
+        fs::create_dir(&replacement)?;
+        state.replacement = Some(replacement);
+        state.retained = Some(retained);
+        Ok(())
     }
 }
 
@@ -2597,7 +2747,7 @@ fn assert_checkpoint_publication_allocations_do_not_scale(
         maximum_path_bytes: 256,
     };
     let (mut arena, ingress, plan) = runtime(geometry);
-    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let mut small_workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
     let root = tempfile::tempdir().unwrap();
     let staging = root.path().join("staging");
     fs::create_dir(&staging).unwrap();
@@ -2621,7 +2771,7 @@ fn assert_checkpoint_publication_allocations_do_not_scale(
     let mut small_samples = vec![0.0; 2 * 4];
     small_samples[0] = 0.25;
     let mut small_frozen = freeze(&mut arena, &ingress, &small_samples, 4);
-    let small_prepared = workspace
+    let small_prepared = small_workspace
         .prepare(
             &small_frozen,
             PrepareRequest::Policy {
@@ -2645,7 +2795,7 @@ fn assert_checkpoint_publication_allocations_do_not_scale(
     else {
         panic!("checkpoint must classify prepared publication as indeterminate")
     };
-    let small_recovery = workspace
+    let small_recovery = small_workspace
         .recover_indeterminate_publication(&mut small_cleanup)
         .unwrap();
     match expected {
@@ -2660,10 +2810,12 @@ fn assert_checkpoint_publication_allocations_do_not_scale(
     }
     arena.release_frozen(&mut small_frozen, DEADLINE).unwrap();
 
+    let mut maximum_workspace =
+        PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
     let mut maximum_decision = FrozenExportDecision::new(&plan).unwrap();
     let maximum_samples = vec![0.25; 32 * 4];
     let mut maximum_frozen = freeze(&mut arena, &ingress, &maximum_samples, 4);
-    let maximum_prepared = workspace
+    let maximum_prepared = maximum_workspace
         .prepare(
             &maximum_frozen,
             PrepareRequest::Policy {
@@ -2692,7 +2844,7 @@ fn assert_checkpoint_publication_allocations_do_not_scale(
         (small_count, small_bytes),
         "checkpoint publication allocations scaled from one output to the startup maximum"
     );
-    let maximum_recovery = workspace
+    let maximum_recovery = maximum_workspace
         .recover_indeterminate_publication(&mut maximum_cleanup)
         .unwrap();
     match expected {
@@ -2737,7 +2889,7 @@ fn dump_after_rename_checkpoint_allocations_do_not_scale_and_recovery_completes(
 }
 
 #[test]
-fn current_artifact_cleanup_race_never_deletes_foreign_replacement_and_retries() {
+fn final_private_cleanup_boundary_replacement_is_preserved_and_remains_pending() {
     let geometry = Geometry {
         retention_frames: 32,
         channels: 4,
@@ -2748,18 +2900,19 @@ fn current_artifact_cleanup_race_never_deletes_foreign_replacement_and_retries()
     };
     let (mut arena, ingress, plan) = runtime(geometry);
     let state = Arc::new(Mutex::new(CleanupRaceState::default()));
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("output");
     let mut workspace = PersistenceWorkspace::new_with_cleanup_io(
         &plan,
         workspace_config(geometry),
         Box::new(ReplaceAtCleanupCheckRemoveBoundary {
             state: Arc::clone(&state),
+            fail_after_replace: false,
         }),
     )
     .unwrap();
-    let root = tempfile::tempdir().unwrap();
     let staging = root.path().join("staging");
     fs::create_dir(&staging).unwrap();
-    let output = root.path().join("output");
     let policy = exact_zero_policy(&output, &[ChannelExportMode::Auto; 4]);
     let mut decision = FrozenExportDecision::new(&plan).unwrap();
     let mut samples = vec![0.0; 2 * 4];
@@ -2803,16 +2956,288 @@ fn current_artifact_cleanup_race_never_deletes_foreign_replacement_and_retries()
         .unwrap()
         .replaced_path
         .clone()
-        .expect("cleanup seam replaced the public artifact name");
-    assert_eq!(fs::read(&foreign).unwrap(), b"foreign cleanup race inode");
+        .expect("cleanup seam replaced the final private cleanup name");
+    assert_eq!(
+        fs::read(&foreign).unwrap(),
+        b"foreign private cleanup race inode"
+    );
 
-    fs::remove_file(&foreign).unwrap();
+    assert!(matches!(
+        workspace
+            .recover_indeterminate_publication(&mut descriptor)
+            .unwrap(),
+        PublicationRecovery::Pending
+    ));
+    assert_eq!(
+        fs::read(&foreign).unwrap(),
+        b"foreign private cleanup race inode",
+        "a preexisting mismatched private candidate must not be promoted"
+    );
+    arena.release_frozen(&mut frozen, DEADLINE).unwrap();
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn mismatched_preexisting_private_candidate_is_not_promoted_and_retains_authority() {
+    let geometry = Geometry {
+        retention_frames: 32,
+        channels: 4,
+        chunk_frames: 32,
+        split_when_over_bytes: 50,
+        io_buffer_bytes_per_channel: 24,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let state = Arc::new(Mutex::new(CleanupRaceState::default()));
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("output");
+    let mut workspace = PersistenceWorkspace::new_with_cleanup_io(
+        &plan,
+        workspace_config(geometry),
+        Box::new(ReplaceAtCleanupCheckRemoveBoundary {
+            state: Arc::clone(&state),
+            fail_after_replace: true,
+        }),
+    )
+    .unwrap();
+    let staging = root.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    let policy = exact_zero_policy(&output, &[ChannelExportMode::Auto; 4]);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut samples = vec![0.0; 2 * 4];
+    samples[0] = 0.25;
+    let mut frozen = freeze(&mut arena, &ingress, &samples, 4);
+    let prepared = workspace
+        .prepare(
+            &frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "private-collision",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+        )
+        .unwrap();
+    let PreparedPublication::Indeterminate {
+        cleanup: mut descriptor,
+        ..
+    } = publish_prepared_with_hook(
+        prepared,
+        &mut InterruptPublicationAt(PublicationCheckpoint::RecallPartialCreatedBeforeManifest {
+            index: 0,
+        }),
+    )
+    else {
+        panic!("partial-created checkpoint must be indeterminate")
+    };
+
+    assert!(workspace
+        .recover_indeterminate_publication(&mut descriptor)
+        .is_err());
+    let foreign_private = state
+        .lock()
+        .unwrap()
+        .replaced_path
+        .clone()
+        .expect("first recovery left a mismatched private candidate");
+    assert!(matches!(
+        workspace
+            .recover_indeterminate_publication(&mut descriptor)
+            .unwrap(),
+        PublicationRecovery::Pending
+    ));
+    assert_eq!(
+        fs::read(&foreign_private).unwrap(),
+        b"foreign private cleanup race inode"
+    );
+    let output_entries: Vec<_> = fs::read_dir(&output)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(
+        output_entries,
+        vec![foreign_private.parent().unwrap().to_path_buf()]
+    );
+
+    arena.release_frozen(&mut frozen, DEADLINE).unwrap();
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+fn assert_quarantine_setup_failure_is_retryable(stage: QuarantineSetupFailure) {
+    let geometry = Geometry {
+        retention_frames: 32,
+        channels: 4,
+        chunk_frames: 32,
+        split_when_over_bytes: 50,
+        io_buffer_bytes_per_channel: 24,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new_with_cleanup_io(
+        &plan,
+        workspace_config(geometry),
+        Box::new(FailQuarantineSetupOnce {
+            stage,
+            failed: false,
+        }),
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    let output = root.path().join("output");
+    let policy = exact_zero_policy(&output, &[ChannelExportMode::Auto; 4]);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut samples = vec![0.0; 2 * 4];
+    samples[0] = 0.25;
+    let mut frozen = freeze(&mut arena, &ingress, &samples, 4);
+    let prepared = workspace
+        .prepare(
+            &frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "setup-retry",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+        )
+        .unwrap();
+    let PreparedPublication::Indeterminate {
+        cleanup: mut descriptor,
+        ..
+    } = publish_prepared_with_hook(
+        prepared,
+        &mut InterruptPublicationAt(PublicationCheckpoint::RecallPartialCreatedBeforeManifest {
+            index: 0,
+        }),
+    )
+    else {
+        panic!("partial-created checkpoint must be indeterminate")
+    };
+
+    assert!(workspace
+        .recover_indeterminate_publication(&mut descriptor)
+        .is_err());
     assert!(matches!(
         workspace
             .recover_indeterminate_publication(&mut descriptor)
             .unwrap(),
         PublicationRecovery::RolledBack
     ));
+    assert_eq!(fs::read_dir(&output).unwrap().count(), 0);
+
+    let retry = workspace
+        .prepare(
+            &frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "setup-retry",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        publish_prepared(retry),
+        PreparedPublication::Published
+    ));
+    assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+
+    arena.release_frozen(&mut frozen, DEADLINE).unwrap();
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn mkdir_success_then_quarantine_open_failure_reopens_on_retry() {
+    assert_quarantine_setup_failure_is_retryable(QuarantineSetupFailure::Open);
+}
+
+#[test]
+fn quarantine_normalization_failure_reopens_on_retry() {
+    assert_quarantine_setup_failure_is_retryable(QuarantineSetupFailure::Normalize);
+}
+
+#[test]
+fn final_quarantine_removal_boundary_replacement_is_preserved_and_pending() {
+    let geometry = Geometry {
+        retention_frames: 32,
+        channels: 4,
+        chunk_frames: 32,
+        split_when_over_bytes: 50,
+        io_buffer_bytes_per_channel: 24,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let state = Arc::new(Mutex::new(QuarantineRemovalRaceState::default()));
+    let mut workspace = PersistenceWorkspace::new_with_cleanup_io(
+        &plan,
+        workspace_config(geometry),
+        Box::new(ReplaceQuarantineAtRemoval {
+            state: Arc::clone(&state),
+        }),
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    let output = root.path().join("output");
+    let policy = exact_zero_policy(&output, &[ChannelExportMode::Auto; 4]);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut samples = vec![0.0; 2 * 4];
+    samples[0] = 0.25;
+    let mut frozen = freeze(&mut arena, &ingress, &samples, 4);
+    let prepared = workspace
+        .prepare(
+            &frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "teardown-race",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+        )
+        .unwrap();
+    let PreparedPublication::Indeterminate {
+        cleanup: mut descriptor,
+        ..
+    } = publish_prepared_with_hook(
+        prepared,
+        &mut InterruptPublicationAt(PublicationCheckpoint::RecallPartialCreatedBeforeManifest {
+            index: 0,
+        }),
+    )
+    else {
+        panic!("partial-created checkpoint must be indeterminate")
+    };
+
+    assert!(matches!(
+        workspace
+            .recover_indeterminate_publication(&mut descriptor)
+            .unwrap(),
+        PublicationRecovery::Pending
+    ));
+    let state = state.lock().unwrap();
+    let replacement = state.replacement.as_ref().unwrap();
+    let retained = state.retained.as_ref().unwrap();
+    assert!(replacement.is_dir(), "foreign replacement was removed");
+    assert!(retained.is_dir(), "workspace quarantine authority was lost");
+    assert_eq!(fs::read_dir(replacement).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(retained).unwrap().count(), 0);
+    assert!(fs::read_dir(&output).unwrap().all(|entry| entry
+        .unwrap()
+        .file_type()
+        .unwrap()
+        .is_dir()));
+    drop(state);
+
     arena.release_frozen(&mut frozen, DEADLINE).unwrap();
     arena.shutdown(DEADLINE).unwrap();
 }
