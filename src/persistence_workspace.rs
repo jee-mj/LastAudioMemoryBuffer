@@ -1233,7 +1233,7 @@ impl PersistenceWorkspace {
         request: PrepareRequest<'_>,
         io: &mut impl WavIo,
     ) -> Result<PreparedPersistence<'a>> {
-        self.finish_completed_publication();
+        self.finish_completed_publication()?;
         self.advance_transaction_generation()?;
         self.retry_pending_cleanup()?;
         self.reset_slots();
@@ -2266,9 +2266,9 @@ impl PersistenceWorkspace {
         )
     }
 
-    pub(crate) fn finish_completed_publication(&mut self) {
-        let Some(completed) = self.completed_publication.take() else {
-            return;
+    pub(crate) fn finish_completed_publication(&mut self) -> Result<()> {
+        let Some(completed) = self.completed_publication else {
+            return Ok(());
         };
         let transaction_root = self.paths[TRANSACTION_ROOT_PATH].as_path().to_path_buf();
         let final_root = self.paths[FINAL_ROOT_PATH].as_path().to_path_buf();
@@ -2300,26 +2300,31 @@ impl PersistenceWorkspace {
                 output_parent.join(format!(".{transaction_id}.manifest.json"))
             }
         };
-        if completed.kind == PersistenceKind::Recall {
-            let _ = recover_recall_root_with_directories(
+        let recovery = if completed.kind == PersistenceKind::Recall {
+            recover_recall_root_with_directories(
                 &transaction_root,
                 &final_root,
                 self.manifest_serialization.as_mut_slice(),
                 self.manifest_entries.as_mut_slice(),
                 self.manifest_directories.as_mut_slice(),
                 self.manifest_paths.as_mut_slice(),
-            );
-            self.clear_recovered_transaction();
-            return;
+            )
+        } else {
+            recover_dump_parent(
+                &output_parent,
+                &manifest_path,
+                self.manifest_serialization.as_mut_slice(),
+                self.manifest_entries.as_mut_slice(),
+                self.manifest_paths.as_mut_slice(),
+            )
+        }?;
+        if recovery != RecoveryOutcome::Complete {
+            return Err(LambError::ExportInvariant(
+                "completed publication cleanup remains pending",
+            ));
         }
-        let _ = recover_dump_parent(
-            &output_parent,
-            &manifest_path,
-            self.manifest_serialization.as_mut_slice(),
-            self.manifest_entries.as_mut_slice(),
-            self.manifest_paths.as_mut_slice(),
-        );
         self.clear_recovered_transaction();
+        Ok(())
     }
 
     fn clear_recovered_transaction(&mut self) {

@@ -271,12 +271,12 @@ impl CompletionGuard<'_> {
         deliver(outcome)
     }
 
-    fn finalize(&mut self) {
+    fn finalize(&mut self) -> Result<()> {
         if self.finalized {
-            return;
+            return Ok(());
         }
         self.finalized = true;
-        self.workspace.finish_completed_publication();
+        let cleanup = self.workspace.finish_completed_publication();
         let (mut state, poisoned) = match self.coordinator.state.lock() {
             Ok(state) => (state, false),
             Err(error) => (error.into_inner(), true),
@@ -294,12 +294,13 @@ impl CompletionGuard<'_> {
         if poisoned && coherent {
             self.coordinator.state.clear_poison();
         }
+        cleanup
     }
 }
 
 impl Drop for CompletionGuard<'_> {
     fn drop(&mut self) {
-        self.finalize();
+        let _ = self.finalize();
     }
 }
 
@@ -497,6 +498,7 @@ impl DumpCoordinator {
     where
         F: for<'view> FnOnce(CommittedPersistenceRef<'view>) -> Result<()>,
     {
+        workspace.finish_completed_publication()?;
         let mut state = self.lock_state()?;
         Self::bind_arena(&mut state, arena)?;
         Self::recover_pending_clear(&mut state, self.id, arena, timeout)?;
@@ -560,9 +562,16 @@ impl DumpCoordinator {
                 finalized: false,
             };
             drop(state);
-            let result = completion.deliver(deliver);
-            completion.finalize();
-            return result;
+            let delivery = completion.deliver(deliver);
+            let cleanup = completion.finalize();
+            return match (delivery, cleanup) {
+                (Ok(()), cleanup) => cleanup,
+                (Err(operation), Ok(())) => Err(operation),
+                (Err(operation), Err(cleanup)) => Err(LambError::PersistenceCleanup {
+                    operation: Box::new(operation),
+                    cleanup: Box::new(cleanup),
+                }),
+            };
         }
         if state.frozen.is_none() && state.reusable_decision.is_none() {
             return Err(LambError::ControlInvariant(
@@ -697,9 +706,16 @@ impl DumpCoordinator {
             finalized: false,
         };
         drop(state);
-        let result = completion.deliver(deliver);
-        completion.finalize();
-        result
+        let delivery = completion.deliver(deliver);
+        let cleanup = completion.finalize();
+        match (delivery, cleanup) {
+            (Ok(()), cleanup) => cleanup,
+            (Err(operation), Ok(())) => Err(operation),
+            (Err(operation), Err(cleanup)) => Err(LambError::PersistenceCleanup {
+                operation: Box::new(operation),
+                cleanup: Box::new(cleanup),
+            }),
+        }
     }
 
     pub fn persist_with_release_timeout(
@@ -1000,8 +1016,7 @@ impl DumpCoordinator {
             },
         };
 
-        workspace.finish_completed_publication();
-
+        let cleanup = workspace.finish_completed_publication();
         Self::begin_completion(&mut state)?;
         let Some(transaction) = state.frozen.take() else {
             Self::cancel_completion(&mut state);
@@ -1011,6 +1026,7 @@ impl DumpCoordinator {
         };
         let mut transaction = Some(transaction);
         Self::finalize_completed_transaction(&mut state, arena, release_timeout, &mut transaction)?;
+        cleanup?;
         Ok(outcome)
     }
 

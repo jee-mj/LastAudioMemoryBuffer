@@ -2978,6 +2978,197 @@ fn borrowed_delivery_error_commits_then_reuses_workspace_without_republishing() 
 }
 
 #[test]
+fn borrowed_recall_delivery_cleanup_error_retains_authority_until_repaired() {
+    let mut fixture = FrozenFixture::new(8, 8, 2);
+    let output = fixture.root.path().join("borrowed-recall-cleanup-error");
+    let staging = fixture.root.path().join("borrowed-recall-cleanup-staging");
+    let policy = prepared_policy(output.clone(), ChannelExportMode::Auto);
+    fixture.push(&[0.25, 0.5]);
+    let mut saved_manifest = None;
+
+    let error = fixture.coordinator.persist_policy_with_delivery(
+        &fixture.arena,
+        &mut fixture.workspace,
+        borrowed_request(&policy, &staging, TIMESTAMP_A),
+        DEADLINE,
+        DEADLINE,
+        |outcome| {
+            let CommittedPersistenceRef::Written { output, .. } = outcome else {
+                panic!("expected written borrowed delivery")
+            };
+            assert!(output.files.get(0).unwrap().final_path().is_file());
+            let transaction_root = std::fs::read_dir(&staging)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let manifest = transaction_root.join("manifest.json");
+            let saved = transaction_root.join("saved-manifest.json");
+            std::fs::rename(&manifest, &saved).unwrap();
+            std::fs::write(&manifest, b"not a manifest").unwrap();
+            saved_manifest = Some((manifest, saved));
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        error,
+        Err(LambError::Io { .. } | LambError::Validation(_))
+    ));
+
+    let (manifest, saved) = saved_manifest.unwrap();
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::rename(saved, manifest).unwrap();
+    fixture
+        .coordinator
+        .persist_policy_with_delivery(
+            &fixture.arena,
+            &mut fixture.workspace,
+            borrowed_request(&policy, &staging, TIMESTAMP_A),
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                assert!(matches!(
+                    outcome,
+                    CommittedPersistenceRef::NoNewAudio { .. }
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(std::fs::read_dir(&staging).unwrap().next().is_none());
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+}
+
+#[test]
+fn borrowed_dump_delivery_cleanup_error_retains_authority_until_repaired() {
+    let mut fixture = FrozenFixture::new(8, 8, 2);
+    let output = fixture.root.path().join("borrowed-dump-cleanup-error");
+    let output_parent = output.clone();
+    let staging = fixture.root.path().join("borrowed-dump-cleanup-staging");
+    let policy = ResolvedExportPolicy::new(
+        output.clone(),
+        ResolvedLayout::TimestampDirectory,
+        exact_zero_policy(ChannelExportMode::Auto),
+    )
+    .unwrap();
+    fixture.push(&[0.25, 0.5]);
+    let mut saved_manifest = None;
+
+    let error = fixture.coordinator.persist_policy_with_delivery(
+        &fixture.arena,
+        &mut fixture.workspace,
+        PolicyPersistenceRequest {
+            command: ExportCommand::Dump,
+            policy: &policy,
+            profile: "borrowed-delivery",
+            staging_root: &staging,
+            timestamp: TIMESTAMP_A,
+        },
+        DEADLINE,
+        DEADLINE,
+        |outcome| {
+            let CommittedPersistenceRef::Written { output, .. } = outcome else {
+                panic!("expected written borrowed delivery")
+            };
+            assert!(output.files.get(0).unwrap().final_path().is_file());
+            let manifest = std::fs::read_dir(&output_parent)
+                .unwrap()
+                .find_map(|entry| {
+                    let path = entry.unwrap().path();
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".manifest.json"))
+                        .then_some(path)
+                })
+                .unwrap();
+            let saved = output_parent.join("saved-manifest.json");
+            std::fs::rename(&manifest, &saved).unwrap();
+            std::fs::write(&manifest, b"not a manifest").unwrap();
+            saved_manifest = Some((manifest, saved));
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        error,
+        Err(LambError::Io { .. } | LambError::Validation(_))
+    ));
+
+    let (manifest, saved) = saved_manifest.unwrap();
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::rename(saved, manifest).unwrap();
+    fixture
+        .coordinator
+        .persist_policy_with_delivery(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PolicyPersistenceRequest {
+                command: ExportCommand::Dump,
+                policy: &policy,
+                profile: "borrowed-delivery",
+                staging_root: &staging,
+                timestamp: TIMESTAMP_A,
+            },
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                assert!(matches!(
+                    outcome,
+                    CommittedPersistenceRef::NoNewAudio { .. }
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(std::fs::read_dir(&output).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_str()
+        .unwrap()
+        .ends_with(".manifest.json")));
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+}
+
+#[test]
+fn borrowed_delivery_and_cleanup_errors_are_both_reported() {
+    let mut fixture = FrozenFixture::new(8, 8, 2);
+    let output = fixture.root.path().join("borrowed-double-error");
+    let staging = fixture.root.path().join("borrowed-double-error-staging");
+    let policy = prepared_policy(output, ChannelExportMode::Auto);
+    fixture.push(&[0.25, 0.5]);
+
+    let error = fixture.coordinator.persist_policy_with_delivery(
+        &fixture.arena,
+        &mut fixture.workspace,
+        borrowed_request(&policy, &staging, TIMESTAMP_A),
+        DEADLINE,
+        DEADLINE,
+        |outcome| {
+            let CommittedPersistenceRef::Written { output, .. } = outcome else {
+                panic!("expected written borrowed delivery")
+            };
+            assert!(output.files.get(0).unwrap().final_path().is_file());
+            let transaction_root = std::fs::read_dir(&staging)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let manifest = transaction_root.join("manifest.json");
+            std::fs::write(&manifest, b"not a manifest").unwrap();
+            Err(LambError::Control("injected delivery error".to_string()))
+        },
+    );
+
+    assert!(matches!(
+        error,
+        Err(LambError::PersistenceCleanup { operation, cleanup })
+            if matches!(&*operation, LambError::Control(message) if message == "injected delivery error")
+                && matches!(&*cleanup, LambError::Io { .. } | LambError::Validation(_))
+    ));
+}
+
+#[test]
 fn borrowed_delivery_panic_finalizes_before_the_next_command() {
     let mut fixture = FrozenFixture::new(8, 8, 2);
     let output = fixture.root.path().join("borrowed-panic");
