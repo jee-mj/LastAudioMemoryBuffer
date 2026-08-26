@@ -2244,6 +2244,23 @@ fn startup_addresses_and_operation_allocations_are_stable_across_sparse_maximum_
     let (mut arena, ingress, plan) = runtime(geometry);
     let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
     let startup = workspace.allocation_addresses();
+    assert_ne!(startup.publication_sync_slots, 0);
+    assert_eq!(
+        startup.publication_sync_slot_count,
+        usize::try_from(plan.manifest_directory_slots()).unwrap()
+    );
+    assert_ne!(startup.publication_current_artifact, 0);
+    assert_eq!(startup.publication_current_artifact_slots, 1);
+    assert_ne!(startup.publication_component_a, 0);
+    assert_eq!(
+        startup.publication_component_a_capacity,
+        geometry.maximum_path_bytes as usize + 1
+    );
+    assert_ne!(startup.publication_component_b, 0);
+    assert_eq!(
+        startup.publication_component_b_capacity,
+        geometry.maximum_path_bytes as usize + 1
+    );
     let root = tempfile::tempdir().unwrap();
     let staging = root.path().join("staging");
     fs::create_dir(&staging).unwrap();

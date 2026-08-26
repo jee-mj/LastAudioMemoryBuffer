@@ -38,6 +38,8 @@ pub const CAPTURE_COMMAND_RESULT_SLOT_BYTES: u64 = 512;
 pub const FROZEN_EXPORT_DECISION_SLOT_BYTES: u64 = 24;
 pub const ACTIVITY_DETECTOR_STATE_SLOT_BYTES: u64 = 104;
 pub const CALIBRATION_SLOT_METADATA_BYTES: u64 = 256;
+pub const PUBLICATION_SYNC_SLOT_BYTES: u64 = 16;
+pub const PUBLICATION_ARTIFACT_SLOT_BYTES: u64 = 40;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SessionMemoryInputs {
@@ -91,6 +93,7 @@ pub struct SessionMemoryPlan {
     path_slots: u64,
     manifest_paths_bytes: u64,
     manifest_directory_slots: u64,
+    publication_scratch: u64,
     calibration_sample_frames: u64,
     calibration_complete_windows: u64,
     calibration_window_frames: u64,
@@ -354,6 +357,29 @@ impl SessionMemoryPlan {
             MANIFEST_DIRECTORY_METADATA_BYTES,
         )
         .and_then(allocation_budget_bytes)?;
+        let component_bytes = checked_add(
+            "publication component buffer overflow",
+            inputs.maximum_path_bytes,
+            1,
+        )?;
+        let sync_payload = checked_mul(
+            "publication sync slot storage overflow",
+            manifest_directory_slots,
+            PUBLICATION_SYNC_SLOT_BYTES,
+        )?;
+        let publication_scratch = checked_add(
+            "publication scratch overflow",
+            checked_add(
+                "publication scratch overflow",
+                allocation_budget_bytes(sync_payload)?,
+                checked_mul(
+                    "publication component buffer storage overflow",
+                    2,
+                    allocation_budget_bytes(component_bytes)?,
+                )?,
+            )?,
+            allocation_budget_bytes(PUBLICATION_ARTIFACT_SLOT_BYTES)?,
+        )?;
         let manifest_path_entries = checked_add(
             "manifest entry path slot count overflow",
             checked_mul("manifest entry path count overflow", part_slots, 3)?,
@@ -525,6 +551,10 @@ impl SessionMemoryPlan {
                 bytes: manifest_directories,
             },
             MemoryComponent {
+                name: "publication_scratch",
+                bytes: publication_scratch,
+            },
+            MemoryComponent {
                 name: "manifest_serialization",
                 bytes: manifest_serialization,
             },
@@ -587,6 +617,7 @@ impl SessionMemoryPlan {
             path_slots: path_slot_count,
             manifest_paths_bytes: manifest_paths,
             manifest_directory_slots,
+            publication_scratch,
             calibration_sample_frames,
             calibration_complete_windows,
             calibration_window_frames: window_frames,
@@ -694,6 +725,10 @@ impl SessionMemoryPlan {
 
     pub fn manifest_directory_slots(&self) -> u64 {
         self.manifest_directory_slots
+    }
+
+    pub fn publication_scratch_bytes(&self) -> u64 {
+        self.publication_scratch
     }
 
     pub fn calibration_sample_frames(&self) -> u64 {

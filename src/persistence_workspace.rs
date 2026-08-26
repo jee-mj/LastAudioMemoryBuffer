@@ -13,16 +13,16 @@ use crate::export_wav::{
 };
 use crate::math::{wav_part_count, WAV_HEADER_BYTES};
 use crate::memory_plan::{
-    ExactArray, MaterializedBuffer, SessionMemoryPlan, MANIFEST_DIRECTORY_METADATA_BYTES,
-    MANIFEST_ENTRY_METADATA_BYTES, MANIFEST_FIXED_PATH_ENTRIES,
+    allocation_budget_bytes, ExactArray, MaterializedBuffer, SessionMemoryPlan,
+    MANIFEST_DIRECTORY_METADATA_BYTES, MANIFEST_ENTRY_METADATA_BYTES, MANIFEST_FIXED_PATH_ENTRIES,
     MANIFEST_JSON_DIRECTORY_OVERHEAD_BYTES, MANIFEST_JSON_ENTRY_OVERHEAD_BYTES,
     MANIFEST_JSON_FIXED_OVERHEAD_BYTES, MANIFEST_PATH_ESCAPE_MULTIPLIER,
-    OUTPUT_PATH_SLOTS_PER_PART,
+    OUTPUT_PATH_SLOTS_PER_PART, PUBLICATION_ARTIFACT_SLOT_BYTES, PUBLICATION_SYNC_SLOT_BYTES,
 };
 use crate::recovery::{
     recover_dump_parent, recover_dump_root, recover_recall_root_with_directories,
-    recover_recall_staging_root_with_directories, ManifestDirectorySlot, ManifestEntrySlot,
-    RecoveryOutcome, RecoveryScanSummary, TransactionKind,
+    recover_recall_staging_root_with_directories, FileIdentity, ManifestDirectorySlot,
+    ManifestEntrySlot, PathRef, RecoveryOutcome, RecoveryScanSummary, TransactionKind,
 };
 use crate::sample_ring::SampleFormat;
 use std::fmt;
@@ -41,6 +41,8 @@ const FIXED_PATH_SLOTS: usize = MANIFEST_FIXED_PATH_ENTRIES as usize;
 const TRANSACTION_ROOT_PATH: usize = 0;
 const STAGING_PARENT_PATH: usize = 1;
 const FINAL_ROOT_PATH: usize = 2;
+const PARTIAL_SCRATCH_PATH: usize = 3;
+const MANIFEST_SCRATCH_PATH: usize = 4;
 const OUTPUT_PATH_START: usize = FIXED_PATH_SLOTS;
 const STAGED_PATH_OFFSET: usize = 0;
 const FINAL_PATH_OFFSET: usize = 1;
@@ -212,6 +214,43 @@ pub struct WorkspaceAllocationAddresses {
     manifest_paths_len: usize,
     manifest_serialization: usize,
     manifest_serialization_len: usize,
+    pub publication_sync_slots: usize,
+    pub publication_sync_slot_count: usize,
+    pub publication_current_artifact: usize,
+    pub publication_current_artifact_slots: usize,
+    pub publication_component_a: usize,
+    pub publication_component_a_capacity: usize,
+    pub publication_component_b: usize,
+    pub publication_component_b_capacity: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)] // Reserved for allocation-free publication in the next integration step.
+pub(crate) struct DirectorySyncSlot {
+    pub entry_index: u32,
+    pub prefix_len: u32,
+    pub active: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)] // Reserved for allocation-free publication in the next integration step.
+pub(crate) struct CurrentArtifactSlot {
+    pub path: PathRef,
+    pub identity: Option<FileIdentity>,
+    pub final_name: bool,
+}
+
+const _: () =
+    assert!(std::mem::size_of::<DirectorySyncSlot>() <= PUBLICATION_SYNC_SLOT_BYTES as usize);
+const _: () =
+    assert!(std::mem::size_of::<CurrentArtifactSlot>() <= PUBLICATION_ARTIFACT_SLOT_BYTES as usize);
+
+pub(crate) struct PublicationScratch {
+    sync_slots: ExactArray<DirectorySyncSlot>,
+    current_artifact: ExactArray<CurrentArtifactSlot>,
+    component_a: MaterializedBuffer<u8>,
+    component_b: MaterializedBuffer<u8>,
+    sync_count: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -408,6 +447,7 @@ pub struct PersistenceWorkspace {
     manifest_directories: ExactArray<ManifestDirectorySlot>,
     manifest_paths: MaterializedBuffer<u8>,
     manifest_serialization: MaterializedBuffer<u8>,
+    publication: PublicationScratch,
     output_count: usize,
     staging_identity: Option<StagingIdentity>,
     pending_cleanup: Option<PendingCleanup>,
@@ -476,6 +516,13 @@ impl PersistenceWorkspace {
         let directory_slots = usize::try_from(plan.manifest_directory_slots()).map_err(|_| {
             LambError::Validation("workspace directory slot count overflow".to_string())
         })?;
+        let publication_component_len = config
+            .maximum_path_bytes
+            .checked_add(1)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| {
+                LambError::Validation("publication component buffer capacity overflow".to_string())
+            })?;
         let escaped_path_bytes = config
             .maximum_path_bytes
             .checked_mul(MANIFEST_PATH_ESCAPE_MULTIPLIER)
@@ -534,6 +581,17 @@ impl PersistenceWorkspace {
             })?,
             manifest_paths: MaterializedBuffer::new_zeroed(manifest_paths_len)?,
             manifest_serialization: MaterializedBuffer::new_zeroed(manifest_serialization_len)?,
+            publication: PublicationScratch {
+                sync_slots: ExactArray::try_from_fn(directory_slots, |_| {
+                    Ok(DirectorySyncSlot::default())
+                })?,
+                current_artifact: ExactArray::try_from_fn(1, |_| {
+                    Ok(CurrentArtifactSlot::default())
+                })?,
+                component_a: MaterializedBuffer::new_zeroed(publication_component_len)?,
+                component_b: MaterializedBuffer::new_zeroed(publication_component_len)?,
+                sync_count: 0,
+            },
             output_count: 0,
             staging_identity: None,
             pending_cleanup: None,
@@ -592,6 +650,15 @@ impl PersistenceWorkspace {
             manifest_paths_len: self.manifest_paths.len(),
             manifest_serialization: self.manifest_serialization.as_slice().as_ptr() as usize,
             manifest_serialization_len: self.manifest_serialization.len(),
+            publication_sync_slots: self.publication.sync_slots.as_slice().as_ptr() as usize,
+            publication_sync_slot_count: self.publication.sync_slots.len(),
+            publication_current_artifact: self.publication.current_artifact.as_slice().as_ptr()
+                as usize,
+            publication_current_artifact_slots: self.publication.current_artifact.len(),
+            publication_component_a: self.publication.component_a.as_slice().as_ptr() as usize,
+            publication_component_a_capacity: self.publication.component_a.len(),
+            publication_component_b: self.publication.component_b.as_slice().as_ptr() as usize,
+            publication_component_b_capacity: self.publication.component_b.len(),
         }
     }
 
@@ -1417,11 +1484,20 @@ impl PersistenceWorkspace {
         for path in self.paths.iter_mut() {
             path.clear();
         }
+        self.paths[PARTIAL_SCRATCH_PATH].clear();
+        self.paths[MANIFEST_SCRATCH_PATH].clear();
         for entry in self.manifest_entries.iter_mut() {
             *entry = ManifestEntrySlot::default();
         }
         self.manifest_paths.as_mut_slice().fill(0);
         self.manifest_serialization.as_mut_slice().fill(0);
+        for slot in self.publication.sync_slots.iter_mut() {
+            *slot = DirectorySyncSlot::default();
+        }
+        self.publication.current_artifact[0] = CurrentArtifactSlot::default();
+        self.publication.component_a.as_mut_slice().fill(0);
+        self.publication.component_b.as_mut_slice().fill(0);
+        self.publication.sync_count = 0;
         self.output_count = 0;
         if let Some(first) = self.interleaved_scratch.as_mut_slice().first_mut() {
             *first = 0.0;
@@ -1928,6 +2004,31 @@ fn validate_workspace_plan(
     if !matches {
         return Err(LambError::Validation(
             "persistence workspace geometry does not match session memory plan".to_string(),
+        ));
+    }
+    let component_bytes = config.maximum_path_bytes.checked_add(1).ok_or_else(|| {
+        LambError::Validation("publication component buffer overflow".to_string())
+    })?;
+    let sync_payload = plan
+        .manifest_directory_slots()
+        .checked_mul(PUBLICATION_SYNC_SLOT_BYTES)
+        .ok_or_else(|| {
+            LambError::Validation("publication sync slot storage overflow".to_string())
+        })?;
+    let component_storage = allocation_budget_bytes(component_bytes)?
+        .checked_mul(2)
+        .ok_or_else(|| {
+            LambError::Validation("publication component buffer storage overflow".to_string())
+        })?;
+    let artifact_storage = allocation_budget_bytes(PUBLICATION_ARTIFACT_SLOT_BYTES)?;
+    let expected_publication_scratch = allocation_budget_bytes(sync_payload)?
+        .checked_add(component_storage)
+        .and_then(|bytes| bytes.checked_add(artifact_storage))
+        .ok_or_else(|| LambError::Validation("publication scratch overflow".to_string()))?;
+    if plan.publication_scratch_bytes() != expected_publication_scratch {
+        return Err(LambError::Validation(
+            "persistence workspace publication scratch does not match session memory plan"
+                .to_string(),
         ));
     }
     if config.io_buffer_bytes_per_channel < WAV_BYTES_PER_SAMPLE {

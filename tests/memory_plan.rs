@@ -13,8 +13,8 @@ use lamb::memory_plan::{
     MANIFEST_JSON_DIRECTORY_OVERHEAD_BYTES, MANIFEST_JSON_ENTRY_OVERHEAD_BYTES,
     MANIFEST_JSON_FIXED_OVERHEAD_BYTES, MANIFEST_PATH_ESCAPE_MULTIPLIER,
     OPERATION_QUEUE_SLOT_BYTES, OUTPUT_PATH_SLOTS_PER_PART, PATH_SLOT_METADATA_BYTES,
-    RING_CHUNK_OBJECT_RESERVE_BYTES, RING_FIXED_METADATA_RESERVE_BYTES,
-    RUNTIME_METADATA_RESERVE_BYTES, SPLIT_PART_SLOT_BYTES,
+    PUBLICATION_ARTIFACT_SLOT_BYTES, PUBLICATION_SYNC_SLOT_BYTES, RING_CHUNK_OBJECT_RESERVE_BYTES,
+    RING_FIXED_METADATA_RESERVE_BYTES, RUNTIME_METADATA_RESERVE_BYTES, SPLIT_PART_SLOT_BYTES,
 };
 use lamb::sample_ring::{RingConfig, SampleFormat, SampleRing};
 use std::cell::Cell;
@@ -53,6 +53,28 @@ fn inputs() -> SessionMemoryInputs {
         maximum_calibration_seconds: 0,
         headroom: 1.0,
     }
+}
+
+#[test]
+fn publication_scratch_is_startup_accounted_materialized_and_limit_checked() {
+    let inputs = inputs();
+    let plan = SessionMemoryPlan::calculate(inputs).unwrap();
+    let sync_payload = plan.manifest_directory_slots() * PUBLICATION_SYNC_SLOT_BYTES;
+    let component_payload = inputs.maximum_path_bytes.checked_add(1).unwrap();
+    let expected = allocation_budget_bytes(sync_payload).unwrap()
+        + 2 * allocation_budget_bytes(component_payload).unwrap()
+        + allocation_budget_bytes(PUBLICATION_ARTIFACT_SLOT_BYTES).unwrap();
+    assert_eq!(plan.publication_scratch_bytes(), expected);
+    assert_eq!(
+        plan.component("publication_scratch").unwrap().bytes,
+        expected
+    );
+    assert!(plan
+        .validate_max(Some(plan.required_with_headroom()))
+        .is_ok());
+    assert!(plan
+        .validate_max(Some(plan.required_with_headroom() - 1))
+        .is_err());
 }
 
 #[test]

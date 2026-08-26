@@ -6,6 +6,11 @@ use lamb::export_policy::{
 };
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+
 fn policy(layout: ResolvedLayout, output_dir: &str, channels: &[&str]) -> ResolvedExportPolicy {
     try_policy(layout, output_dir, channels).unwrap()
 }
@@ -45,6 +50,28 @@ fn context(command: ExportCommand) -> RenderContext<'static> {
         split_when_over_bytes: 312_044,
         maximum_path_bytes: 512,
     }
+}
+
+#[cfg(unix)]
+fn absolute_non_utf8_path() -> PathBuf {
+    PathBuf::from(OsString::from_vec(b"/exports/\xff".to_vec()))
+}
+
+#[cfg(unix)]
+#[test]
+fn prepared_policy_rejects_non_utf8_root_before_staging() {
+    let activity = policy(ResolvedLayout::FlatDetailed, "/exports", &["left"]).activity;
+    let temporary = tempfile::tempdir().unwrap();
+    let staging_root = temporary.path().join("staging");
+    let error = ResolvedExportPolicy::new(
+        absolute_non_utf8_path(),
+        ResolvedLayout::FlatDetailed,
+        activity,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("UTF-8"));
+    assert!(!staging_root.exists());
 }
 
 #[test]
