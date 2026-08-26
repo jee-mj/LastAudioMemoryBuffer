@@ -690,6 +690,11 @@ impl PersistenceWorkspace {
                 timestamp,
                 decision,
             } => {
+                if staging_root.to_str().is_none() {
+                    return Err(LambError::Validation(
+                        "export staging root must be valid UTF-8".to_string(),
+                    ));
+                }
                 validate_policy_geometry(&self.config, frozen, policy, decision)?;
                 if decision.valid() && !decision.matches_frozen_epoch(frozen) {
                     return Err(LambError::ExportInvariant(

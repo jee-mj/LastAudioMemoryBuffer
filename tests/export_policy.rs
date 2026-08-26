@@ -59,10 +59,8 @@ fn absolute_non_utf8_path() -> PathBuf {
 
 #[cfg(unix)]
 #[test]
-fn prepared_policy_rejects_non_utf8_root_before_staging() {
+fn resolved_policy_rejects_non_utf8_output_root() {
     let activity = policy(ResolvedLayout::FlatDetailed, "/exports", &["left"]).activity;
-    let temporary = tempfile::tempdir().unwrap();
-    let staging_root = temporary.path().join("staging");
     let error = ResolvedExportPolicy::new(
         absolute_non_utf8_path(),
         ResolvedLayout::FlatDetailed,
@@ -71,7 +69,6 @@ fn prepared_policy_rejects_non_utf8_root_before_staging() {
     .unwrap_err();
 
     assert!(error.to_string().contains("UTF-8"));
-    assert!(!staging_root.exists());
 }
 
 #[test]

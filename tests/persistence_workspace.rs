@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
+#[cfg(unix)]
+use std::{ffi::OsString, os::unix::ffi::OsStrExt, os::unix::ffi::OsStringExt};
 
 const DEADLINE: Duration = Duration::from_secs(2);
 const TIMESTAMP: &str = "20260818T120000";
@@ -237,6 +239,53 @@ fn policy_prepare_retains_only_active_channels_in_original_order() {
     let files = prepared.files().unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files.get(0).unwrap().channel(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_prepare_rejects_non_utf8_staging_root_before_filesystem_mutation() {
+    let geometry = Geometry {
+        retention_frames: 2,
+        channels: 1,
+        chunk_frames: 2,
+        split_when_over_bytes: 1_000,
+        io_buffer_bytes_per_channel: 6,
+        maximum_path_bytes: 512,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let temporary = tempfile::tempdir().unwrap();
+    let output = temporary.path().join("output");
+    let policy = exact_zero_policy(&output, &[ChannelExportMode::Always]);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut staging_bytes = temporary.path().as_os_str().as_bytes().to_vec();
+    staging_bytes.extend_from_slice(b"/staging-\xff");
+    let staging_root = PathBuf::from(OsString::from_vec(staging_bytes));
+    let mut frozen = freeze(&mut arena, &ingress, &[0.25, 0.5], 1);
+
+    let error = match workspace.prepare(
+        &frozen,
+        PrepareRequest::Policy {
+            command: ExportCommand::Recall,
+            policy: &policy,
+            profile: "non-utf8",
+            staging_root: &staging_root,
+            timestamp: TIMESTAMP,
+            decision: &mut decision,
+        },
+    ) {
+        Err(error) => error,
+        Ok(prepared) => {
+            drop(prepared);
+            panic!("canonical prepare accepted a non-UTF-8 staging root")
+        }
+    };
+
+    assert!(error.to_string().contains("UTF-8"));
+    assert!(!staging_root.exists());
+    assert!(!output.exists());
+    arena.release_frozen(&mut frozen, DEADLINE).unwrap();
+    arena.shutdown(DEADLINE).unwrap();
 }
 
 #[test]
