@@ -1,11 +1,14 @@
 use crate::activity::ThresholdSource;
 use crate::calibration::{ConfiguredDeviceSelector, InputBackend, LiveDeviceKeyKind, StaleReason};
+use crate::capture_runtime::DEFAULT_MAXIMUM_PATH_BYTES;
 use crate::dump::{CommittedPersistenceRef, FrameRange, LossBreakdown};
 use crate::error::{io_error, LambError, Result};
 use crate::persistence_workspace::FilePlan;
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::fmt;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -689,6 +692,643 @@ pub fn send_request(socket: &Path, request: &ControlRequest) -> Result<ControlRe
         .map_err(|err| LambError::Control(format!("invalid response: {err}")))
 }
 
+/// Deserializes a persistence response directly to a caller-owned writer.
+///
+/// The seed retains only response scalars and one bounded byte buffer. Written
+/// file paths are rendered in wire order while their sequence is visited.
+pub struct PersistenceClientResponseSeed<'a, W: Write> {
+    writer: &'a mut W,
+    buffer: Vec<u8>,
+}
+
+impl<'a, W: Write> PersistenceClientResponseSeed<'a, W> {
+    pub fn new(writer: &'a mut W) -> Self {
+        Self {
+            writer,
+            buffer: Vec::with_capacity(DEFAULT_MAXIMUM_PATH_BYTES as usize),
+        }
+    }
+}
+
+impl<'de, W: Write> DeserializeSeed<'de> for PersistenceClientResponseSeed<'_, W> {
+    type Value = std::result::Result<(), String>;
+
+    fn deserialize<D>(mut self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(PersistenceResponseVisitor {
+            writer: self.writer,
+            buffer: &mut self.buffer,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum PersistenceResponseField {
+    Ok,
+    Message,
+    Status,
+    PersistenceOutcome,
+    ThresholdReport,
+    #[serde(other)]
+    Other,
+}
+
+struct PersistenceResponseVisitor<'a, W> {
+    writer: &'a mut W,
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'de, W: Write> Visitor<'de> for PersistenceResponseVisitor<'_, W> {
+    type Value = std::result::Result<(), String>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a persistence control response")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut ok = None;
+        let mut message = None;
+        let mut persistence_outcome = false;
+        let mut rendered_outcome = false;
+
+        while let Some(field) = map.next_key()? {
+            match field {
+                PersistenceResponseField::Ok => {
+                    set_once(&mut ok, map.next_value()?, "ok")?;
+                }
+                PersistenceResponseField::Message => {
+                    set_once(&mut message, map.next_value()?, "message")?;
+                }
+                PersistenceResponseField::PersistenceOutcome => {
+                    if persistence_outcome {
+                        return Err(de::Error::duplicate_field("persistence_outcome"));
+                    }
+                    let response_ok = ok.ok_or_else(|| de::Error::missing_field("ok"))?;
+                    if message.is_none() {
+                        return Err(de::Error::missing_field("message"));
+                    }
+                    persistence_outcome = true;
+                    if response_ok {
+                        rendered_outcome = map.next_value_seed(PersistenceOutcomeOptionSeed {
+                            writer: self.writer,
+                            buffer: self.buffer,
+                        })?;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                PersistenceResponseField::Status
+                | PersistenceResponseField::ThresholdReport
+                | PersistenceResponseField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        let response_ok = ok.ok_or_else(|| de::Error::missing_field("ok"))?;
+        let message = message.ok_or_else(|| de::Error::missing_field("message"))?;
+        if !response_ok {
+            return Ok(Err(message));
+        }
+        if !rendered_outcome {
+            self.writer
+                .write_all(message.as_bytes())
+                .and_then(|()| self.writer.write_all(b"\n"))
+                .map_err(de::Error::custom)?;
+        } else {
+            self.writer.write_all(b"\n").map_err(de::Error::custom)?;
+        }
+        Ok(Ok(()))
+    }
+}
+
+struct BoundedStringSeed<'a> {
+    buffer: &'a mut Vec<u8>,
+    label: &'static str,
+}
+
+impl<'de> DeserializeSeed<'de> for BoundedStringSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(BoundedStringVisitor {
+            buffer: self.buffer,
+            label: self.label,
+        })
+    }
+}
+
+struct BoundedStringVisitor<'a> {
+    buffer: &'a mut Vec<u8>,
+    label: &'static str,
+}
+
+impl Visitor<'_> for BoundedStringVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} no longer than {DEFAULT_MAXIMUM_PATH_BYTES} bytes",
+            self.label
+        )
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value.len() > DEFAULT_MAXIMUM_PATH_BYTES as usize {
+            return Err(E::custom(format_args!(
+                "{} exceeds maximum path bytes ({DEFAULT_MAXIMUM_PATH_BYTES})",
+                self.label
+            )));
+        }
+        self.buffer.clear();
+        self.buffer.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'_ str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+}
+
+struct PersistenceOutcomeOptionSeed<'a, W> {
+    writer: &'a mut W,
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'de, W: Write> DeserializeSeed<'de> for PersistenceOutcomeOptionSeed<'_, W> {
+    type Value = bool;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_option(PersistenceOutcomeOptionVisitor {
+            writer: self.writer,
+            buffer: self.buffer,
+        })
+    }
+}
+
+struct PersistenceOutcomeOptionVisitor<'a, W> {
+    writer: &'a mut W,
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'de, W: Write> Visitor<'de> for PersistenceOutcomeOptionVisitor<'_, W> {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a persistence outcome or null")
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(false)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(false)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        PersistenceOutcomeSeed {
+            writer: self.writer,
+            buffer: self.buffer,
+        }
+        .deserialize(deserializer)?;
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistenceClientOutcomeKind {
+    Written,
+    SkippedSilent,
+    SkippedByPolicy,
+    NoNewAudio,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum PersistenceOutcomeField {
+    Kind,
+    StartFrame,
+    EndFrame,
+    Frames,
+    ExportStartFrame,
+    ExportFrames,
+    DurationSeconds,
+    LostFrames,
+    RetentionLostFrames,
+    ClearedFrames,
+    CaptureDroppedFrames,
+    OutputDirectory,
+    Files,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Default)]
+struct PersistenceOutcomeScalars {
+    kind: Option<PersistenceClientOutcomeKind>,
+    start_frame: Option<u64>,
+    end_frame: Option<u64>,
+    frames: Option<u64>,
+    export_start_frame: Option<u64>,
+    export_frames: Option<u64>,
+    duration_seconds: Option<f64>,
+    lost_frames: Option<u64>,
+    retention_lost_frames: Option<u64>,
+    cleared_frames: Option<u64>,
+    capture_dropped_frames: Option<u64>,
+    output_directory: bool,
+}
+
+struct PersistenceOutcomeSeed<'a, W> {
+    writer: &'a mut W,
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'de, W: Write> DeserializeSeed<'de> for PersistenceOutcomeSeed<'_, W> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(PersistenceOutcomeVisitor {
+            writer: self.writer,
+            buffer: self.buffer,
+        })
+    }
+}
+
+struct PersistenceOutcomeVisitor<'a, W> {
+    writer: &'a mut W,
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'de, W: Write> Visitor<'de> for PersistenceOutcomeVisitor<'_, W> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a persistence outcome")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = PersistenceOutcomeScalars::default();
+        let mut rendered_files = false;
+        while let Some(field) = map.next_key()? {
+            if rendered_files {
+                return Err(de::Error::custom(
+                    "files must be the final persistence field",
+                ));
+            }
+            match field {
+                PersistenceOutcomeField::Kind => {
+                    set_once(&mut values.kind, map.next_value()?, "kind")?;
+                }
+                PersistenceOutcomeField::StartFrame => {
+                    set_once(&mut values.start_frame, map.next_value()?, "start_frame")?;
+                }
+                PersistenceOutcomeField::EndFrame => {
+                    set_once(&mut values.end_frame, map.next_value()?, "end_frame")?;
+                }
+                PersistenceOutcomeField::Frames => {
+                    set_once(&mut values.frames, map.next_value()?, "frames")?;
+                }
+                PersistenceOutcomeField::ExportStartFrame => set_once(
+                    &mut values.export_start_frame,
+                    map.next_value()?,
+                    "export_start_frame",
+                )?,
+                PersistenceOutcomeField::ExportFrames => set_once(
+                    &mut values.export_frames,
+                    map.next_value()?,
+                    "export_frames",
+                )?,
+                PersistenceOutcomeField::DurationSeconds => set_once(
+                    &mut values.duration_seconds,
+                    map.next_value()?,
+                    "duration_seconds",
+                )?,
+                PersistenceOutcomeField::LostFrames => {
+                    set_once(&mut values.lost_frames, map.next_value()?, "lost_frames")?;
+                }
+                PersistenceOutcomeField::RetentionLostFrames => set_once(
+                    &mut values.retention_lost_frames,
+                    map.next_value()?,
+                    "retention_lost_frames",
+                )?,
+                PersistenceOutcomeField::ClearedFrames => set_once(
+                    &mut values.cleared_frames,
+                    map.next_value()?,
+                    "cleared_frames",
+                )?,
+                PersistenceOutcomeField::CaptureDroppedFrames => set_once(
+                    &mut values.capture_dropped_frames,
+                    map.next_value()?,
+                    "capture_dropped_frames",
+                )?,
+                PersistenceOutcomeField::OutputDirectory => {
+                    if values.output_directory {
+                        return Err(de::Error::duplicate_field("output_directory"));
+                    }
+                    map.next_value_seed(BoundedStringSeed {
+                        buffer: self.buffer,
+                        label: "output directory",
+                    })?;
+                    values.output_directory = true;
+                }
+                PersistenceOutcomeField::Files => {
+                    render_written_header::<W, A::Error>(self.writer, self.buffer, &values)?;
+                    self.buffer.clear();
+                    map.next_value_seed(PersistenceFilesSeed {
+                        writer: self.writer,
+                        buffer: self.buffer,
+                    })?;
+                    rendered_files = true;
+                }
+                PersistenceOutcomeField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        match values
+            .kind
+            .ok_or_else(|| de::Error::missing_field("kind"))?
+        {
+            PersistenceClientOutcomeKind::Written if !rendered_files => {
+                Err(de::Error::missing_field("files"))
+            }
+            PersistenceClientOutcomeKind::Written => Ok(()),
+            kind if rendered_files => Err(de::Error::custom(format_args!(
+                "files are invalid for {}",
+                outcome_kind_name(kind)
+            ))),
+            kind => render_non_written::<W, A::Error>(self.writer, kind, &values),
+        }
+    }
+}
+
+fn set_once<T, E: de::Error>(
+    destination: &mut Option<T>,
+    value: T,
+    field: &'static str,
+) -> std::result::Result<(), E> {
+    if destination.replace(value).is_some() {
+        Err(E::duplicate_field(field))
+    } else {
+        Ok(())
+    }
+}
+
+fn required<T: Copy, E: de::Error>(
+    value: Option<T>,
+    field: &'static str,
+) -> std::result::Result<T, E> {
+    value.ok_or_else(|| E::missing_field(field))
+}
+
+fn outcome_kind_name(kind: PersistenceClientOutcomeKind) -> &'static str {
+    match kind {
+        PersistenceClientOutcomeKind::Written => "written",
+        PersistenceClientOutcomeKind::SkippedSilent => "skipped_silent",
+        PersistenceClientOutcomeKind::SkippedByPolicy => "skipped_by_policy",
+        PersistenceClientOutcomeKind::NoNewAudio => "no_new_audio",
+    }
+}
+
+fn render_written_header<W: Write, E: de::Error>(
+    writer: &mut W,
+    output_directory: &[u8],
+    values: &PersistenceOutcomeScalars,
+) -> std::result::Result<(), E> {
+    if !matches!(values.kind, Some(PersistenceClientOutcomeKind::Written)) {
+        return Err(E::custom("files require a written persistence outcome"));
+    }
+    if !values.output_directory {
+        return Err(E::custom("output_directory must precede files"));
+    }
+    let start_frame = required::<_, E>(values.start_frame, "start_frame")?;
+    let end_frame = required::<_, E>(values.end_frame, "end_frame")?;
+    let frames = required::<_, E>(values.frames, "frames")?;
+    let export_start_frame = required::<_, E>(values.export_start_frame, "export_start_frame")?;
+    let export_frames = required::<_, E>(values.export_frames, "export_frames")?;
+    written_export_range(
+        start_frame,
+        end_frame,
+        Some(export_start_frame),
+        Some(export_frames),
+    )
+    .map_err(E::custom)?;
+    let duration_seconds = required::<_, E>(values.duration_seconds, "duration_seconds")?;
+    let lost_frames = required::<_, E>(values.lost_frames, "lost_frames")?;
+    let retention = required::<_, E>(values.retention_lost_frames, "retention_lost_frames")?;
+    let cleared = required::<_, E>(values.cleared_frames, "cleared_frames")?;
+    let dropped = required::<_, E>(values.capture_dropped_frames, "capture_dropped_frames")?;
+    let output_directory = std::str::from_utf8(output_directory).map_err(E::custom)?;
+    write!(
+        writer,
+        "written {frames} frames ({duration_seconds:.3} seconds), source frames {start_frame}..{end_frame}"
+    )
+    .map_err(E::custom)?;
+    render_loss_warning::<_, E>(writer, lost_frames, retention, cleared, dropped)?;
+    write!(writer, "\noutput directory: {output_directory}").map_err(E::custom)
+}
+
+fn render_non_written<W: Write, E: de::Error>(
+    writer: &mut W,
+    kind: PersistenceClientOutcomeKind,
+    values: &PersistenceOutcomeScalars,
+) -> std::result::Result<(), E> {
+    let lost_frames = required::<_, E>(values.lost_frames, "lost_frames")?;
+    let retention = required::<_, E>(values.retention_lost_frames, "retention_lost_frames")?;
+    let cleared = required::<_, E>(values.cleared_frames, "cleared_frames")?;
+    let dropped = required::<_, E>(values.capture_dropped_frames, "capture_dropped_frames")?;
+    match kind {
+        PersistenceClientOutcomeKind::SkippedSilent
+        | PersistenceClientOutcomeKind::SkippedByPolicy => {
+            let start_frame = required::<_, E>(values.start_frame, "start_frame")?;
+            let end_frame = required::<_, E>(values.end_frame, "end_frame")?;
+            let frames = required::<_, E>(values.frames, "frames")?;
+            let duration_seconds = required::<_, E>(values.duration_seconds, "duration_seconds")?;
+            let label = if matches!(kind, PersistenceClientOutcomeKind::SkippedSilent) {
+                "skipped exact-zero audio"
+            } else {
+                "skipped by policy"
+            };
+            write!(
+                writer,
+                "{label}: {frames} frames ({duration_seconds:.3} seconds), source frames {start_frame}..{end_frame}"
+            )
+            .map_err(E::custom)?;
+        }
+        PersistenceClientOutcomeKind::NoNewAudio => {
+            writer.write_all(b"no new audio").map_err(E::custom)?;
+        }
+        PersistenceClientOutcomeKind::Written => unreachable!(),
+    }
+    render_loss_warning::<_, E>(writer, lost_frames, retention, cleared, dropped)
+}
+
+fn render_loss_warning<W: Write, E: de::Error>(
+    writer: &mut W,
+    lost: u64,
+    retention: u64,
+    cleared: u64,
+    dropped: u64,
+) -> std::result::Result<(), E> {
+    if lost == 0 {
+        return Ok(());
+    }
+    write!(
+        writer,
+        "\nwarning: {lost} frames were lost before persistence ("
+    )
+    .map_err(E::custom)?;
+    let mut separator = "";
+    for (label, count) in [
+        ("retention", retention),
+        ("cleared", cleared),
+        ("capture-dropped", dropped),
+    ] {
+        if count > 0 {
+            write!(writer, "{separator}{label} {count}").map_err(E::custom)?;
+            separator = ", ";
+        }
+    }
+    writer.write_all(b")").map_err(E::custom)
+}
+
+struct PersistenceFilesSeed<'a, W> {
+    writer: &'a mut W,
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'de, W: Write> DeserializeSeed<'de> for PersistenceFilesSeed<'_, W> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(PersistenceFilesVisitor {
+            writer: self.writer,
+            buffer: self.buffer,
+        })
+    }
+}
+
+struct PersistenceFilesVisitor<'a, W> {
+    writer: &'a mut W,
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'de, W: Write> Visitor<'de> for PersistenceFilesVisitor<'_, W> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a sequence of bounded persistence paths")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence
+            .next_element_seed(BoundedStringSeed {
+                buffer: self.buffer,
+                label: "persistence file path",
+            })?
+            .is_some()
+        {
+            self.writer.write_all(b"\n").map_err(de::Error::custom)?;
+            self.writer
+                .write_all(self.buffer)
+                .map_err(de::Error::custom)?;
+        }
+        Ok(())
+    }
+}
+
+struct ResponseLineReader<R> {
+    inner: R,
+    finished: bool,
+}
+
+impl<R: BufRead> Read for ResponseLineReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.finished || output.is_empty() {
+            return Ok(0);
+        }
+        let available = self.inner.fill_buf()?;
+        if available.is_empty() {
+            self.finished = true;
+            return Ok(0);
+        }
+        let line_bytes = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(available.len());
+        let reached_newline = line_bytes < available.len();
+        let copied = line_bytes.min(output.len());
+        output[..copied].copy_from_slice(&available[..copied]);
+        self.inner.consume(copied);
+        if copied == line_bytes && reached_newline {
+            self.inner.consume(1);
+            self.finished = true;
+        }
+        Ok(copied)
+    }
+}
+
+pub fn send_persistence_request_streaming<W: Write>(
+    socket: &Path,
+    request: &ControlRequest,
+    writer: &mut W,
+) -> Result<()> {
+    let mut stream = UnixStream::connect(socket).map_err(|source| io_error(socket, source))?;
+    let line = serde_json::to_string(request).map_err(|err| LambError::Control(err.to_string()))?;
+    writeln!(stream, "{line}").map_err(|source| io_error(socket, source))?;
+    let reader = BufReader::new(stream);
+    let mut line_reader = ResponseLineReader {
+        inner: reader,
+        finished: false,
+    };
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut line_reader);
+    let response = PersistenceClientResponseSeed::new(writer)
+        .deserialize(&mut deserializer)
+        .map_err(|err| LambError::Control(format!("invalid response: {err}")))?;
+    deserializer
+        .end()
+        .map_err(|err| LambError::Control(format!("invalid response: {err}")))?;
+    response.map_err(LambError::Control)
+}
+
 pub fn client_dump(socket: &Path) -> Result<()> {
     client_persistence(socket, ControlRequest::Dump)
 }
@@ -698,18 +1338,12 @@ pub fn client_recall(socket: &Path) -> Result<()> {
 }
 
 fn client_persistence(socket: &Path, request: ControlRequest) -> Result<()> {
-    let response = send_request(socket, &request)?;
-    if !response.ok {
-        return Err(LambError::Control(response.message));
-    }
-
-    match response.persistence_outcome {
-        Some(outcome) => println!("{}", format_persistence_outcome(&outcome)),
-        None => println!("{}", response.message),
-    }
-    Ok(())
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    send_persistence_request_streaming(socket, &request, &mut output)
 }
 
+#[cfg(test)]
 fn format_loss_causes(retention: u64, cleared: u64, dropped: u64) -> String {
     let mut causes = Vec::new();
     if retention > 0 {
@@ -724,6 +1358,7 @@ fn format_loss_causes(retention: u64, cleared: u64, dropped: u64) -> String {
     causes.join(", ")
 }
 
+#[cfg(test)]
 fn format_persistence_outcome(outcome: &PersistenceOutcomeResponse) -> String {
     match outcome {
         PersistenceOutcomeResponse::Written {
@@ -1377,5 +2012,108 @@ mod tests {
         let payload = r#"{"kind":"written","start_frame":250,"end_frame":100,"frames":0,"duration_seconds":0.0,"lost_frames":0,"output_directory":"/tmp/out","files":[]}"#;
         let error = serde_json::from_str::<PersistenceOutcomeResponse>(payload).unwrap_err();
         assert!(error.to_string().contains("consumed range"), "{error}");
+    }
+
+    #[test]
+    fn streaming_persistence_client_matches_owned_format_with_escaped_paths() {
+        use serde::de::DeserializeSeed;
+
+        let output_directory = PathBuf::from("/tmp/out/quoted\"directory");
+        let files = vec![
+            output_directory.join("first\nchannel.wav"),
+            output_directory.join("second\\channel.wav"),
+        ];
+        let outcome = PersistenceOutcomeResponse::Written {
+            start_frame: 100,
+            end_frame: 350,
+            frames: 250,
+            export_start_frame: 100,
+            export_frames: 250,
+            duration_seconds: 2.5,
+            lost_frames: 25,
+            retention_lost_frames: 10,
+            cleared_frames: 5,
+            capture_dropped_frames: 10,
+            output_directory,
+            files,
+        };
+        let response = ControlResponse {
+            ok: true,
+            message: "written fixture".to_string(),
+            status: None,
+            persistence_outcome: Some(outcome.clone()),
+            threshold_report: None,
+        };
+        let json = serde_json::to_vec(&response).unwrap();
+        let mut output = Vec::new();
+        let mut deserializer = serde_json::Deserializer::from_slice(&json);
+
+        let _: () = PersistenceClientResponseSeed::new(&mut output)
+            .deserialize(&mut deserializer)
+            .unwrap()
+            .unwrap();
+
+        let expected = format!("{}\n", format_persistence_outcome(&outcome));
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+
+    #[test]
+    fn streaming_persistence_client_accepts_long_success_and_error_messages() {
+        use serde::de::DeserializeSeed;
+
+        let message = format!(
+            "escaped quote \" newline\n backslash \\ {}",
+            "x".repeat(DEFAULT_MAXIMUM_PATH_BYTES as usize)
+        );
+        for ok in [true, false] {
+            let response = ControlResponse {
+                ok,
+                message: message.clone(),
+                status: None,
+                persistence_outcome: None,
+                threshold_report: None,
+            };
+            let json = serde_json::to_vec(&response).unwrap();
+            let mut output = Vec::new();
+            let mut deserializer = serde_json::Deserializer::from_slice(&json);
+
+            let result = PersistenceClientResponseSeed::new(&mut output)
+                .deserialize(&mut deserializer)
+                .unwrap();
+
+            if ok {
+                result.unwrap();
+                assert_eq!(output, format!("{message}\n").as_bytes());
+            } else {
+                assert_eq!(result.unwrap_err(), message);
+                assert!(output.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_persistence_client_rejects_malformed_and_oversized_paths() {
+        use serde::de::DeserializeSeed;
+
+        let malformed = br#"{"ok":true,"message":"x","status":null,"persistence_outcome":{"kind":"written","start_frame":0,"end_frame":1,"frames":1,"export_start_frame":0,"export_frames":1,"duration_seconds":0.01,"lost_frames":0,"retention_lost_frames":0,"cleared_frames":0,"capture_dropped_frames":0,"output_directory":"/tmp/out","files":["/tmp/bad\q"]}}"#;
+        let mut output = Vec::new();
+        let mut deserializer = serde_json::Deserializer::from_slice(malformed);
+        assert!(PersistenceClientResponseSeed::new(&mut output)
+            .deserialize(&mut deserializer)
+            .is_err());
+
+        let oversized = "x".repeat(
+            usize::try_from(crate::capture_runtime::DEFAULT_MAXIMUM_PATH_BYTES).unwrap() + 1,
+        );
+        let json = format!(
+            r#"{{"ok":true,"message":"x","status":null,"persistence_outcome":{{"kind":"written","start_frame":0,"end_frame":1,"frames":1,"export_start_frame":0,"export_frames":1,"duration_seconds":0.01,"lost_frames":0,"retention_lost_frames":0,"cleared_frames":0,"capture_dropped_frames":0,"output_directory":"/tmp/out","files":[{}]}}}}"#,
+            serde_json::to_string(&oversized).unwrap()
+        );
+        let mut output = Vec::new();
+        let mut deserializer = serde_json::Deserializer::from_str(&json);
+        let error = PersistenceClientResponseSeed::new(&mut output)
+            .deserialize(&mut deserializer)
+            .unwrap_err();
+        assert!(error.to_string().contains("maximum path bytes"), "{error}");
     }
 }

@@ -1,7 +1,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -11,11 +11,12 @@ use lamb::activity::ThresholdSource;
 use lamb::activity::{ActivityDetectorKind, ChannelExportMode, FrozenExportDecision};
 use lamb::calibration::{ConfiguredDeviceSelector, InputBackend, StaleReason};
 use lamb::capture_arena::{CaptureArena, CaptureRuntimeConfig};
+use lamb::capture_runtime::DEFAULT_MAXIMUM_PATH_BYTES;
 use lamb::control::{
     send_request, write_persistence_response, CalibrationEvaluation, CalibrationReportStatus,
     ConfiguredInputReport, ControlRequest, ControlResponse, DaemonStatus,
-    PersistenceOutcomeResponse, StoredThresholdReport, ThresholdChannelReport, ThresholdReport,
-    ThresholdRequest,
+    PersistenceClientResponseSeed, PersistenceOutcomeResponse, StoredThresholdReport,
+    ThresholdChannelReport, ThresholdReport, ThresholdRequest,
 };
 use lamb::dump::{CommittedPersistenceRef, DumpCoordinator, PolicyPersistenceRequest};
 use lamb::export_policy::{
@@ -25,6 +26,7 @@ use lamb::export_policy::{
 use lamb::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
 use lamb::persistence_workspace::{PersistenceWorkspace, PersistenceWorkspaceConfig};
 use lamb::sample_ring::{RingConfig, SampleFormat};
+use serde::de::DeserializeSeed;
 
 struct ThreadCountingAllocator;
 thread_local! {
@@ -280,6 +282,120 @@ fn control_response_without_persistence_outcome_remains_compatible() {
         serde_json::from_str(r#"{"ok":true,"message":"status","status":null}"#).unwrap();
 
     assert_eq!(response.persistence_outcome, None);
+}
+
+struct FixedWriter<const N: usize> {
+    bytes: [u8; N],
+    length: usize,
+}
+
+impl<const N: usize> FixedWriter<N> {
+    fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            length: 0,
+        }
+    }
+
+    fn written(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+}
+
+impl<const N: usize> Write for FixedWriter<N> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let end = self
+            .length
+            .checked_add(bytes.len())
+            .filter(|end| *end <= N)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WriteZero, "fixed writer is full"))?;
+        self.bytes[self.length..end].copy_from_slice(bytes);
+        self.length = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn maximum_escaped_path(index: usize) -> String {
+    let prefix = format!("/tmp/ordered-{index:02}/quoted\"line\nslash\\");
+    let maximum = usize::try_from(DEFAULT_MAXIMUM_PATH_BYTES).unwrap();
+    assert!(prefix.len() < maximum);
+    let padding = maximum - prefix.len();
+    prefix + &"x".repeat(padding)
+}
+
+fn streaming_response_fixture(file_count: usize) -> (Vec<u8>, Vec<u8>) {
+    let output_directory = maximum_escaped_path(99);
+    let files: Vec<_> = (0..file_count).map(maximum_escaped_path).collect();
+    let response = ControlResponse {
+        ok: true,
+        message: "written fixture".to_string(),
+        status: None,
+        persistence_outcome: Some(PersistenceOutcomeResponse::Written {
+            start_frame: 100,
+            end_frame: 350,
+            frames: 250,
+            export_start_frame: 100,
+            export_frames: 250,
+            duration_seconds: 2.5,
+            lost_frames: 25,
+            retention_lost_frames: 10,
+            cleared_frames: 5,
+            capture_dropped_frames: 10,
+            output_directory: PathBuf::from(&output_directory),
+            files: files.iter().map(PathBuf::from).collect(),
+        }),
+        threshold_report: None,
+    };
+    let mut expected = format!(
+        concat!(
+            "written 250 frames (2.500 seconds), source frames 100..350\n",
+            "warning: 25 frames were lost before persistence ",
+            "(retention 10, cleared 5, capture-dropped 10)\n",
+            "output directory: {}"
+        ),
+        output_directory
+    )
+    .into_bytes();
+    for file in files {
+        expected.push(b'\n');
+        expected.extend_from_slice(file.as_bytes());
+    }
+    expected.push(b'\n');
+    (serde_json::to_vec(&response).unwrap(), expected)
+}
+
+fn streaming_client_allocations(file_count: usize) -> ((usize, usize), Vec<u8>) {
+    const OUTPUT_CAPACITY: usize = 300_000;
+    let (json, expected) = streaming_response_fixture(file_count);
+    let mut writer = Box::new(FixedWriter::<OUTPUT_CAPACITY>::new());
+    let mut deserializer = serde_json::Deserializer::from_slice(&json);
+    let seed = PersistenceClientResponseSeed::new(&mut *writer);
+
+    let (result, count, bytes) = allocation_count_during(|| seed.deserialize(&mut deserializer));
+    result.unwrap().unwrap();
+    assert_eq!(writer.written(), expected);
+    ((count, bytes), expected)
+}
+
+#[test]
+fn streaming_persistence_client_allocations_do_not_scale_with_file_count() {
+    let (one_allocations, one_output) = streaming_client_allocations(1);
+    let (maximum_allocations, maximum_output) = streaming_client_allocations(64);
+
+    eprintln!(
+        "streaming persistence client: one={one_allocations:?}, maximum={maximum_allocations:?}"
+    );
+    assert_eq!(one_allocations, maximum_allocations);
+    assert!(maximum_output.len() > one_output.len());
+    assert_eq!(one_output.iter().filter(|byte| **byte == b'\n').count(), 6);
+    assert_eq!(
+        maximum_output.iter().filter(|byte| **byte == b'\n').count(),
+        132
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
