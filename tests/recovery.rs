@@ -21,6 +21,25 @@ fn current_manifest_schema_is_version_two() {
     assert_eq!(MANIFEST_VERSION, 2);
 }
 
+#[test]
+fn utf8_manifest_paths_preserve_historical_json_bytes() {
+    let mut slots = [];
+    let mut directories = [];
+    let mut path_bytes = [0_u8; 128];
+    let mut manifest =
+        TransactionManifest::new_with_directories(&mut slots, &mut directories, &mut path_bytes);
+    manifest.version = MANIFEST_VERSION;
+    manifest.uid = 42;
+    manifest.transaction_id = manifest.push_path("tx-é").unwrap();
+    manifest.staging_root_path = manifest.push_path("/staging/é \"quoted\"").unwrap();
+    manifest.output_root = manifest.push_path("/output/é").unwrap();
+
+    assert_eq!(
+        serde_json::to_string(&manifest).unwrap(),
+        r#"{"version":2,"uid":42,"transaction_id":"tx-é","kind":"file_set","phase":{"state":"prepared"},"staging_root":{"path":"/staging/é \"quoted\"","identity":null},"output_root":"/output/é","final_directory":null,"entries":[],"created_directories":[]}"#
+    );
+}
+
 fn identity(path: &Path) -> FileIdentity {
     let metadata = fs::symlink_metadata(path).unwrap();
     FileIdentity {

@@ -419,12 +419,8 @@ fn recall_timestamp_directory_uses_atomic_publication_on_real_capture() {
         &mut trace,
         |_, _, _, output, staging, _, result| {
             let final_dir = output.join(TIMESTAMP);
-            let published = match result {
-                PreparedPublication::Published(output) => output,
-                _ => panic!("real recall timestamp publication failed"),
-            };
-            assert_eq!(published.files, vec![final_dir.join("mic.wav")]);
-            assert!(published.files[0].is_file());
+            assert!(matches!(result, PreparedPublication::Published));
+            assert!(final_dir.join("mic.wav").is_file());
             let visible_directories: Vec<_> = fs::read_dir(output)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
@@ -458,12 +454,8 @@ fn dump_timestamp_directory_uses_atomic_publication_on_real_capture() {
         &mut trace,
         |_, _, _, output, staging, _, result| {
             let final_dir = output.join(TIMESTAMP);
-            let published = match result {
-                PreparedPublication::Published(output) => output,
-                _ => panic!("real dump timestamp publication failed"),
-            };
-            assert_eq!(published.files, vec![final_dir.join("mic.wav")]);
-            assert!(published.files[0].is_file());
+            assert!(matches!(result, PreparedPublication::Published));
+            assert!(final_dir.join("mic.wav").is_file());
             let visible_directories: Vec<_> = fs::read_dir(output)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
@@ -533,7 +525,7 @@ fn recall_parent_created_before_owned_manifest_recovers_and_retries_exact_epoch(
                 .unwrap();
             assert!(matches!(
                 publish_prepared(retried),
-                PreparedPublication::Published(_)
+                PreparedPublication::Published
             ));
             assert!(output.join(TIMESTAMP).join("corrected/mic.wav").is_file());
             let _ = plan;
@@ -578,7 +570,7 @@ fn recall_parent_owned_manifest_recorded_recovers_deepest_first_and_retries() {
                 .unwrap();
             assert!(matches!(
                 publish_prepared(retried),
-                PreparedPublication::Published(_)
+                PreparedPublication::Published
             ));
             assert!(output.join(TIMESTAMP).join("corrected/mic.wav").is_file());
         },
@@ -628,7 +620,7 @@ fn recall_parent_owned_manifest_recorded_foreign_sibling_finishes_rollback_and_r
                 .unwrap();
             assert!(matches!(
                 publish_prepared(retried),
-                PreparedPublication::Published(_)
+                PreparedPublication::Published
             ));
             assert!(output.join(TIMESTAMP).join("corrected/mic.wav").is_file());
         },
@@ -644,11 +636,7 @@ fn recall_custom_timestamp_directory_uses_fileset_publication_on_real_capture() 
         &mut trace,
         |workspace, _, _, output, staging, _, result| {
             let final_path = output.join(TIMESTAMP).join("mic.wav");
-            let published = match result {
-                PreparedPublication::Published(output) => output,
-                _ => panic!("real recall custom publication failed"),
-            };
-            assert_eq!(published.files, vec![final_path.clone()]);
+            assert!(matches!(result, PreparedPublication::Published));
             assert!(final_path.is_file());
             assert!(!output.join(format!(".{TIMESTAMP}.manifest.json")).exists());
             let recovered = workspace.recover_recall_staging(staging, output);
@@ -673,11 +661,7 @@ fn dump_custom_timestamp_directory_uses_fileset_publication_on_real_capture() {
         &mut trace,
         |workspace, _, _, output, staging, _, result| {
             let final_path = output.join(TIMESTAMP).join("mic.wav");
-            let published = match result {
-                PreparedPublication::Published(output) => output,
-                _ => panic!("real dump custom publication failed"),
-            };
-            assert_eq!(published.files, vec![final_path.clone()]);
+            assert!(matches!(result, PreparedPublication::Published));
             assert!(final_path.is_file());
             assert!(!output.join(format!(".{TIMESTAMP}.manifest.json")).exists());
             let recovered = workspace.recover_recall_staging(staging, output);
@@ -729,7 +713,7 @@ fn nested_ancestor_symlink_fails_before_mutation_and_corrected_retry_succeeds() 
                 .unwrap();
             assert!(matches!(
                 publish_prepared(retried),
-                PreparedPublication::Published(_)
+                PreparedPublication::Published
             ));
             assert!(output
                 .join("corrected")
@@ -774,7 +758,7 @@ fn nested_final_collision_preserves_existing_file_and_corrected_retry_succeeds()
                 .unwrap();
             assert!(matches!(
                 publish_prepared(retried),
-                PreparedPublication::Published(_)
+                PreparedPublication::Published
             ));
             assert!(output.join("corrected").join("mic.wav").is_file());
         },
@@ -793,7 +777,7 @@ fn fileset_ancestor_swap_after_preflight_never_mutates_attacker_or_reports_publi
             let original = ancestor.with_extension("original");
             let attacker = ancestor.with_extension("attacker");
             let attacker_output_created = attacker.join("output").exists();
-            let reported_published = matches!(result, PreparedPublication::Published(_));
+            let reported_published = matches!(result, PreparedPublication::Published);
 
             fs::remove_file(ancestor).unwrap();
             fs::rename(&original, ancestor).unwrap();
@@ -821,7 +805,7 @@ fn fileset_newly_created_output_root_replacement_is_rejected_before_mutation() {
         |_, _, _, output, _, _, result| {
             let original = output.with_extension("original-root");
             let replacement_is_empty = fs::read_dir(output).unwrap().next().is_none();
-            let reported_published = matches!(result, PreparedPublication::Published(_));
+            let reported_published = matches!(result, PreparedPublication::Published);
 
             fs::remove_dir_all(output).unwrap();
             fs::rename(&original, output).unwrap();
@@ -855,7 +839,7 @@ fn fileset_new_configured_root_syncs_containing_parent_before_manifest() {
         custom_directory_layout("{timestamp}/nested"),
         &mut trace,
         |_, _, _, _, _, _, result| {
-            assert!(matches!(result, PreparedPublication::Published(_)));
+            assert!(matches!(result, PreparedPublication::Published));
         },
     );
 
@@ -888,7 +872,7 @@ fn fileset_vanished_unjournaled_parent_is_not_recreated_by_deeper_intent() {
                 "deeper intent recreated an unjournaled intermediate parent"
             );
             assert!(
-                !matches!(result, PreparedPublication::Published(_)),
+                !matches!(result, PreparedPublication::Published),
                 "publication succeeded after an unjournaled parent vanished"
             );
         },
@@ -986,16 +970,15 @@ fn prepared_timestamp_directory_publishes_canonical_filenames() {
         )
         .unwrap();
 
-    let published = match publish_prepared(prepared) {
-        PreparedPublication::Published(published) => published,
+    match publish_prepared(prepared) {
+        PreparedPublication::Published => {}
         PreparedPublication::RetryableFailure(error) => panic!("publication failed: {error}"),
         PreparedPublication::Indeterminate { operation, .. } => {
             panic!("publication became indeterminate: {operation}")
         }
     };
 
-    assert_eq!(published.files, [output.join(TIMESTAMP).join("mic.wav")]);
-    assert!(published.files.iter().all(|path| path.exists()));
+    assert!(output.join(TIMESTAMP).join("mic.wav").exists());
     assert!(fs::read_dir(output.join(TIMESTAMP))
         .unwrap()
         .all(|entry| !entry
@@ -1165,16 +1148,14 @@ fn nested_sparse_file_set_publishes_exact_dense_wavs_and_syncs_each_parent() {
     );
 
     let mut trace = SyncTrace::default();
-    let published = match publish_prepared_with_hook(prepared, &mut trace) {
-        PreparedPublication::Published(output) => output,
+    match publish_prepared_with_hook(prepared, &mut trace) {
+        PreparedPublication::Published => {}
         PreparedPublication::RetryableFailure(error) => panic!("publication failed: {error}"),
         PreparedPublication::Indeterminate { operation, .. } => {
             panic!("publication became indeterminate: {operation}")
         }
     };
-    assert_eq!(published.output_directory, output);
-    assert_eq!(published.files, expected_paths);
-    assert!(published.files.iter().all(|path| path.is_file()));
+    assert!(expected_paths.iter().all(|path| path.is_file()));
     let expected_samples = [
         vec![0, 4_194_304],
         vec![2_097_152, -4_194_304],
@@ -1183,7 +1164,7 @@ fn nested_sparse_file_set_publishes_exact_dense_wavs_and_syncs_each_parent() {
         vec![0, 4_194_304],
         vec![2_097_152, -2_097_152],
     ];
-    for (path, samples) in published.files.iter().zip(expected_samples) {
+    for (path, samples) in expected_paths.iter().zip(expected_samples) {
         assert_eq!(wav_frames(path), 2);
         assert_eq!(wav_s24(path), samples);
     }
@@ -1233,7 +1214,7 @@ fn nested_sparse_file_set_publishes_exact_dense_wavs_and_syncs_each_parent() {
     let mut actual_files = Vec::new();
     collect_files(&output, &mut actual_files);
     actual_files.sort();
-    let mut expected_sorted = published.files.clone();
+    let mut expected_sorted = expected_paths.clone();
     expected_sorted.sort();
     assert_eq!(actual_files, expected_sorted);
     assert!(actual_files.iter().all(|path| {

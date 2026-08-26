@@ -562,7 +562,9 @@ impl DumpCoordinator {
                     None
                 }
                 prepared => match publisher(prepared) {
-                    PreparedPublication::Published(published) => Some(published),
+                    PreparedPublication::Published => {
+                        Some(workspace.collect_completed_output_for_legacy_test_adapter())
+                    }
                     PreparedPublication::RetryableFailure(error) => return Err(error),
                     PreparedPublication::Indeterminate { operation, cleanup } => {
                         state.indeterminate_publication = Some(cleanup);

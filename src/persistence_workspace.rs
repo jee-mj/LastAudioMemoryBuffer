@@ -32,7 +32,7 @@ use std::io::{self, Write};
 use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,6 +48,7 @@ const STAGED_PATH_OFFSET: usize = 0;
 const FINAL_PATH_OFFSET: usize = 1;
 
 static NEXT_WORKSPACE_TRANSACTION: AtomicU64 = AtomicU64::new(0);
+static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistenceWorkspaceConfig {
@@ -225,7 +226,6 @@ pub struct WorkspaceAllocationAddresses {
 }
 
 #[derive(Clone, Copy, Default)]
-#[allow(dead_code)] // Reserved for allocation-free publication in the next integration step.
 pub(crate) struct DirectorySyncSlot {
     pub entry_index: u32,
     pub prefix_len: u32,
@@ -233,7 +233,6 @@ pub(crate) struct DirectorySyncSlot {
 }
 
 #[derive(Clone, Copy, Default)]
-#[allow(dead_code)] // Reserved for allocation-free publication in the next integration step.
 pub(crate) struct CurrentArtifactSlot {
     pub path: PathRef,
     pub identity: Option<FileIdentity>,
@@ -250,11 +249,47 @@ pub(crate) struct PublicationScratch {
     current_artifact: ExactArray<CurrentArtifactSlot>,
     component_a: MaterializedBuffer<u8>,
     component_b: MaterializedBuffer<u8>,
-    sync_count: usize,
+}
+
+impl PublicationScratch {
+    pub(crate) fn reset(&mut self) {
+        for slot in self.sync_slots.iter_mut() {
+            *slot = DirectorySyncSlot::default();
+        }
+        self.current_artifact[0] = CurrentArtifactSlot::default();
+        self.component_a.as_mut_slice().fill(0);
+        self.component_b.as_mut_slice().fill(0);
+    }
+
+    pub(crate) fn component_a(&mut self) -> &mut [u8] {
+        self.component_a.as_mut_slice()
+    }
+
+    pub(crate) fn component_a_and_sync_slots(&mut self) -> (&mut [u8], &mut [DirectorySyncSlot]) {
+        (
+            self.component_a.as_mut_slice(),
+            self.sync_slots.as_mut_slice(),
+        )
+    }
+
+    pub(crate) fn component_pair(&mut self) -> (&mut [u8], &mut [u8]) {
+        (
+            self.component_a.as_mut_slice(),
+            self.component_b.as_mut_slice(),
+        )
+    }
+
+    pub(crate) fn current_artifact(&mut self) -> &mut CurrentArtifactSlot {
+        &mut self.current_artifact[0]
+    }
+
+    pub(crate) fn sync_slots(&mut self) -> &mut [DirectorySyncSlot] {
+        self.sync_slots.as_mut_slice()
+    }
 }
 
 #[derive(Clone, Copy)]
-struct OutputFileSlot {
+pub(crate) struct OutputFileSlot {
     start_frame: u64,
     frame_count: u64,
     channel: u32,
@@ -338,7 +373,7 @@ impl WriterSlot {
 
 const _: () = assert!(std::mem::size_of::<WriterSlot>() <= 256);
 
-struct ReusablePath {
+pub(crate) struct ReusablePath {
     bytes: MaterializedBuffer<u8>,
 }
 
@@ -371,7 +406,7 @@ impl ReusablePath {
         &self.bytes.as_slice()[..self.len()]
     }
 
-    fn as_path(&self) -> &Path {
+    pub(crate) fn as_path(&self) -> &Path {
         Path::new(std::ffi::OsStr::from_bytes(self.as_bytes()))
     }
 
@@ -380,12 +415,12 @@ impl ReusablePath {
             .map_err(|_| LambError::ExportInvariant("workspace rendered path is not UTF-8"))
     }
 
-    fn set_path(&mut self, path: &Path) -> Result<()> {
+    pub(crate) fn set_path(&mut self, path: &Path) -> Result<()> {
         self.clear();
         self.push_bytes(path.as_os_str().as_bytes())
     }
 
-    fn push_separator(&mut self) -> Result<()> {
+    pub(crate) fn push_separator(&mut self) -> Result<()> {
         let bytes = self.as_bytes();
         if !bytes.is_empty() && bytes.last() != Some(&b'/') {
             self.push_bytes(b"/")?;
@@ -393,7 +428,7 @@ impl ReusablePath {
         Ok(())
     }
 
-    fn push_bytes(&mut self, value: &[u8]) -> Result<()> {
+    pub(crate) fn push_bytes(&mut self, value: &[u8]) -> Result<()> {
         if value.contains(&0) {
             return Err(LambError::Export(
                 "path contains an embedded NUL byte".to_string(),
@@ -434,6 +469,8 @@ const _: () = assert!(
 );
 
 pub struct PersistenceWorkspace {
+    workspace_id: u64,
+    transaction_generation: u64,
     config: PersistenceWorkspaceConfig,
     interleaved_scratch: MaterializedBuffer<f32>,
     detector: DetectorWorkspace,
@@ -562,6 +599,8 @@ impl PersistenceWorkspace {
         // the second overflow boundary for this platform.
 
         Ok(Self {
+            workspace_id: NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed),
+            transaction_generation: 0,
             config,
             interleaved_scratch: MaterializedBuffer::new_zeroed(scratch_len)?,
             detector: DetectorWorkspace::new(plan)?,
@@ -590,7 +629,6 @@ impl PersistenceWorkspace {
                 })?,
                 component_a: MaterializedBuffer::new_zeroed(publication_component_len)?,
                 component_b: MaterializedBuffer::new_zeroed(publication_component_len)?,
-                sync_count: 0,
             },
             output_count: 0,
             staging_identity: None,
@@ -678,6 +716,7 @@ impl PersistenceWorkspace {
         io: &mut impl WavIo,
     ) -> Result<PreparedPersistence<'a>> {
         self.finish_completed_publication();
+        self.advance_transaction_generation()?;
         self.retry_pending_cleanup()?;
         self.reset_slots();
         validate_frozen(&self.config, frozen)?;
@@ -798,6 +837,16 @@ impl PersistenceWorkspace {
             PersistenceKind::Recall => PreparedPersistence::Recall { staging },
             PersistenceKind::Dump => PreparedPersistence::Dump { staging },
         })
+    }
+
+    fn advance_transaction_generation(&mut self) -> Result<()> {
+        self.transaction_generation =
+            self.transaction_generation
+                .checked_add(1)
+                .ok_or(LambError::ExportInvariant(
+                    "persistence transaction generation overflow",
+                ))?;
+        Ok(())
     }
 
     fn finish_policy_prepare<'a>(
@@ -1496,13 +1545,7 @@ impl PersistenceWorkspace {
         }
         self.manifest_paths.as_mut_slice().fill(0);
         self.manifest_serialization.as_mut_slice().fill(0);
-        for slot in self.publication.sync_slots.iter_mut() {
-            *slot = DirectorySyncSlot::default();
-        }
-        self.publication.current_artifact[0] = CurrentArtifactSlot::default();
-        self.publication.component_a.as_mut_slice().fill(0);
-        self.publication.component_b.as_mut_slice().fill(0);
-        self.publication.sync_count = 0;
+        self.publication.reset();
         self.output_count = 0;
         if let Some(first) = self.interleaved_scratch.as_mut_slice().first_mut() {
             *first = 0.0;
@@ -1523,91 +1566,138 @@ impl PersistenceWorkspace {
         &mut self,
         publication: &mut IndeterminatePublication,
     ) -> Result<PublicationRecovery> {
-        if let Some(durable) = publication.durable.as_ref() {
-            let outcome = match durable {
-                DurablePublication::Recall {
-                    transaction_root,
-                    output_root,
-                    ..
-                } => recover_recall_root_with_directories(
-                    transaction_root,
-                    output_root,
-                    self.manifest_serialization.as_mut_slice(),
-                    self.manifest_entries.as_mut_slice(),
-                    self.manifest_directories.as_mut_slice(),
-                    self.manifest_paths.as_mut_slice(),
-                )?,
-                DurablePublication::Dump {
-                    output_parent,
-                    manifest_path,
-                    ..
-                } => recover_dump_parent(
-                    output_parent,
-                    manifest_path,
-                    self.manifest_serialization.as_mut_slice(),
-                    self.manifest_entries.as_mut_slice(),
-                    self.manifest_paths.as_mut_slice(),
-                )?,
-            };
-            return match outcome {
-                RecoveryOutcome::Complete => {
-                    let durable = publication
-                        .durable
-                        .take()
-                        .expect("durable publication remains present after recovery");
-                    self.clear_recovered_transaction();
-                    Ok(PublicationRecovery::Complete(durable.output()))
-                }
-                RecoveryOutcome::RolledBack => {
-                    publication.durable = None;
-                    self.clear_recovered_transaction();
-                    Ok(PublicationRecovery::RolledBack)
-                }
-                RecoveryOutcome::Pending => Ok(PublicationRecovery::Pending),
-            };
+        if publication.workspace_id != self.workspace_id
+            || publication.transaction_generation != self.transaction_generation
+        {
+            return Err(LambError::ExportInvariant(
+                "indeterminate publication does not belong to this workspace transaction",
+            ));
         }
-
-        let mut first_error = None;
-        let mut index = 0;
-        while index < publication.artifacts.len() {
-            let artifact = &publication.artifacts[index];
-            let resolved = match self.cleanup_io.symlink_metadata(&artifact.path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-                Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(io_error(&artifact.path, error));
-                    }
-                    false
-                }
-                Ok(metadata)
-                    if (metadata.dev(), metadata.ino()) != (artifact.device, artifact.inode) =>
-                {
-                    true
-                }
-                Ok(_) => match self.cleanup_io.remove_file(&artifact.path) {
-                    Ok(()) => true,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-                    Err(error) => {
-                        if first_error.is_none() {
-                            first_error = Some(io_error(&artifact.path, error));
-                        }
-                        false
-                    }
-                },
-            };
-            if resolved {
-                publication.artifacts.swap_remove(index);
-            } else {
-                index += 1;
+        self.resolve_current_artifact()?;
+        let outcome = match publication.kind {
+            PersistenceKind::Recall => recover_recall_root_with_directories(
+                self.paths[TRANSACTION_ROOT_PATH].as_path(),
+                self.paths[FINAL_ROOT_PATH].as_path(),
+                self.manifest_serialization.as_mut_slice(),
+                self.manifest_entries.as_mut_slice(),
+                self.manifest_directories.as_mut_slice(),
+                self.manifest_paths.as_mut_slice(),
+            )?,
+            PersistenceKind::Dump => {
+                let output_parent = self.paths[FINAL_ROOT_PATH].as_path().parent().ok_or(
+                    LambError::ExportInvariant("prepared dump final directory has no parent"),
+                )?;
+                recover_dump_parent(
+                    output_parent,
+                    self.paths[MANIFEST_SCRATCH_PATH].as_path(),
+                    self.manifest_serialization.as_mut_slice(),
+                    self.manifest_entries.as_mut_slice(),
+                    self.manifest_paths.as_mut_slice(),
+                )?
             }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None if publication.artifacts.is_empty() => {
-                self.cleanup_transaction()?;
+        };
+        match outcome {
+            RecoveryOutcome::Complete => {
+                let output = self.collect_completed_output_for_legacy_test_adapter();
+                self.clear_recovered_transaction();
+                Ok(PublicationRecovery::Complete(output))
+            }
+            RecoveryOutcome::RolledBack => {
+                self.clear_recovered_transaction();
                 Ok(PublicationRecovery::RolledBack)
             }
-            None => Ok(PublicationRecovery::Pending),
+            RecoveryOutcome::Pending => Ok(PublicationRecovery::Pending),
+        }
+    }
+
+    fn resolve_current_artifact(&mut self) -> Result<()> {
+        let active = self.publication.current_artifact[0];
+        let Some(identity) = active.identity else {
+            return Ok(());
+        };
+
+        let offset = usize::try_from(active.path.offset)
+            .map_err(|_| LambError::ExportInvariant("active artifact path offset overflow"))?;
+        let len = usize::try_from(active.path.len)
+            .map_err(|_| LambError::ExportInvariant("active artifact path length overflow"))?;
+        if len == 0 {
+            return Err(LambError::ExportInvariant(
+                "active artifact path coordinate is empty",
+            ));
+        }
+        let end = offset.checked_add(len).ok_or(LambError::ExportInvariant(
+            "active artifact path range overflow",
+        ))?;
+        let path_bytes =
+            self.manifest_paths
+                .as_slice()
+                .get(offset..end)
+                .ok_or(LambError::ExportInvariant(
+                    "active artifact path is outside the manifest path arena",
+                ))?;
+        let path =
+            Path::new(std::str::from_utf8(path_bytes).map_err(|_| {
+                LambError::ExportInvariant("active artifact path is not valid UTF-8")
+            })?);
+
+        let entries = self
+            .manifest_entries
+            .as_slice()
+            .get(..self.output_count)
+            .ok_or(LambError::ExportInvariant(
+                "active artifact output count exceeds manifest entry capacity",
+            ))?;
+        let coordinate_matches = entries.iter().any(|entry| {
+            if active.final_name {
+                entry.final_path == active.path
+            } else {
+                entry.partial_path == active.path
+            }
+        });
+        if !coordinate_matches {
+            return Err(LambError::ExportInvariant(
+                "active artifact path does not match a current output entry",
+            ));
+        }
+
+        let metadata = match self.cleanup_io.symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                self.publication.current_artifact[0] = CurrentArtifactSlot::default();
+                return Ok(());
+            }
+            Err(source) => return Err(io_error(path, source)),
+        };
+        if metadata.dev() != identity.device || metadata.ino() != identity.inode {
+            self.publication.current_artifact[0] = CurrentArtifactSlot::default();
+            return Ok(());
+        }
+
+        match self.cleanup_io.remove_file(path) {
+            Ok(()) => {
+                self.publication.current_artifact[0] = CurrentArtifactSlot::default();
+                Ok(())
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                self.publication.current_artifact[0] = CurrentArtifactSlot::default();
+                Ok(())
+            }
+            Err(source) => Err(io_error(path, source)),
+        }
+    }
+
+    /// Temporary bridge for coordinators that still expose owned outcomes.
+    /// Task 3 removes this adapter after response serialization becomes borrowed.
+    pub(crate) fn collect_completed_output_for_legacy_test_adapter(&self) -> PublishedOutput {
+        PublishedOutput {
+            output_directory: self.paths[FINAL_ROOT_PATH].as_path().to_path_buf(),
+            files: (0..self.output_count)
+                .map(|index| {
+                    self.paths[self.outputs[index].final_path as usize]
+                        .as_path()
+                        .to_path_buf()
+                })
+                .collect(),
         }
     }
 
@@ -1760,28 +1850,76 @@ pub(crate) struct ManifestScratch<'a> {
     pub serialization: &'a mut [u8],
 }
 
+pub(crate) struct PublicationViews<'a> {
+    pub files: FilePlan<'a>,
+    pub manifest: ManifestScratch<'a>,
+    pub paths: PublicationPathScratch<'a>,
+    pub scratch: &'a mut PublicationScratch,
+}
+
+pub(crate) struct PublicationPathScratch<'a> {
+    pub partial: &'a mut ReusablePath,
+    pub manifest: &'a mut ReusablePath,
+}
+
 impl OwnedTransactionArtifacts<'_> {
     pub fn files(&self) -> FilePlan<'_> {
+        let (fixed_paths, scratch_and_outputs) = self
+            .workspace
+            .paths
+            .as_slice()
+            .split_at(PARTIAL_SCRATCH_PATH);
+        let (_, output_paths) =
+            scratch_and_outputs.split_at(OUTPUT_PATH_START - PARTIAL_SCRATCH_PATH);
         FilePlan {
-            workspace: self.workspace,
+            outputs: &self.workspace.outputs.as_slice()[..self.workspace.output_count],
+            fixed_paths,
+            output_paths,
+            len: self.workspace.output_count,
         }
     }
 
-    pub(crate) fn recover_publication(
-        &mut self,
-        publication: &mut IndeterminatePublication,
-    ) -> Result<PublicationRecovery> {
-        self.workspace
-            .recover_indeterminate_publication(publication)
+    pub(crate) fn publication_views(&mut self) -> PublicationViews<'_> {
+        let workspace = &mut *self.workspace;
+        let len = workspace.output_count;
+        let outputs = &workspace.outputs.as_slice()[..len];
+        let (fixed_paths, scratch_and_outputs) = workspace
+            .paths
+            .as_mut_slice()
+            .split_at_mut(PARTIAL_SCRATCH_PATH);
+        let (scratch_paths, output_paths) =
+            scratch_and_outputs.split_at_mut(OUTPUT_PATH_START - PARTIAL_SCRATCH_PATH);
+        let (partial_paths, manifest_paths) = scratch_paths.split_at_mut(1);
+        PublicationViews {
+            files: FilePlan {
+                outputs,
+                fixed_paths,
+                output_paths,
+                len,
+            },
+            manifest: ManifestScratch {
+                slots: workspace.manifest_entries.as_mut_slice(),
+                directories: workspace.manifest_directories.as_mut_slice(),
+                path_bytes: workspace.manifest_paths.as_mut_slice(),
+                serialization: workspace.manifest_serialization.as_mut_slice(),
+            },
+            paths: PublicationPathScratch {
+                partial: &mut partial_paths[0],
+                manifest: &mut manifest_paths[0],
+            },
+            scratch: &mut workspace.publication,
+        }
     }
 
-    pub(crate) fn manifest_scratch(&mut self) -> ManifestScratch<'_> {
-        ManifestScratch {
-            slots: self.workspace.manifest_entries.as_mut_slice(),
-            directories: self.workspace.manifest_directories.as_mut_slice(),
-            path_bytes: self.workspace.manifest_paths.as_mut_slice(),
-            serialization: self.workspace.manifest_serialization.as_mut_slice(),
-        }
+    pub(crate) fn indeterminate(&self, kind: TransactionKind) -> IndeterminatePublication {
+        IndeterminatePublication::new(
+            self.workspace.workspace_id,
+            self.workspace.transaction_generation,
+            match kind {
+                TransactionKind::FileSet | TransactionKind::Recall => PersistenceKind::Recall,
+                TransactionKind::AtomicDirectory | TransactionKind::Dump => PersistenceKind::Dump,
+            },
+        )
     }
 
     pub(crate) fn staging_identity(&self) -> (u64, u64) {
@@ -1792,8 +1930,47 @@ impl OwnedTransactionArtifacts<'_> {
         (identity.device, identity.inode)
     }
 
-    pub(crate) fn final_root(&self) -> &Path {
-        self.workspace.paths[FINAL_ROOT_PATH].as_path()
+    pub(crate) fn prepare_atomic_manifest_path(&mut self) -> Result<()> {
+        let (fixed_paths, scratch_paths) = self
+            .workspace
+            .paths
+            .as_mut_slice()
+            .split_at_mut(MANIFEST_SCRATCH_PATH);
+        let transaction_root = fixed_paths[TRANSACTION_ROOT_PATH].as_path();
+        let transaction_id = transaction_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(".tmp-lamb-"))
+            .filter(|id| !id.is_empty())
+            .ok_or(LambError::ExportInvariant(
+                "prepared dump transaction id is invalid",
+            ))?;
+        let output_parent =
+            fixed_paths[FINAL_ROOT_PATH]
+                .as_path()
+                .parent()
+                .ok_or(LambError::ExportInvariant(
+                    "prepared dump final directory has no parent",
+                ))?;
+        let manifest_path = &mut scratch_paths[0];
+        manifest_path.set_path(output_parent)?;
+        manifest_path.push_separator()?;
+        manifest_path.push_bytes(b".")?;
+        manifest_path.push_bytes(transaction_id.as_bytes())?;
+        manifest_path.push_bytes(b".manifest.json")
+    }
+
+    pub(crate) fn prepare_recall_manifest_path(&mut self) -> Result<()> {
+        let (fixed, scratch_and_outputs) = self
+            .workspace
+            .paths
+            .as_mut_slice()
+            .split_at_mut(PARTIAL_SCRATCH_PATH);
+        let (_, manifest_and_outputs) = scratch_and_outputs.split_at_mut(1);
+        let staging_root = fixed[TRANSACTION_ROOT_PATH].as_path();
+        manifest_and_outputs[0].set_path(staging_root)?;
+        manifest_and_outputs[0].push_separator()?;
+        manifest_and_outputs[0].push_bytes(crate::recovery::RECALL_MANIFEST_NAME.as_bytes())
     }
 
     pub(crate) fn defer_recovery(self) {
@@ -1811,39 +1988,11 @@ impl OwnedTransactionArtifacts<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct IndeterminatePublication {
-    artifacts: Vec<PublicationArtifact>,
-    durable: Option<DurablePublication>,
-}
-
-#[derive(Debug)]
-struct PublicationArtifact {
-    path: PathBuf,
-    device: u64,
-    inode: u64,
-}
-
-#[derive(Debug)]
-enum DurablePublication {
-    Recall {
-        transaction_root: PathBuf,
-        output_root: PathBuf,
-        output: PublishedOutput,
-    },
-    Dump {
-        output_parent: PathBuf,
-        manifest_path: PathBuf,
-        output: PublishedOutput,
-    },
-}
-
-impl DurablePublication {
-    fn output(self) -> PublishedOutput {
-        match self {
-            Self::Recall { output, .. } | Self::Dump { output, .. } => output,
-        }
-    }
+    workspace_id: u64,
+    transaction_generation: u64,
+    kind: PersistenceKind,
 }
 
 pub enum PublicationRecovery {
@@ -1853,55 +2002,16 @@ pub enum PublicationRecovery {
 }
 
 impl IndeterminatePublication {
-    pub(crate) fn new() -> Self {
+    fn new(workspace_id: u64, transaction_generation: u64, kind: PersistenceKind) -> Self {
         Self {
-            artifacts: Vec::new(),
-            durable: None,
+            workspace_id,
+            transaction_generation,
+            kind,
         }
-    }
-
-    pub(crate) fn recall(
-        transaction_root: PathBuf,
-        output_root: PathBuf,
-        output: PublishedOutput,
-    ) -> Self {
-        Self {
-            artifacts: Vec::new(),
-            durable: Some(DurablePublication::Recall {
-                transaction_root,
-                output_root,
-                output,
-            }),
-        }
-    }
-
-    pub(crate) fn dump(
-        output_parent: PathBuf,
-        manifest_path: PathBuf,
-        output: PublishedOutput,
-    ) -> Self {
-        Self {
-            artifacts: Vec::new(),
-            durable: Some(DurablePublication::Dump {
-                output_parent,
-                manifest_path,
-                output,
-            }),
-        }
-    }
-
-    pub(crate) fn track(&mut self, path: PathBuf, device: u64, inode: u64) {
-        self.artifacts.push(PublicationArtifact {
-            path,
-            device,
-            inode,
-        });
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.artifacts.is_empty() && self.durable.is_none()
     }
 }
+
+const _: () = assert!(std::mem::size_of::<IndeterminatePublication>() <= 32);
 
 impl Drop for OwnedTransactionArtifacts<'_> {
     fn drop(&mut self) {
@@ -1911,12 +2021,18 @@ impl Drop for OwnedTransactionArtifacts<'_> {
 
 #[derive(Clone, Copy)]
 pub struct FilePlan<'a> {
-    workspace: &'a PersistenceWorkspace,
+    outputs: &'a [OutputFileSlot],
+    fixed_paths: &'a [ReusablePath],
+    output_paths: &'a [ReusablePath],
+    len: usize,
 }
 
 impl FilePlan<'_> {
+    pub(crate) fn final_root(&self) -> &Path {
+        self.fixed_paths[FINAL_ROOT_PATH].as_path()
+    }
     pub fn len(&self) -> usize {
-        self.workspace.output_count
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1924,12 +2040,13 @@ impl FilePlan<'_> {
     }
 
     pub fn capacity(&self) -> usize {
-        self.workspace.outputs.len()
+        self.outputs.len()
     }
 
     pub fn get(&self, index: usize) -> Option<PreparedFile<'_>> {
         (index < self.len()).then_some(PreparedFile {
-            workspace: self.workspace,
+            outputs: self.outputs,
+            output_paths: self.output_paths,
             index,
         })
     }
@@ -1937,21 +2054,22 @@ impl FilePlan<'_> {
 
 #[derive(Clone, Copy)]
 pub struct PreparedFile<'a> {
-    workspace: &'a PersistenceWorkspace,
+    outputs: &'a [OutputFileSlot],
+    output_paths: &'a [ReusablePath],
     index: usize,
 }
 
 impl PreparedFile<'_> {
     fn slot(&self) -> &OutputFileSlot {
-        &self.workspace.outputs[self.index]
+        &self.outputs[self.index]
     }
 
     pub fn staged_path(&self) -> &Path {
-        self.workspace.paths[self.slot().staged_path as usize].as_path()
+        self.output_paths[self.slot().staged_path as usize - OUTPUT_PATH_START].as_path()
     }
 
     pub fn final_path(&self) -> &Path {
-        self.workspace.paths[self.slot().final_path as usize].as_path()
+        self.output_paths[self.slot().final_path as usize - OUTPUT_PATH_START].as_path()
     }
 
     pub fn channel(&self) -> u32 {
@@ -2278,6 +2396,8 @@ mod tests {
     use super::*;
     use crate::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
     use crate::recovery::{ManifestEntrySlot, TransactionManifest, MANIFEST_VERSION};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     fn test_workspace() -> (SessionMemoryPlan, PersistenceWorkspace) {
         let plan = SessionMemoryPlan::calculate(SessionMemoryInputs {
@@ -2313,6 +2433,53 @@ mod tests {
         };
         let workspace = PersistenceWorkspace::new(&plan, config).unwrap();
         (plan, workspace)
+    }
+
+    fn seed_active_artifact(
+        workspace: &mut PersistenceWorkspace,
+        path: &Path,
+        identity: FileIdentity,
+        final_name: bool,
+    ) -> PathRef {
+        let bytes = path.to_str().unwrap().as_bytes();
+        workspace.manifest_paths.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        let path_ref = PathRef {
+            offset: 0,
+            len: u32::try_from(bytes.len()).unwrap(),
+        };
+        workspace.output_count = 1;
+        if final_name {
+            workspace.manifest_entries[0].final_path = path_ref;
+        } else {
+            workspace.manifest_entries[0].partial_path = path_ref;
+        }
+        workspace.publication.current_artifact[0] = CurrentArtifactSlot {
+            path: path_ref,
+            identity: Some(identity),
+            final_name,
+        };
+        path_ref
+    }
+
+    struct ToggleRemoveFileIo {
+        fail: Arc<AtomicBool>,
+    }
+
+    impl CleanupIo for ToggleRemoveFileIo {
+        fn symlink_metadata(&mut self, path: &Path) -> io::Result<fs::Metadata> {
+            fs::symlink_metadata(path)
+        }
+
+        fn remove_dir_all(&mut self, path: &Path) -> io::Result<()> {
+            fs::remove_dir_all(path)
+        }
+
+        fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(io::Error::other("injected active artifact cleanup failure"));
+            }
+            fs::remove_file(path)
+        }
     }
 
     #[test]
@@ -2361,5 +2528,146 @@ mod tests {
             absolute_split_range((u64::MAX - 4)..u64::MAX, 1, 3).unwrap(),
             (u64::MAX - 1)..u64::MAX
         );
+    }
+
+    #[test]
+    fn transaction_generation_overflow_fails_without_wrapping() {
+        let (_plan, mut workspace) = test_workspace();
+        workspace.transaction_generation = u64::MAX;
+
+        assert!(matches!(
+            workspace.advance_transaction_generation(),
+            Err(LambError::ExportInvariant(
+                "persistence transaction generation overflow"
+            ))
+        ));
+        assert_eq!(workspace.transaction_generation, u64::MAX);
+    }
+
+    #[test]
+    fn missing_or_replaced_active_artifact_is_resolved_without_foreign_deletion() {
+        let root = tempfile::tempdir().unwrap();
+
+        let (_plan, mut missing_workspace) = test_workspace();
+        let missing = root.path().join("missing.partial");
+        seed_active_artifact(
+            &mut missing_workspace,
+            &missing,
+            FileIdentity {
+                device: 11,
+                inode: 22,
+            },
+            false,
+        );
+        missing_workspace.resolve_current_artifact().unwrap();
+        assert!(missing_workspace.publication.current_artifact[0]
+            .identity
+            .is_none());
+
+        let (_plan, mut replaced_workspace) = test_workspace();
+        let replaced = root.path().join("replaced.partial");
+        let replacement = root.path().join("foreign-replacement");
+        fs::write(&replaced, b"owned").unwrap();
+        let owned = fs::symlink_metadata(&replaced).unwrap();
+        fs::write(&replacement, b"foreign").unwrap();
+        fs::rename(&replacement, &replaced).unwrap();
+        seed_active_artifact(
+            &mut replaced_workspace,
+            &replaced,
+            FileIdentity {
+                device: owned.dev(),
+                inode: owned.ino(),
+            },
+            false,
+        );
+        replaced_workspace.resolve_current_artifact().unwrap();
+        assert_eq!(fs::read(&replaced).unwrap(), b"foreign");
+        assert!(replaced_workspace.publication.current_artifact[0]
+            .identity
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_active_coordinate_and_descriptor_identity_delete_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let active_path = root.path().join("active.partial");
+        fs::write(&active_path, b"owned").unwrap();
+        let metadata = fs::symlink_metadata(&active_path).unwrap();
+        let identity = FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+
+        let (_plan, mut coordinate_workspace) = test_workspace();
+        let active_ref =
+            seed_active_artifact(&mut coordinate_workspace, &active_path, identity, false);
+        coordinate_workspace.manifest_entries[0].partial_path = PathRef {
+            offset: active_ref.offset,
+            len: active_ref.len - 1,
+        };
+        assert!(matches!(
+            coordinate_workspace.resolve_current_artifact(),
+            Err(LambError::ExportInvariant(
+                "active artifact path does not match a current output entry"
+            ))
+        ));
+        assert_eq!(fs::read(&active_path).unwrap(), b"owned");
+        assert!(coordinate_workspace.publication.current_artifact[0]
+            .identity
+            .is_some());
+
+        let (_plan, mut descriptor_workspace) = test_workspace();
+        seed_active_artifact(&mut descriptor_workspace, &active_path, identity, false);
+        let mut wrong_workspace = IndeterminatePublication::new(
+            descriptor_workspace.workspace_id.wrapping_add(1),
+            descriptor_workspace.transaction_generation,
+            PersistenceKind::Recall,
+        );
+        assert!(descriptor_workspace
+            .recover_indeterminate_publication(&mut wrong_workspace)
+            .is_err());
+        let mut wrong_generation = IndeterminatePublication::new(
+            descriptor_workspace.workspace_id,
+            descriptor_workspace.transaction_generation.wrapping_add(1),
+            PersistenceKind::Recall,
+        );
+        assert!(descriptor_workspace
+            .recover_indeterminate_publication(&mut wrong_generation)
+            .is_err());
+        assert_eq!(fs::read(&active_path).unwrap(), b"owned");
+        assert!(descriptor_workspace.publication.current_artifact[0]
+            .identity
+            .is_some());
+    }
+
+    #[test]
+    fn active_artifact_cleanup_error_keeps_identity_for_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("retry.partial");
+        fs::write(&path, b"owned").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let fail = Arc::new(AtomicBool::new(true));
+        let (_plan, mut workspace) = test_workspace();
+        workspace.cleanup_io = Box::new(ToggleRemoveFileIo {
+            fail: Arc::clone(&fail),
+        });
+        seed_active_artifact(
+            &mut workspace,
+            &path,
+            FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            false,
+        );
+
+        assert!(workspace.resolve_current_artifact().is_err());
+        assert!(path.exists());
+        assert!(workspace.publication.current_artifact[0].identity.is_some());
+
+        fail.store(false, Ordering::Release);
+        workspace.resolve_current_artifact().unwrap();
+        assert!(!path.exists());
+        assert!(workspace.publication.current_artifact[0].identity.is_none());
     }
 }

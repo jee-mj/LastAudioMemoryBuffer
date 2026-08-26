@@ -8,10 +8,14 @@ use lamb::export_policy::{
     ChannelActivityPolicy, ExportCommand, ResolvedActivityPolicy, ResolvedExportPolicy,
     ResolvedLayout, ValidatedPattern,
 };
+use lamb::export_wav::{
+    publish_prepared, publish_prepared_with_hook, PreparedPublication, PreparedPublicationHook,
+    PublicationCheckpoint,
+};
 use lamb::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
 use lamb::persistence_workspace::{
     CleanupIo, PendingCleanup, PersistenceWorkspace, PersistenceWorkspaceConfig, PrepareRequest,
-    PreparedPersistence, WavIo,
+    PreparedPersistence, PublicationRecovery, WavIo,
 };
 use lamb::sample_ring::{RingConfig, SampleFormat};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -64,6 +68,19 @@ fn allocation_count_during<T>(operation: impl FnOnce() -> T) -> (T, usize, usize
     let count = ALLOCATION_COUNT.with(Cell::get);
     let bytes = ALLOCATION_BYTES.with(Cell::get);
     (result, count, bytes)
+}
+
+struct InterruptPublicationAt(PublicationCheckpoint);
+
+impl PreparedPublicationHook for InterruptPublicationAt {
+    fn checkpoint(&mut self, checkpoint: PublicationCheckpoint) -> lamb::error::Result<()> {
+        if checkpoint == self.0 {
+            return Err(LambError::Export(
+                "injected prepared publication interruption".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2369,6 +2386,331 @@ fn startup_addresses_and_operation_allocations_are_stable_across_sparse_maximum_
     assert!(maximum_count <= 2, "unexpected fixed allocation count");
     assert!(maximum_bytes <= 64, "unexpected fixed allocated bytes");
     arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn prepared_publication_allocations_do_not_scale_with_output_count() {
+    let geometry = Geometry {
+        retention_frames: 32,
+        channels: 4,
+        chunk_frames: 32,
+        split_when_over_bytes: 50,
+        io_buffer_bytes_per_channel: 24,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    let small_output = root.path().join("small-output");
+    let maximum_output = root.path().join("large-output");
+    let small_policy = exact_zero_policy(&small_output, &[ChannelExportMode::Auto; 4]);
+    let maximum_policy = exact_zero_policy(&maximum_output, &[ChannelExportMode::Auto; 4]);
+
+    let mut small_decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut small_samples = vec![0.0; 2 * 4];
+    small_samples[0] = 0.25;
+    let mut small_frozen = freeze(&mut arena, &ingress, &small_samples, 4);
+    let small_prepared = workspace
+        .prepare(
+            &small_frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &small_policy,
+                profile: "allocation",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut small_decision,
+            },
+        )
+        .unwrap();
+    assert_eq!(small_prepared.files().unwrap().len(), 1);
+    let (small_result, small_count, small_bytes) =
+        allocation_count_during(|| publish_prepared(small_prepared));
+    assert!(matches!(small_result, PreparedPublication::Published));
+    arena.release_frozen(&mut small_frozen, DEADLINE).unwrap();
+
+    let mut maximum_decision = FrozenExportDecision::new(&plan).unwrap();
+    let maximum_samples = vec![0.25; 32 * 4];
+    let maximum_frozen = freeze(&mut arena, &ingress, &maximum_samples, 4);
+    let maximum_prepared = workspace
+        .prepare(
+            &maximum_frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &maximum_policy,
+                profile: "allocation",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut maximum_decision,
+            },
+        )
+        .unwrap();
+    assert_eq!(maximum_prepared.files().unwrap().len(), 64);
+    let (maximum_result, maximum_count, maximum_bytes) =
+        allocation_count_during(|| publish_prepared(maximum_prepared));
+    assert!(matches!(maximum_result, PreparedPublication::Published));
+    assert_eq!(
+        (maximum_count, maximum_bytes),
+        (small_count, small_bytes),
+        "prepared publication allocations scaled from one output to the startup maximum"
+    );
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn prepared_atomic_publication_allocations_do_not_scale_with_output_count() {
+    let geometry = Geometry {
+        retention_frames: 32,
+        channels: 4,
+        chunk_frames: 32,
+        split_when_over_bytes: 50,
+        io_buffer_bytes_per_channel: 24,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    // Equal-length roots keep path byte volume constant across the comparison.
+    let small_output = root.path().join("small-output");
+    let maximum_output = root.path().join("large-output");
+    let small_policy = activity_policy(
+        &small_output,
+        &[ChannelExportMode::Auto; 4],
+        ResolvedLayout::TimestampDirectory,
+        false,
+    );
+    let maximum_policy = activity_policy(
+        &maximum_output,
+        &[ChannelExportMode::Auto; 4],
+        ResolvedLayout::TimestampDirectory,
+        false,
+    );
+
+    let mut small_decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut small_samples = vec![0.0; 2 * 4];
+    small_samples[0] = 0.25;
+    let mut small_frozen = freeze(&mut arena, &ingress, &small_samples, 4);
+    let small_prepared = workspace
+        .prepare(
+            &small_frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &small_policy,
+                profile: "allocation",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut small_decision,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        small_prepared,
+        PreparedPersistence::AtomicDirectory { .. }
+    ));
+    assert_eq!(small_prepared.files().unwrap().len(), 1);
+    let (small_result, small_count, small_bytes) =
+        allocation_count_during(|| publish_prepared(small_prepared));
+    assert!(matches!(small_result, PreparedPublication::Published));
+    arena.release_frozen(&mut small_frozen, DEADLINE).unwrap();
+
+    let mut maximum_decision = FrozenExportDecision::new(&plan).unwrap();
+    let maximum_samples = vec![0.25; 32 * 4];
+    let maximum_frozen = freeze(&mut arena, &ingress, &maximum_samples, 4);
+    let maximum_prepared = workspace
+        .prepare(
+            &maximum_frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &maximum_policy,
+                profile: "allocation",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut maximum_decision,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        maximum_prepared,
+        PreparedPersistence::AtomicDirectory { .. }
+    ));
+    assert_eq!(maximum_prepared.files().unwrap().len(), 64);
+    let (maximum_result, maximum_count, maximum_bytes) =
+        allocation_count_during(|| publish_prepared(maximum_prepared));
+    assert!(matches!(maximum_result, PreparedPublication::Published));
+    assert_eq!(
+        (maximum_count, maximum_bytes),
+        (small_count, small_bytes),
+        "prepared atomic publication allocations scaled from one output to the startup maximum"
+    );
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedCheckpointRecovery {
+    RolledBack,
+    Complete,
+}
+
+fn assert_checkpoint_publication_allocations_do_not_scale(
+    checkpoint: PublicationCheckpoint,
+    layout: ResolvedLayout,
+    expected: ExpectedCheckpointRecovery,
+) {
+    let geometry = Geometry {
+        retention_frames: 32,
+        channels: 4,
+        chunk_frames: 32,
+        split_when_over_bytes: 50,
+        io_buffer_bytes_per_channel: 24,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let mut workspace = PersistenceWorkspace::new(&plan, workspace_config(geometry)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    // Equal-length roots make the path byte volume identical in both measured calls.
+    let small_output = root.path().join("small-output");
+    let maximum_output = root.path().join("large-output");
+    let small_policy = activity_policy(
+        &small_output,
+        &[ChannelExportMode::Auto; 4],
+        layout.clone(),
+        false,
+    );
+    let maximum_policy = activity_policy(
+        &maximum_output,
+        &[ChannelExportMode::Auto; 4],
+        layout,
+        false,
+    );
+
+    let mut small_decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut small_samples = vec![0.0; 2 * 4];
+    small_samples[0] = 0.25;
+    let mut small_frozen = freeze(&mut arena, &ingress, &small_samples, 4);
+    let small_prepared = workspace
+        .prepare(
+            &small_frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &small_policy,
+                profile: "allocation-checkpoint",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut small_decision,
+            },
+        )
+        .unwrap();
+    assert_eq!(small_prepared.files().unwrap().len(), 1);
+    let mut small_hook = InterruptPublicationAt(checkpoint);
+    let (small_result, small_count, small_bytes) =
+        allocation_count_during(|| publish_prepared_with_hook(small_prepared, &mut small_hook));
+    let PreparedPublication::Indeterminate {
+        cleanup: mut small_cleanup,
+        ..
+    } = small_result
+    else {
+        panic!("checkpoint must classify prepared publication as indeterminate")
+    };
+    let small_recovery = workspace
+        .recover_indeterminate_publication(&mut small_cleanup)
+        .unwrap();
+    match expected {
+        ExpectedCheckpointRecovery::RolledBack => {
+            assert!(matches!(small_recovery, PublicationRecovery::RolledBack));
+            assert_eq!(fs::read_dir(&small_output).unwrap().count(), 0);
+        }
+        ExpectedCheckpointRecovery::Complete => {
+            assert!(matches!(small_recovery, PublicationRecovery::Complete(_)));
+            assert_eq!(fs::read_dir(&small_output).unwrap().count(), 1);
+        }
+    }
+    arena.release_frozen(&mut small_frozen, DEADLINE).unwrap();
+
+    let mut maximum_decision = FrozenExportDecision::new(&plan).unwrap();
+    let maximum_samples = vec![0.25; 32 * 4];
+    let mut maximum_frozen = freeze(&mut arena, &ingress, &maximum_samples, 4);
+    let maximum_prepared = workspace
+        .prepare(
+            &maximum_frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &maximum_policy,
+                profile: "allocation-checkpoint",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut maximum_decision,
+            },
+        )
+        .unwrap();
+    assert_eq!(maximum_prepared.files().unwrap().len(), 64);
+    let mut maximum_hook = InterruptPublicationAt(checkpoint);
+    let (maximum_result, maximum_count, maximum_bytes) =
+        allocation_count_during(|| publish_prepared_with_hook(maximum_prepared, &mut maximum_hook));
+    let PreparedPublication::Indeterminate {
+        cleanup: mut maximum_cleanup,
+        ..
+    } = maximum_result
+    else {
+        panic!("checkpoint must classify prepared publication as indeterminate")
+    };
+    assert_eq!(
+        (maximum_count, maximum_bytes),
+        (small_count, small_bytes),
+        "checkpoint publication allocations scaled from one output to the startup maximum"
+    );
+    let maximum_recovery = workspace
+        .recover_indeterminate_publication(&mut maximum_cleanup)
+        .unwrap();
+    match expected {
+        ExpectedCheckpointRecovery::RolledBack => {
+            assert!(matches!(maximum_recovery, PublicationRecovery::RolledBack));
+            assert_eq!(fs::read_dir(&maximum_output).unwrap().count(), 0);
+        }
+        ExpectedCheckpointRecovery::Complete => {
+            assert!(matches!(maximum_recovery, PublicationRecovery::Complete(_)));
+            assert_eq!(fs::read_dir(&maximum_output).unwrap().count(), 1);
+        }
+    }
+    arena.release_frozen(&mut maximum_frozen, DEADLINE).unwrap();
+    arena.shutdown(DEADLINE).unwrap();
+}
+
+#[test]
+fn recall_partial_created_checkpoint_allocations_do_not_scale_and_recovery_rolls_back() {
+    assert_checkpoint_publication_allocations_do_not_scale(
+        PublicationCheckpoint::RecallPartialCreatedBeforeManifest { index: 0 },
+        ResolvedLayout::FlatDetailed,
+        ExpectedCheckpointRecovery::RolledBack,
+    );
+}
+
+#[test]
+fn recall_renamed_checkpoint_allocations_do_not_scale_and_recovery_rolls_back() {
+    assert_checkpoint_publication_allocations_do_not_scale(
+        PublicationCheckpoint::RecallRenamedBeforeManifest { index: 0 },
+        ResolvedLayout::FlatDetailed,
+        ExpectedCheckpointRecovery::RolledBack,
+    );
+}
+
+#[test]
+fn dump_after_rename_checkpoint_allocations_do_not_scale_and_recovery_completes() {
+    assert_checkpoint_publication_allocations_do_not_scale(
+        PublicationCheckpoint::DumpAfterRename,
+        ResolvedLayout::TimestampDirectory,
+        ExpectedCheckpointRecovery::Complete,
+    );
+}
+
+#[test]
+fn prepared_indeterminate_descriptor_has_fixed_metadata_only() {
+    assert!(std::mem::size_of::<lamb::persistence_workspace::IndeterminatePublication>() <= 32);
 }
 
 struct BlockingIo {

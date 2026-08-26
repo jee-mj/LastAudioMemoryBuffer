@@ -2,9 +2,11 @@ use crate::error::{io_error, LambError, Result};
 use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::ffi::CStr;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 
 // Transactional publication and recovery rely on Linux `renameat2(RENAME_NOREPLACE
@@ -341,8 +343,8 @@ impl std::fmt::Debug for TransactionManifest<'_> {
 
 // Serialization mirrors the historical on-disk JSON exactly so that already
 // written manifests remain readable, while producing zero per-entry heap
-// allocation (paths are emitted via `collect_str` and entries are streamed
-// from the fixed slots).
+// allocation (UTF-8 paths are emitted as borrowed strings and entries are
+// streamed from the fixed slots).
 
 struct ManifestPathSer<'a> {
     path: &'a Path,
@@ -369,7 +371,10 @@ impl Serialize for PathDisplay<'_> {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        serializer.collect_str(&self.0.display())
+        match self.0.to_str() {
+            Some(path_str) => serializer.serialize_str(path_str),
+            None => serializer.collect_str(&self.0.display()),
+        }
     }
 }
 
@@ -1129,6 +1134,99 @@ impl<'a> ManifestStore<'a> {
         write_result
     }
 
+    /// Allocation-free descriptor-relative writer for prepared publication.
+    /// Names are caller-owned NUL-terminated component buffers; `display` is
+    /// solely for stable errors and hook reporting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_prepared_at(
+        &mut self,
+        parent: &File,
+        manifest_name: &CStr,
+        temp_name: &CStr,
+        display: &Path,
+        manifest: &TransactionManifest,
+        current_manifest_identity: &mut Option<FileIdentity>,
+        directory_sync: impl FnOnce(&File, &Path) -> Result<()>,
+    ) -> Result<()> {
+        validate_manifest_basics(manifest)?;
+        let display_parent = display.parent().ok_or_else(|| {
+            LambError::Validation("manifest path has no parent directory".to_string())
+        })?;
+        let serialized_len = serialize_bounded(self.buffer, manifest)?;
+        match *current_manifest_identity {
+            None => match open_regular_at(parent, manifest_name, display) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(LambError::Validation(
+                        "refusing to replace an unowned manifest".to_string(),
+                    ))
+                }
+                Err(error) => return Err(io_error(display, error)),
+            },
+            Some(expected) if identity_at(parent, manifest_name, display)? != expected => {
+                return Err(LambError::Validation(
+                    "manifest identity changed during prepared publication".to_string(),
+                ));
+            }
+            Some(_) => {}
+        }
+        let mut temp = create_new_at(parent, temp_name, display)?;
+        let temp_identity =
+            identity_from_metadata(&temp.metadata().map_err(|e| io_error(display, e))?);
+        let result = (|| {
+            temp.write_all(&self.buffer[..serialized_len])
+                .map_err(|e| io_error(display, e))?;
+            temp.flush().map_err(|e| io_error(display, e))?;
+            temp.sync_all().map_err(|e| io_error(display, e))?;
+            drop(temp);
+            match *current_manifest_identity {
+                None => {
+                    rename_at(
+                        parent,
+                        temp_name,
+                        manifest_name,
+                        libc::RENAME_NOREPLACE,
+                        display,
+                    )?;
+                    *current_manifest_identity = Some(temp_identity);
+                }
+                Some(expected) => {
+                    rename_at(
+                        parent,
+                        temp_name,
+                        manifest_name,
+                        libc::RENAME_EXCHANGE,
+                        display,
+                    )?;
+                    let replaced = identity_at(parent, temp_name, display)?;
+                    if replaced != expected {
+                        return match rename_at(
+                            parent,
+                            temp_name,
+                            manifest_name,
+                            libc::RENAME_EXCHANGE,
+                            display,
+                        ) {
+                            Ok(()) => Err(LambError::Validation(
+                                "manifest identity changed during atomic replacement".to_string(),
+                            )),
+                            Err(error) => Err(LambError::IndeterminatePublication {
+                                operation: Box::new(error),
+                            }),
+                        };
+                    }
+                    unlink_if_identity_at(parent, temp_name, expected, display)?;
+                    *current_manifest_identity = Some(temp_identity);
+                }
+            }
+            directory_sync(parent, display_parent)
+        })();
+        if result.is_err() {
+            let _ = unlink_if_identity_at(parent, temp_name, temp_identity, display);
+        }
+        result
+    }
+
     fn read_identity_fields(&mut self, manifest_path: &Path) -> Result<ExistingManifestCheck<'_>> {
         let used = self.read_file_bounded(manifest_path)?;
         serde_json::from_slice(&self.buffer[..used]).map_err(|error| {
@@ -1234,6 +1332,91 @@ impl<'a> ManifestStore<'a> {
                 "transaction manifest changed before publication outcome".to_string(),
             ));
         }
+        Ok(())
+    }
+}
+
+fn open_regular_at(parent: &File, name: &CStr, _display: &Path) -> io::Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "manifest is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn create_new_at(parent: &File, name: &CStr, _display: &Path) -> Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        Err(io_error(_display, io::Error::last_os_error()))
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn identity_at(parent: &File, name: &CStr, display: &Path) -> Result<FileIdentity> {
+    let file = open_regular_at(parent, name, display).map_err(|e| io_error(display, e))?;
+    file.metadata()
+        .map(|m| identity_from_metadata(&m))
+        .map_err(|e| io_error(display, e))
+}
+
+fn unlink_if_identity_at(
+    parent: &File,
+    name: &CStr,
+    expected: FileIdentity,
+    display: &Path,
+) -> Result<()> {
+    if identity_at(parent, name, display)? != expected {
+        return Err(LambError::Validation(
+            "refusing to remove identity-changed manifest temporary".to_string(),
+        ));
+    }
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(io_error(display, io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn rename_at(
+    parent: &File,
+    source: &CStr,
+    destination: &CStr,
+    flags: u32,
+    display: &Path,
+) -> Result<()> {
+    if unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            flags,
+        )
+    } != 0
+    {
+        Err(io_error(display, io::Error::last_os_error()))
+    } else {
         Ok(())
     }
 }

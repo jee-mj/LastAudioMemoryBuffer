@@ -231,6 +231,19 @@ impl PreparedPublicationHook for RecordingPublicationHook {
             .push(PublicationEvent::DirectorySync(path.to_path_buf()));
         Ok(())
     }
+
+    fn sync_preopened_directory(
+        &mut self,
+        directory: &std::fs::File,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        directory
+            .sync_all()
+            .map_err(|error| LambError::Export(error.to_string()))?;
+        self.events
+            .push(PublicationEvent::DirectorySync(path.to_path_buf()));
+        Ok(())
+    }
 }
 
 struct FailDirectorySyncAt {
@@ -313,29 +326,6 @@ impl PreparedPublicationHook for ReplaceDumpManifestAtComplete {
             .map_err(|error| LambError::Export(error.to_string()))?;
         self.replacement_path = Some(manifest);
         Ok(())
-    }
-}
-
-struct PublicationCleanupIo {
-    fail_remove_file: Arc<AtomicBool>,
-}
-
-impl CleanupIo for PublicationCleanupIo {
-    fn symlink_metadata(&mut self, path: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
-        std::fs::symlink_metadata(path)
-    }
-
-    fn remove_dir_all(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        std::fs::remove_dir_all(path)
-    }
-
-    fn remove_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        if self.fail_remove_file.load(Ordering::Acquire) {
-            return Err(std::io::Error::other(
-                "injected publication rollback failure",
-            ));
-        }
-        std::fs::remove_file(path)
     }
 }
 
@@ -1026,7 +1016,7 @@ fn different_arena_is_rejected_before_preparation_or_publication() {
             DEADLINE,
             |_| {
                 publisher_called.store(true, Ordering::Release);
-                PreparedPublication::Published(fake_publication("wrong-arena"))
+                PreparedPublication::Published
             },
         )
         .unwrap_err();
@@ -1121,7 +1111,7 @@ fn retry_preserves_the_classified_frozen_decision_when_policy_changes() {
                 assert_eq!(changed_policy.channels[0].mode, ChannelExportMode::Never);
                 Ok(DecisionPreparation::Continue)
             },
-            |_| PreparedPublication::Published(fake_publication("retry")),
+            |_| PreparedPublication::Published,
         )
         .unwrap();
 
@@ -1161,7 +1151,7 @@ fn successful_completion_recycles_the_same_reset_decision_for_the_next_range() {
                 first_storage = Some((decision.storage_id(), decision.channels().len()));
                 Ok(DecisionPreparation::Continue)
             },
-            |_| PreparedPublication::Published(fake_publication("first")),
+            |_| PreparedPublication::Published,
         )
         .unwrap();
 
@@ -1195,7 +1185,7 @@ fn successful_completion_recycles_the_same_reset_decision_for_the_next_range() {
                 )?;
                 Ok(DecisionPreparation::Continue)
             },
-            |_| PreparedPublication::Published(fake_publication("second")),
+            |_| PreparedPublication::Published,
         )
         .unwrap();
 
@@ -1237,7 +1227,7 @@ fn only_all_never_decisions_skip_by_policy_without_preparing_or_publishing() {
             },
             |_| {
                 publisher_called.store(true, Ordering::Release);
-                PreparedPublication::Published(fake_publication("must-not-publish"))
+                PreparedPublication::Published
             },
         )
         .unwrap();
@@ -1286,7 +1276,7 @@ fn inactive_auto_decision_is_a_silent_skip_not_a_policy_skip() {
             },
             |_| {
                 publisher_called.store(true, Ordering::Release);
-                PreparedPublication::Published(fake_publication("must-not-publish"))
+                PreparedPublication::Published
             },
         )
         .unwrap();
@@ -1398,7 +1388,7 @@ fn never_plus_inactive_auto_decision_is_a_silent_skip_not_a_policy_skip() {
             },
             |_| {
                 publisher_called.store(true, Ordering::Release);
-                PreparedPublication::Published(fake_publication("must-not-publish"))
+                PreparedPublication::Published
             },
         )
         .unwrap();
@@ -1706,8 +1696,11 @@ fn later_recall_rename_collision_rolls_back_and_allows_exact_retry() {
         |prepared| publish_prepared_with_hook(prepared, &mut hook),
     );
 
-    assert!(first.is_err());
-    assert!(!first_final.exists());
+    assert!(matches!(
+        first,
+        Err(LambError::IndeterminatePublication { .. })
+    ));
+    assert!(first_final.exists());
     assert_eq!(std::fs::read(&second_final).unwrap(), b"foreign collision");
     std::fs::remove_file(&second_final).unwrap();
     let retry = fixture.recall(TIMESTAMP_A).unwrap();
@@ -1717,13 +1710,8 @@ fn later_recall_rename_collision_rolls_back_and_allows_exact_retry() {
 }
 
 #[test]
-fn uncertain_recall_rollback_blocks_reencoding_until_cleanup_recovers() {
-    let fail_remove_file = Arc::new(AtomicBool::new(true));
-    let cleanup_io = PublicationCleanupIo {
-        fail_remove_file: Arc::clone(&fail_remove_file),
-    };
-    let mut fixture =
-        FrozenFixture::new_with_split_and_cleanup(8, 8, 4, 50, Some(Box::new(cleanup_io)));
+fn foreign_recall_collision_blocks_reencoding_until_removed() {
+    let mut fixture = FrozenFixture::new_with_split_and_cleanup(8, 8, 4, 50, None);
     fixture.push(&[0.25, 0.5, 0.75, 1.0]);
     let output = fixture.root.path().join("recall");
     let staging = fixture.root.path().join("recall-staging");
@@ -1786,9 +1774,8 @@ fn uncertain_recall_rollback_blocks_reencoding_until_cleanup_recovers() {
         Err(LambError::IndeterminatePublication { .. })
     ));
     assert!(!publisher_called.load(Ordering::Acquire));
-    assert!(first_final.exists());
+    assert!(!first_final.exists());
 
-    fail_remove_file.store(false, Ordering::Release);
     std::fs::remove_file(&second_final).unwrap();
     let retry = fixture.recall(TIMESTAMP_A).unwrap();
     assert_eq!(retry.range(), Some(FrameRange { start: 0, end: 4 }));
@@ -2247,7 +2234,7 @@ fn visible_dump_manifest_with_failed_parent_sync_is_recovered_before_retry() {
         )
         .unwrap();
 
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(outcome.range(), Some(FrameRange { start: 0, end: 2 }));
 }
 
@@ -2329,6 +2316,10 @@ fn every_recall_checkpoint_recovers_without_duplicate_publication() {
     let checkpoints = [
         (PublicationCheckpoint::RecallManifestPrepared, true),
         (
+            PublicationCheckpoint::RecallPartialCreatedBeforeManifest { index: 0 },
+            true,
+        ),
+        (
             PublicationCheckpoint::RecallPartialSynced { index: 0 },
             true,
         ),
@@ -2342,7 +2333,7 @@ fn every_recall_checkpoint_recovers_without_duplicate_publication() {
         ),
         (
             PublicationCheckpoint::RecallRenamedBeforeManifest { index: 0 },
-            false,
+            true,
         ),
         (PublicationCheckpoint::RecallFilesSynced, false),
         (PublicationCheckpoint::RecallOutputSynced, false),
@@ -2399,7 +2390,7 @@ fn every_recall_checkpoint_recovers_without_duplicate_publication() {
 }
 
 #[test]
-fn unrecorded_partial_identity_remains_pending_and_blocks_retry() {
+fn unrecorded_partial_identity_is_removed_before_manifest_rollback_and_retry() {
     let mut fixture = FrozenFixture::new(8, 8, 2);
     fixture.push(&[0.25, 0.5]);
     let staging_root = fixture.root.path().join("recall-staging");
@@ -2432,29 +2423,30 @@ fn unrecorded_partial_identity_remains_pending_and_blocks_retry() {
         .unwrap_err();
     assert!(matches!(error, LambError::IndeterminatePublication { .. }));
 
-    let publisher_called = AtomicBool::new(false);
-    let retry = fixture.coordinator.persist_with_publisher(
-        &fixture.arena,
-        &mut fixture.workspace,
-        PrepareRequest::Recall {
-            staging_root: &staging_root,
-            output_dir: &output_dir,
-            timestamp: TIMESTAMP_A,
-            channel_names: &names,
-        },
-        DEADLINE,
-        DEADLINE,
-        |_| {
-            publisher_called.store(true, Ordering::Release);
-            panic!("pending manifest recovery must block retry")
-        },
-    );
+    let publisher_calls = AtomicUsize::new(0);
+    let retry = fixture
+        .coordinator
+        .persist_with_publisher(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PrepareRequest::Recall {
+                staging_root: &staging_root,
+                output_dir: &output_dir,
+                timestamp: TIMESTAMP_A,
+                channel_names: &names,
+            },
+            DEADLINE,
+            DEADLINE,
+            |prepared| {
+                publisher_calls.fetch_add(1, Ordering::SeqCst);
+                publish_prepared(prepared)
+            },
+        )
+        .unwrap();
 
-    assert!(matches!(
-        retry,
-        Err(LambError::IndeterminatePublication { .. })
-    ));
-    assert!(!publisher_called.load(Ordering::Acquire));
+    assert_eq!(retry.range(), Some(FrameRange { start: 0, end: 2 }));
+    assert_eq!(publisher_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read_dir(&output_dir).unwrap().count(), 1);
 }
 
 #[test]
