@@ -25,14 +25,16 @@ use crate::recovery::{
     ManifestEntrySlot, PathRef, RecoveryOutcome, RecoveryScanSummary, TransactionKind,
 };
 use crate::sample_ring::SampleFormat;
+use std::ffi::{CStr, OsStr};
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::ops::Range;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -153,6 +155,30 @@ pub trait CleanupIo: Send {
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {
         fs::remove_file(path)
     }
+
+    fn after_current_artifact_handoff(&mut self, _public_path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn resolve_current_artifact(
+        &mut self,
+        path: &Path,
+        expected: FileIdentity,
+        component_a: &mut [u8],
+        component_b: &mut [u8],
+        workspace_id: u64,
+        transaction_generation: u64,
+    ) -> io::Result<()> {
+        resolve_current_artifact_by_handoff(
+            path,
+            expected,
+            component_a,
+            component_b,
+            workspace_id,
+            transaction_generation,
+            || self.after_current_artifact_handoff(path),
+        )
+    }
 }
 
 struct FileCleanupIo;
@@ -165,6 +191,212 @@ impl CleanupIo for FileCleanupIo {
     fn remove_dir_all(&mut self, path: &Path) -> io::Result<()> {
         fs::remove_dir_all(path)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_current_artifact_by_handoff(
+    path: &Path,
+    expected: FileIdentity,
+    component_a: &mut [u8],
+    component_b: &mut [u8],
+    workspace_id: u64,
+    transaction_generation: u64,
+    after_handoff: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = open_parent_without_symlinks(path, component_a)?;
+    let public_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "active artifact path has no filename",
+        )
+    })?;
+    let public_name = prepare_cleanup_component(component_a, public_name)?;
+    let private_name =
+        prepare_recovery_component(component_b, workspace_id, transaction_generation)?;
+
+    match identity_at_component(&parent, private_name) {
+        Ok(_) => return resolve_private_artifact(&parent, public_name, private_name, expected),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let moved = unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            public_name.as_ptr(),
+            parent.as_raw_fd(),
+            private_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if moved != 0 {
+        let error = io::Error::last_os_error();
+        return match error.kind() {
+            io::ErrorKind::NotFound => Ok(()),
+            io::ErrorKind::AlreadyExists => {
+                resolve_private_artifact(&parent, public_name, private_name, expected)
+            }
+            _ => Err(error),
+        };
+    }
+
+    after_handoff()?;
+    resolve_private_artifact(&parent, public_name, private_name, expected)
+}
+
+fn resolve_private_artifact(
+    parent: &File,
+    public_name: &CStr,
+    private_name: &CStr,
+    expected: FileIdentity,
+) -> io::Result<()> {
+    if identity_at_component(parent, private_name)? == expected {
+        if identity_at_component(parent, private_name)? != expected {
+            return Err(io::Error::other(
+                "private active artifact identity changed before removal",
+            ));
+        }
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), private_name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+
+    if unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            private_name.as_ptr(),
+            parent.as_raw_fd(),
+            public_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn open_parent_without_symlinks(path: &Path, component: &mut [u8]) -> io::Result<File> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "active artifact path is not absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "active artifact path has no parent",
+        )
+    })?;
+    let root = c"/";
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut directory = unsafe { File::from_raw_fd(root_fd) };
+    for part in parent.components() {
+        let name = match part {
+            Component::RootDir => continue,
+            Component::Normal(name) => name,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active artifact parent is not normalized",
+                ))
+            }
+        };
+        let name = prepare_cleanup_component(component, name)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+fn prepare_cleanup_component<'a>(buffer: &'a mut [u8], name: &OsStr) -> io::Result<&'a CStr> {
+    let bytes = name.as_bytes();
+    if bytes.contains(&0) || bytes.len() >= buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cleanup component contains NUL or exceeds scratch capacity",
+        ));
+    }
+    buffer[..bytes.len()].copy_from_slice(bytes);
+    buffer[bytes.len()] = 0;
+    CStr::from_bytes_with_nul(&buffer[..=bytes.len()])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn prepare_recovery_component(
+    buffer: &mut [u8],
+    workspace_id: u64,
+    transaction_generation: u64,
+) -> io::Result<&CStr> {
+    const PREFIX: &[u8] = b".lamb-recovery-";
+    const SUFFIX: &[u8] = b".artifact";
+    let required = PREFIX.len() + 16 + 1 + 16 + SUFFIX.len() + 1;
+    if required > buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recovery component exceeds scratch capacity",
+        ));
+    }
+    buffer[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut cursor = PREFIX.len();
+    write_hex_u64(&mut buffer[cursor..cursor + 16], workspace_id);
+    cursor += 16;
+    buffer[cursor] = b'-';
+    cursor += 1;
+    write_hex_u64(&mut buffer[cursor..cursor + 16], transaction_generation);
+    cursor += 16;
+    buffer[cursor..cursor + SUFFIX.len()].copy_from_slice(SUFFIX);
+    cursor += SUFFIX.len();
+    buffer[cursor] = 0;
+    CStr::from_bytes_with_nul(&buffer[..=cursor])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn write_hex_u64(output: &mut [u8], value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (index, byte) in output.iter_mut().enumerate() {
+        let shift = 60 - index * 4;
+        *byte = HEX[((value >> shift) & 0xf) as usize];
+    }
+}
+
+fn identity_at_component(parent: &File, name: &CStr) -> io::Result<FileIdentity> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(FileIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
 }
 
 struct FileWavIo;
@@ -1659,31 +1891,28 @@ impl PersistenceWorkspace {
                 "active artifact path does not match a current output entry",
             ));
         }
-
-        let metadata = match self.cleanup_io.symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                self.publication.current_artifact[0] = CurrentArtifactSlot::default();
-                return Ok(());
-            }
-            Err(source) => return Err(io_error(path, source)),
-        };
-        if metadata.dev() != identity.device || metadata.ino() != identity.inode {
-            self.publication.current_artifact[0] = CurrentArtifactSlot::default();
-            return Ok(());
+        if path
+            .strip_prefix(self.paths[FINAL_ROOT_PATH].as_path())
+            .is_err()
+        {
+            return Err(LambError::ExportInvariant(
+                "active artifact path escapes the configured output root",
+            ));
         }
 
-        match self.cleanup_io.remove_file(path) {
-            Ok(()) => {
-                self.publication.current_artifact[0] = CurrentArtifactSlot::default();
-                Ok(())
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                self.publication.current_artifact[0] = CurrentArtifactSlot::default();
-                Ok(())
-            }
-            Err(source) => Err(io_error(path, source)),
-        }
+        let (component_a, component_b) = self.publication.component_pair();
+        self.cleanup_io
+            .resolve_current_artifact(
+                path,
+                identity,
+                component_a,
+                component_b,
+                self.workspace_id,
+                self.transaction_generation,
+            )
+            .map_err(|source| io_error(path, source))?;
+        self.publication.current_artifact[0] = CurrentArtifactSlot::default();
+        Ok(())
     }
 
     /// Temporary bridge for coordinators that still expose owned outcomes.
@@ -2480,6 +2709,13 @@ mod tests {
             }
             fs::remove_file(path)
         }
+
+        fn after_current_artifact_handoff(&mut self, _path: &Path) -> io::Result<()> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(io::Error::other("injected active artifact cleanup failure"));
+            }
+            Ok(())
+        }
     }
 
     #[test]
@@ -2662,12 +2898,13 @@ mod tests {
         );
 
         assert!(workspace.resolve_current_artifact().is_err());
-        assert!(path.exists());
+        assert!(!path.exists());
         assert!(workspace.publication.current_artifact[0].identity.is_some());
 
         fail.store(false, Ordering::Release);
         workspace.resolve_current_artifact().unwrap();
         assert!(!path.exists());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
         assert!(workspace.publication.current_artifact[0].identity.is_none());
     }
 }

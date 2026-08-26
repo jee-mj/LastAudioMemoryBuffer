@@ -1089,7 +1089,7 @@ fn publish_recall_inner(
             .map_err(RecallPublishError::retryable)?;
         }
     }
-    persist_manifest_prepared_scratch(
+    if let Err(operation) = persist_manifest_prepared_scratch(
         &mut *serialization,
         manifest_path,
         &manifest,
@@ -1098,8 +1098,13 @@ fn publish_recall_inner(
         &mut manifest_identity,
         scratch,
         hook,
-    )
-    .map_err(RecallPublishError::retryable)?;
+    ) {
+        return Err(if manifest_identity.is_some() {
+            RecallPublishError::durable(operation)
+        } else {
+            RecallPublishError::retryable(operation)
+        });
+    }
     hook.checkpoint(PublicationCheckpoint::RecallManifestPrepared)
         .map_err(RecallPublishError::durable)?;
     trusted_root

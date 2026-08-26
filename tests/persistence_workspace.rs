@@ -83,6 +83,34 @@ impl PreparedPublicationHook for InterruptPublicationAt {
     }
 }
 
+#[derive(Default)]
+struct CleanupRaceState {
+    replaced_path: Option<PathBuf>,
+}
+
+struct ReplaceAtCleanupCheckRemoveBoundary {
+    state: Arc<Mutex<CleanupRaceState>>,
+}
+
+impl CleanupIo for ReplaceAtCleanupCheckRemoveBoundary {
+    fn symlink_metadata(&mut self, path: &Path) -> io::Result<fs::Metadata> {
+        fs::symlink_metadata(path)
+    }
+
+    fn after_current_artifact_handoff(&mut self, path: &Path) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.replaced_path.is_none() {
+            fs::write(path, b"foreign cleanup race inode")?;
+            state.replaced_path = Some(path.to_path_buf());
+        }
+        Ok(())
+    }
+
+    fn remove_dir_all(&mut self, path: &Path) -> io::Result<()> {
+        fs::remove_dir_all(path)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Geometry {
     retention_frames: u64,
@@ -2706,6 +2734,87 @@ fn dump_after_rename_checkpoint_allocations_do_not_scale_and_recovery_completes(
         ResolvedLayout::TimestampDirectory,
         ExpectedCheckpointRecovery::Complete,
     );
+}
+
+#[test]
+fn current_artifact_cleanup_race_never_deletes_foreign_replacement_and_retries() {
+    let geometry = Geometry {
+        retention_frames: 32,
+        channels: 4,
+        chunk_frames: 32,
+        split_when_over_bytes: 50,
+        io_buffer_bytes_per_channel: 24,
+        maximum_path_bytes: 256,
+    };
+    let (mut arena, ingress, plan) = runtime(geometry);
+    let state = Arc::new(Mutex::new(CleanupRaceState::default()));
+    let mut workspace = PersistenceWorkspace::new_with_cleanup_io(
+        &plan,
+        workspace_config(geometry),
+        Box::new(ReplaceAtCleanupCheckRemoveBoundary {
+            state: Arc::clone(&state),
+        }),
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    let output = root.path().join("output");
+    let policy = exact_zero_policy(&output, &[ChannelExportMode::Auto; 4]);
+    let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    let mut samples = vec![0.0; 2 * 4];
+    samples[0] = 0.25;
+    let mut frozen = freeze(&mut arena, &ingress, &samples, 4);
+    let prepared = workspace
+        .prepare(
+            &frozen,
+            PrepareRequest::Policy {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "cleanup-race",
+                staging_root: &staging,
+                timestamp: TIMESTAMP,
+                decision: &mut decision,
+            },
+        )
+        .unwrap();
+    let result = publish_prepared_with_hook(
+        prepared,
+        &mut InterruptPublicationAt(PublicationCheckpoint::RecallPartialCreatedBeforeManifest {
+            index: 0,
+        }),
+    );
+    let PreparedPublication::Indeterminate {
+        cleanup: mut descriptor,
+        ..
+    } = result
+    else {
+        panic!("partial-created checkpoint must be indeterminate")
+    };
+
+    assert!(matches!(
+        workspace
+            .recover_indeterminate_publication(&mut descriptor)
+            .unwrap(),
+        PublicationRecovery::Pending
+    ));
+    let foreign = state
+        .lock()
+        .unwrap()
+        .replaced_path
+        .clone()
+        .expect("cleanup seam replaced the public artifact name");
+    assert_eq!(fs::read(&foreign).unwrap(), b"foreign cleanup race inode");
+
+    fs::remove_file(&foreign).unwrap();
+    assert!(matches!(
+        workspace
+            .recover_indeterminate_publication(&mut descriptor)
+            .unwrap(),
+        PublicationRecovery::RolledBack
+    ));
+    arena.release_frozen(&mut frozen, DEADLINE).unwrap();
+    arena.shutdown(DEADLINE).unwrap();
 }
 
 #[test]

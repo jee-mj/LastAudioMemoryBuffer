@@ -251,6 +251,26 @@ struct FailDirectorySyncAt {
     fail_at: usize,
 }
 
+struct FailFirstPreopenedDirectorySync {
+    failed: bool,
+}
+
+impl PreparedPublicationHook for FailFirstPreopenedDirectorySync {
+    fn sync_preopened_directory(
+        &mut self,
+        _directory: &std::fs::File,
+        _path: &std::path::Path,
+    ) -> Result<()> {
+        if !self.failed {
+            self.failed = true;
+            return Err(LambError::Export(
+                "injected initial manifest parent sync failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl PreparedPublicationHook for FailDirectorySyncAt {
     fn sync_directory(&mut self, path: &std::path::Path) -> Result<()> {
         self.call += 1;
@@ -2236,6 +2256,67 @@ fn visible_dump_manifest_with_failed_parent_sync_is_recovered_before_retry() {
 
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(outcome.range(), Some(FrameRange { start: 0, end: 2 }));
+}
+
+#[test]
+fn installed_recall_manifest_with_failed_initial_parent_sync_retains_recovery_authority() {
+    let mut fixture = FrozenFixture::new(8, 8, 2);
+    fixture.push(&[0.25, 0.5]);
+    let staging_root = fixture.root.path().join("recall-staging");
+    let output_dir = fixture.root.path().join("recall");
+    let names = fixture.names.clone();
+    let first = fixture.coordinator.persist_with_publisher(
+        &fixture.arena,
+        &mut fixture.workspace,
+        PrepareRequest::Recall {
+            staging_root: &staging_root,
+            output_dir: &output_dir,
+            timestamp: TIMESTAMP_A,
+            channel_names: &names,
+        },
+        DEADLINE,
+        DEADLINE,
+        |prepared| {
+            publish_prepared_with_hook(
+                prepared,
+                &mut FailFirstPreopenedDirectorySync { failed: false },
+            )
+        },
+    );
+    assert!(matches!(
+        first,
+        Err(LambError::IndeterminatePublication { .. })
+    ));
+    let transaction_roots: Vec<_> = std::fs::read_dir(&staging_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(transaction_roots.len(), 1);
+    assert!(transaction_roots[0].join("manifest.json").exists());
+
+    let publisher_calls = AtomicUsize::new(0);
+    let outcome = fixture
+        .coordinator
+        .persist_with_publisher(
+            &fixture.arena,
+            &mut fixture.workspace,
+            PrepareRequest::Recall {
+                staging_root: &staging_root,
+                output_dir: &output_dir,
+                timestamp: TIMESTAMP_A,
+                channel_names: &names,
+            },
+            DEADLINE,
+            DEADLINE,
+            |prepared| {
+                publisher_calls.fetch_add(1, Ordering::SeqCst);
+                publish_prepared(prepared)
+            },
+        )
+        .unwrap();
+    assert_eq!(publisher_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.range(), Some(FrameRange { start: 0, end: 2 }));
+    assert_eq!(std::fs::read_dir(&output_dir).unwrap().count(), 1);
 }
 
 #[test]
