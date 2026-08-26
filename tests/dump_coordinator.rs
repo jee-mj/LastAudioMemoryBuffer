@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -12,6 +13,7 @@ use lamb::activity::{
 };
 use lamb::app_config::ActivityThresholdConfig;
 use lamb::capture_arena::{CaptureArena, CaptureIngress, CaptureRuntimeConfig};
+use lamb::control::{write_persistence_response, DaemonStatus};
 use lamb::dump::{
     CommittedPersistenceRef, DecisionPreparation, DumpCoordinator, DumpOutcome, FrameRange,
     LossBreakdown, PolicyPersistenceRequest, PublishedOutput, SampleSnapshot,
@@ -43,6 +45,7 @@ struct FrozenFixture {
     root: tempfile::TempDir,
     names: Vec<String>,
     plan: SessionMemoryPlan,
+    channels: u32,
 }
 
 impl FrozenFixture {
@@ -63,7 +66,24 @@ impl FrozenFixture {
         split_when_over_bytes: u64,
         cleanup_io: Option<Box<dyn CleanupIo>>,
     ) -> Self {
-        let channels = 1;
+        Self::new_with_channels(
+            retention_frames,
+            queue_slots,
+            slot_frames,
+            split_when_over_bytes,
+            cleanup_io,
+            1,
+        )
+    }
+
+    fn new_with_channels(
+        retention_frames: u64,
+        queue_slots: u32,
+        slot_frames: u32,
+        split_when_over_bytes: u64,
+        cleanup_io: Option<Box<dyn CleanupIo>>,
+        channels: u32,
+    ) -> Self {
         let chunk_frames = 2;
         let plan = SessionMemoryPlan::calculate(SessionMemoryInputs {
             retention_frames,
@@ -129,13 +149,22 @@ impl FrozenFixture {
                 FrozenExportDecision::new(&plan).unwrap(),
             ),
             root: tempfile::tempdir().unwrap(),
-            names: vec!["mic".to_string()],
+            names: (0..channels)
+                .map(|index| match index {
+                    0 => "mic".to_string(),
+                    1 => "gtr".to_string(),
+                    _ => format!("channel-{index}"),
+                })
+                .collect(),
             plan,
+            channels,
         }
     }
 
     fn push(&self, samples: &[f32]) -> lamb::capture_arena::CapturePushOutcome {
-        self.ingress.try_push_interleaved(samples, 1).unwrap()
+        self.ingress
+            .try_push_interleaved(samples, self.channels)
+            .unwrap()
     }
 
     fn recall(&mut self, timestamp: &str) -> Result<DumpOutcome> {
@@ -190,6 +219,26 @@ fn prepared_policy(output_dir: PathBuf, mode: ChannelExportMode) -> ResolvedExpo
         output_dir,
         ResolvedLayout::FlatDetailed,
         exact_zero_policy(mode),
+    )
+    .unwrap()
+}
+
+fn prepared_multi_policy(output_dir: PathBuf, channels: u32) -> ResolvedExportPolicy {
+    ResolvedExportPolicy::new(
+        output_dir,
+        ResolvedLayout::FlatDetailed,
+        ResolvedActivityPolicy {
+            detector: ActivityDetectorKind::ExactZero,
+            channels: (0..channels)
+                .map(|index| ChannelActivityPolicy {
+                    name: format!("channel-{index}"),
+                    mode: ChannelExportMode::Auto,
+                    threshold: None,
+                })
+                .collect(),
+            whole_export_exact_zero_gate: false,
+            trim_leading_silence: true,
+        },
     )
     .unwrap()
 }
@@ -2658,6 +2707,208 @@ fn borrowed_request<'a>(
         staging_root: staging,
         timestamp,
     }
+}
+
+fn delivery_status() -> DaemonStatus {
+    DaemonStatus {
+        state: "capturing".to_string(),
+        active_export_count: 0,
+        pending_recall_count: 0,
+        buffer_capacity_seconds: 0.0,
+        retained_seconds: 0.0,
+        dropped_frames: 0,
+        target: None,
+        resolved_target: None,
+        sample_rate: 48_000,
+        channel_count: 1,
+        format: "F32LE".to_string(),
+        last_error: None,
+    }
+}
+
+/// Accepts exactly through the first complete JSON file path, then fails the
+/// next write. Partial writes make this independent of serde's write chunking.
+struct FailAfterFirstPath {
+    first_path: [u8; 512],
+    first_len: usize,
+    second_path: [u8; 512],
+    second_len: usize,
+    bytes: [u8; 4096],
+    len: usize,
+    completed_first_path: bool,
+    fail_next_write: bool,
+    partial_write: bool,
+}
+
+impl FailAfterFirstPath {
+    fn new(path: &std::path::Path, second: &std::path::Path) -> Self {
+        let path = path.to_str().unwrap().as_bytes();
+        let second = second.to_str().unwrap().as_bytes();
+        assert!(path.len() + 2 < 512 && second.len() + 2 < 512);
+        let mut first_path = [0; 512];
+        first_path[0] = b'"';
+        first_path[1..path.len() + 1].copy_from_slice(path);
+        first_path[path.len() + 1] = b'"';
+        let mut second_path = [0; 512];
+        second_path[0] = b'"';
+        second_path[1..second.len() + 1].copy_from_slice(second);
+        second_path[second.len() + 1] = b'"';
+        Self {
+            first_path,
+            first_len: path.len() + 2,
+            second_path,
+            second_len: second.len() + 2,
+            bytes: [0; 4096],
+            len: 0,
+            completed_first_path: false,
+            fail_next_write: false,
+            partial_write: false,
+        }
+    }
+}
+
+impl Write for FailAfterFirstPath {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if self.fail_next_write {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected response failure",
+            ));
+        }
+        let remaining = self.bytes.len() - self.len;
+        let take = input.len().min(7).min(remaining);
+        self.partial_write |= take < input.len();
+        self.bytes[self.len..self.len + take].copy_from_slice(&input[..take]);
+        let prior = self.len;
+        self.len += take;
+        if !self.completed_first_path {
+            let needle = &self.first_path[..self.first_len];
+            if let Some(start) = self.bytes[..self.len]
+                .windows(needle.len())
+                .position(|window| window == needle)
+            {
+                let complete = start + needle.len();
+                if self.len > complete {
+                    self.len = prior + (complete - prior);
+                    self.completed_first_path = true;
+                    self.fail_next_write = true;
+                    return Ok(complete - prior);
+                }
+                self.completed_first_path = true;
+                self.fail_next_write = true;
+            }
+        }
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn response_write_failure_commits_once() {
+    let mut fixture = FrozenFixture::new_with_channels(64, 8, 2, 1_000_000, None, 2);
+    let output = fixture.root.path().join("write-failure-output");
+    let staging = fixture.root.path().join("write-failure-staging");
+    let policy = prepared_multi_policy(output.clone(), 2);
+    fixture.push(&[0.25; 64]);
+    let mut saw_files = 0;
+    let error = fixture.coordinator.persist_policy_with_delivery(
+        &fixture.arena,
+        &mut fixture.workspace,
+        borrowed_request(&policy, &staging, TIMESTAMP_A),
+        DEADLINE,
+        DEADLINE,
+        |outcome| {
+            let CommittedPersistenceRef::Written {
+                output: completed, ..
+            } = outcome
+            else {
+                panic!("active capture must publish")
+            };
+            saw_files = completed.files.len();
+            assert!(saw_files >= 2, "test requires multiple serialized paths");
+            let mut writer = FailAfterFirstPath::new(
+                completed.files.get(0).unwrap().final_path(),
+                completed.files.get(1).unwrap().final_path(),
+            );
+            let result = write_persistence_response(
+                &mut writer,
+                true,
+                "written",
+                &delivery_status(),
+                48_000,
+                CommittedPersistenceRef::Written {
+                    range: FrameRange { start: 0, end: 32 },
+                    export_range: FrameRange { start: 0, end: 32 },
+                    frames: 32,
+                    losses: LossBreakdown::default(),
+                    output: completed,
+                },
+            );
+            assert!(
+                writer.completed_first_path,
+                "writer must accept the first complete path"
+            );
+            assert!(writer.partial_write, "writer must exercise partial writes");
+            assert!(writer.bytes[..writer.len]
+                .windows(writer.first_len)
+                .any(|window| window == &writer.first_path[..writer.first_len]));
+            assert!(!writer.bytes[..writer.len]
+                .windows(writer.second_len)
+                .any(|window| window == &writer.second_path[..writer.second_len]));
+            result
+        },
+    );
+    assert!(
+        matches!(error, Err(LambError::Control(message)) if message.contains("injected response failure"))
+    );
+    assert!(saw_files >= 2);
+    assert!(!fixture.arena.status(DEADLINE).unwrap().frozen_pending);
+    if staging.exists() {
+        assert!(
+            std::fs::read_dir(&staging).unwrap().next().is_none(),
+            "completed delivery must remove transaction staging/manifest artifacts"
+        );
+    }
+    fixture
+        .coordinator
+        .persist_policy_with_delivery(
+            &fixture.arena,
+            &mut fixture.workspace,
+            borrowed_request(&policy, &staging, TIMESTAMP_A),
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                assert!(matches!(
+                    outcome,
+                    CommittedPersistenceRef::NoNewAudio { .. }
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), saw_files);
+    fixture.push(&[0.5; 64]);
+    fixture
+        .coordinator
+        .persist_policy_with_delivery(
+            &fixture.arena,
+            &mut fixture.workspace,
+            borrowed_request(&policy, &staging, TIMESTAMP_B),
+            DEADLINE,
+            DEADLINE,
+            |outcome| {
+                let CommittedPersistenceRef::Written { range, .. } = outcome else {
+                    panic!("new audio must write")
+                };
+                assert_eq!(range, FrameRange { start: 16, end: 32 });
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&output).unwrap().count(), saw_files * 2);
 }
 
 #[test]

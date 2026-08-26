@@ -1,16 +1,95 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use lamb::activity::ThresholdSource;
+use lamb::activity::{ActivityDetectorKind, ChannelExportMode, FrozenExportDecision};
 use lamb::calibration::{ConfiguredDeviceSelector, InputBackend, StaleReason};
+use lamb::capture_arena::{CaptureArena, CaptureRuntimeConfig};
 use lamb::control::{
-    send_request, CalibrationEvaluation, CalibrationReportStatus, ConfiguredInputReport,
-    ControlRequest, ControlResponse, PersistenceOutcomeResponse, StoredThresholdReport,
-    ThresholdChannelReport, ThresholdReport, ThresholdRequest,
+    send_request, write_persistence_response, CalibrationEvaluation, CalibrationReportStatus,
+    ConfiguredInputReport, ControlRequest, ControlResponse, DaemonStatus,
+    PersistenceOutcomeResponse, StoredThresholdReport, ThresholdChannelReport, ThresholdReport,
+    ThresholdRequest,
 };
+use lamb::dump::{CommittedPersistenceRef, DumpCoordinator, PolicyPersistenceRequest};
+use lamb::export_policy::{
+    ChannelActivityPolicy, ExportCommand, ResolvedActivityPolicy, ResolvedExportPolicy,
+    ResolvedLayout,
+};
+use lamb::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
+use lamb::persistence_workspace::{PersistenceWorkspace, PersistenceWorkspaceConfig};
+use lamb::sample_ring::{RingConfig, SampleFormat};
+
+struct ThreadCountingAllocator;
+thread_local! {
+    static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+    static PAUSE_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static ALLOCATION_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+unsafe impl GlobalAlloc for ThreadCountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        COUNT_ALLOCATIONS.with(|enabled| {
+            if enabled.get() && !PAUSE_ALLOCATIONS.with(Cell::get) {
+                ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+                ALLOCATION_BYTES.with(|bytes| bytes.set(bytes.get() + layout.size()));
+            }
+        });
+        System.alloc(layout)
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        System.dealloc(pointer, layout);
+    }
+}
+#[global_allocator]
+static ALLOCATOR: ThreadCountingAllocator = ThreadCountingAllocator;
+
+fn allocation_count_during<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
+    struct ResetCounting;
+    impl Drop for ResetCounting {
+        fn drop(&mut self) {
+            COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+            PAUSE_ALLOCATIONS.with(|paused| paused.set(false));
+        }
+    }
+    ALLOCATION_COUNT.with(|count| count.set(0));
+    ALLOCATION_BYTES.with(|bytes| bytes.set(0));
+    COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+    let _reset = ResetCounting;
+    let result = operation();
+    (
+        result,
+        ALLOCATION_COUNT.with(Cell::get),
+        ALLOCATION_BYTES.with(Cell::get),
+    )
+}
+
+fn pause_counting_after_delivery() {
+    PAUSE_ALLOCATIONS.with(|paused| paused.set(true));
+}
+
+fn allocation_snapshot() -> (usize, usize) {
+    (
+        ALLOCATION_COUNT.with(Cell::get),
+        ALLOCATION_BYTES.with(Cell::get),
+    )
+}
+
+#[test]
+fn allocation_count_during_restores_flags_after_unwind() {
+    let unwind = std::panic::catch_unwind(|| allocation_count_during(|| panic!("test unwind")));
+    assert!(unwind.is_err());
+    assert!(!COUNT_ALLOCATIONS.with(Cell::get));
+    assert!(!PAUSE_ALLOCATIONS.with(Cell::get));
+    let (_, count, bytes) = allocation_count_during(|| {});
+    assert_eq!((count, bytes), (0, 0));
+}
 
 #[test]
 fn threshold_requests_round_trip_through_the_nested_protocol() {
@@ -201,6 +280,258 @@ fn control_response_without_persistence_outcome_remains_compatible() {
         serde_json::from_str(r#"{"ok":true,"message":"status","status":null}"#).unwrap();
 
     assert_eq!(response.persistence_outcome, None);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AllocationPhases {
+    outputs: usize,
+    path_len: usize,
+    output_directory_len: usize,
+    callback_entry: (usize, usize),
+    post_writer: (usize, usize),
+}
+
+fn response_allocation_measurement(
+    layout: ResolvedLayout,
+    frames: u64,
+    active_channels: u32,
+    root: &Path,
+) -> AllocationPhases {
+    const CHANNELS: u32 = 64;
+    let plan = SessionMemoryPlan::calculate(SessionMemoryInputs {
+        retention_frames: 2,
+        channels: CHANNELS,
+        sample_rate: 48_000,
+        sample_format: SampleFormat::F32Le,
+        chunk_frames: 2,
+        max_active_snapshots: 1,
+        sample_bytes: 4,
+        split_when_over_bytes: 1_000_000,
+        control_queue_capacity: 2,
+        worker_stack_bytes: 64 * 1024,
+        capture_queue_slots: 32,
+        capture_slot_frames: 2,
+        capture_worker_stack_bytes: 256 * 1024,
+        io_buffer_bytes_per_channel: 1024,
+        maximum_path_bytes: 256,
+        maximum_calibration_seconds: 0,
+        headroom: 1.0,
+    })
+    .unwrap();
+    let (arena, ingress) = CaptureArena::new(
+        &plan,
+        CaptureRuntimeConfig {
+            ring: RingConfig {
+                channels: CHANNELS,
+                sample_rate: 48_000,
+                format: SampleFormat::F32Le,
+                chunk_frames: 2,
+                chunk_count: 1,
+                max_active_snapshots: 1,
+            },
+            queue_slots: 32,
+            slot_frames: 2,
+            sample_bytes: 4,
+            worker_stack_bytes: 256 * 1024,
+        },
+    )
+    .unwrap();
+    let mut workspace = PersistenceWorkspace::new(
+        &plan,
+        PersistenceWorkspaceConfig {
+            retention_frames: 2,
+            channels: CHANNELS,
+            sample_rate: 48_000,
+            sample_format: SampleFormat::F32Le,
+            chunk_frames: 2,
+            sample_bytes: 4,
+            split_when_over_bytes: 1_000_000,
+            io_buffer_bytes_per_channel: 1024,
+            maximum_path_bytes: 256,
+        },
+    )
+    .unwrap();
+    let policy = ResolvedExportPolicy::new(
+        root.join("output"),
+        layout,
+        ResolvedActivityPolicy {
+            detector: ActivityDetectorKind::ExactZero,
+            channels: (0..CHANNELS)
+                .map(|index| ChannelActivityPolicy {
+                    name: format!("channel-{index:02}"),
+                    mode: if index < active_channels {
+                        ChannelExportMode::Auto
+                    } else {
+                        ChannelExportMode::Never
+                    },
+                    threshold: None,
+                })
+                .collect(),
+            whole_export_exact_zero_gate: false,
+            trim_leading_silence: false,
+        },
+    )
+    .unwrap();
+    let coordinator =
+        DumpCoordinator::with_frozen_decision(FrozenExportDecision::new(&plan).unwrap());
+    let staging_root = root.join("staging");
+    let mut samples = [0.0; 128];
+    for sample in samples
+        .iter_mut()
+        .take(usize::try_from(frames * u64::from(CHANNELS)).unwrap())
+    {
+        *sample = 0.25;
+    }
+    let outputs = Cell::new(0);
+    let path_len = Cell::new(0);
+    let output_directory_len = Cell::new(0);
+    let callback_entry = Cell::new((0, 0));
+    let post_writer = Cell::new((0, 0));
+    let (_result, count, bytes) = allocation_count_during(|| {
+        ingress
+            .try_push_interleaved(
+                &samples[..usize::try_from(frames * u64::from(CHANNELS)).unwrap()],
+                CHANNELS,
+            )
+            .unwrap();
+        coordinator
+            .persist_policy_with_delivery(
+                &arena,
+                &mut workspace,
+                PolicyPersistenceRequest {
+                    command: ExportCommand::Recall,
+                    policy: &policy,
+                    profile: "allocation",
+                    staging_root: &staging_root,
+                    timestamp: "20260818T120000",
+                },
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                |outcome| {
+                    callback_entry.set(allocation_snapshot());
+                    if let CommittedPersistenceRef::Written {
+                        output,
+                        frames,
+                        losses,
+                        ..
+                    } = &outcome
+                    {
+                        outputs.set(output.files.len());
+                        let directory = output.output_directory.to_str().unwrap();
+                        output_directory_len.set(directory.len());
+                        for file in output.files.iter() {
+                            let path = file.final_path().to_str().unwrap();
+                            if path_len.get() == 0 {
+                                path_len.set(path.len());
+                            }
+                            assert_eq!(path.len(), path_len.get());
+                        }
+                        let arena_status = arena.status(Duration::from_secs(2)).unwrap();
+                        let message = format!(
+                            "written: {frames} frames; warning: {} frames lost before persistence",
+                            losses.lost_frames()
+                        );
+                        let status = DaemonStatus {
+                            state: "capturing".to_string(),
+                            active_export_count: u32::from(arena_status.frozen_pending),
+                            pending_recall_count: 0,
+                            buffer_capacity_seconds: arena_status.capacity_frames as f64 / 48_000.0,
+                            retained_seconds: arena_status.retained_frames as f64 / 48_000.0,
+                            dropped_frames: arena_status.dropped_frames,
+                            target: None,
+                            resolved_target: None,
+                            sample_rate: 48_000,
+                            channel_count: CHANNELS,
+                            format: "F32LE".to_string(),
+                            last_error: None,
+                        };
+                        write_persistence_response(
+                            &mut io::sink(),
+                            true,
+                            &message,
+                            &status,
+                            48_000,
+                            outcome,
+                        )?;
+                    } else {
+                        panic!("allocation fixture must write");
+                    }
+                    post_writer.set(allocation_snapshot());
+                    pause_counting_after_delivery();
+                    Ok(())
+                },
+            )
+            .unwrap()
+    });
+    assert_eq!((count, bytes), post_writer.get());
+    coordinator
+        .persist_policy_with_delivery(
+            &arena,
+            &mut workspace,
+            PolicyPersistenceRequest {
+                command: ExportCommand::Recall,
+                policy: &policy,
+                profile: "allocation",
+                staging_root: &staging_root,
+                timestamp: "20260818T120001",
+            },
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            |outcome| {
+                assert!(matches!(
+                    outcome,
+                    CommittedPersistenceRef::NoNewAudio { .. }
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+    AllocationPhases {
+        outputs: outputs.get(),
+        path_len: path_len.get(),
+        output_directory_len: output_directory_len.get(),
+        callback_entry: callback_entry.get(),
+        post_writer: post_writer.get(),
+    }
+}
+
+#[test]
+fn prepared_response_allocations() {
+    let mut comparisons = Vec::new();
+    for (layout, label) in [
+        (ResolvedLayout::FlatDetailed, "file-set"),
+        (ResolvedLayout::TimestampDirectory, "atomic-directory"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let small_root = temp.path().join("small-root");
+        let maximum_root = temp.path().join("large-root");
+        fs::create_dir_all(&small_root).unwrap();
+        fs::create_dir_all(&maximum_root).unwrap();
+        let small = response_allocation_measurement(layout.clone(), 2, 1, &small_root);
+        let maximum = response_allocation_measurement(layout, 2, 64, &maximum_root);
+        assert_eq!(small.outputs, 1, "{label} small output count");
+        assert_eq!(maximum.outputs, 64, "{label} maximum output count");
+        assert_eq!(
+            small.path_len, maximum.path_len,
+            "{label} canonical path lengths differ"
+        );
+        assert_eq!(
+            small.output_directory_len, maximum.output_directory_len,
+            "{label} output-directory lengths differ"
+        );
+        eprintln!("{label}: small={small:?}, maximum={maximum:?}");
+        comparisons.push((label, small, maximum));
+    }
+    for (label, small, maximum) in comparisons {
+        assert_eq!(
+            small.callback_entry, maximum.callback_entry,
+            "{label} prepare/publish/commit allocations scaled: {small:?} -> {maximum:?}"
+        );
+        assert_eq!(
+            small.post_writer, maximum.post_writer,
+            "{label} response allocations scaled: {small:?} -> {maximum:?}"
+        );
+    }
 }
 
 #[test]

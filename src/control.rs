@@ -1,6 +1,9 @@
 use crate::activity::ThresholdSource;
 use crate::calibration::{ConfiguredDeviceSelector, InputBackend, LiveDeviceKeyKind, StaleReason};
+use crate::dump::{CommittedPersistenceRef, FrameRange, LossBreakdown};
 use crate::error::{io_error, LambError, Result};
+use crate::persistence_workspace::FilePlan;
+use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -396,6 +399,244 @@ pub struct DaemonStatus {
     pub last_error: Option<String>,
 }
 
+/// Streams a committed prepared-persistence response without taking ownership
+/// of the workspace-backed output plan.
+pub fn write_persistence_response<W: Write>(
+    writer: &mut W,
+    ok: bool,
+    message: &str,
+    status: &DaemonStatus,
+    sample_rate: u32,
+    outcome: CommittedPersistenceRef<'_>,
+) -> Result<()> {
+    let response = BorrowedPersistenceResponse::new(ok, message, status, sample_rate, outcome)?;
+    serde_json::to_writer(&mut *writer, &response)
+        .map_err(|error| LambError::Control(error.to_string()))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| LambError::Control(error.to_string()))
+}
+
+#[derive(Serialize)]
+struct BorrowedPersistenceResponse<'a> {
+    ok: bool,
+    message: &'a str,
+    status: &'a DaemonStatus,
+    persistence_outcome: BorrowedPersistenceOutcome<'a>,
+}
+
+impl<'a> BorrowedPersistenceResponse<'a> {
+    fn new(
+        ok: bool,
+        message: &'a str,
+        status: &'a DaemonStatus,
+        sample_rate: u32,
+        outcome: CommittedPersistenceRef<'a>,
+    ) -> Result<Self> {
+        if sample_rate == 0 {
+            return Err(LambError::Control(
+                "persistence response sample rate is zero".to_string(),
+            ));
+        }
+        Ok(Self {
+            ok,
+            message,
+            status,
+            persistence_outcome: BorrowedPersistenceOutcome::new(sample_rate, outcome)?,
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BorrowedPersistenceOutcome<'a> {
+    Written {
+        start_frame: u64,
+        end_frame: u64,
+        frames: u64,
+        export_start_frame: u64,
+        export_frames: u64,
+        duration_seconds: f64,
+        lost_frames: u64,
+        retention_lost_frames: u64,
+        cleared_frames: u64,
+        capture_dropped_frames: u64,
+        output_directory: &'a str,
+        files: BorrowedFiles<'a>,
+    },
+    SkippedSilent {
+        start_frame: u64,
+        end_frame: u64,
+        frames: u64,
+        duration_seconds: f64,
+        lost_frames: u64,
+        retention_lost_frames: u64,
+        cleared_frames: u64,
+        capture_dropped_frames: u64,
+    },
+    SkippedByPolicy {
+        start_frame: u64,
+        end_frame: u64,
+        frames: u64,
+        duration_seconds: f64,
+        lost_frames: u64,
+        retention_lost_frames: u64,
+        cleared_frames: u64,
+        capture_dropped_frames: u64,
+    },
+    NoNewAudio {
+        lost_frames: u64,
+        retention_lost_frames: u64,
+        cleared_frames: u64,
+        capture_dropped_frames: u64,
+    },
+}
+
+impl<'a> BorrowedPersistenceOutcome<'a> {
+    fn new(sample_rate: u32, outcome: CommittedPersistenceRef<'a>) -> Result<Self> {
+        match outcome {
+            CommittedPersistenceRef::Written {
+                range,
+                export_range,
+                frames,
+                losses,
+                output,
+            } => {
+                validate_geometry(range, export_range, frames)?;
+                let output_directory = output.output_directory.to_str().ok_or_else(|| {
+                    LambError::Control(
+                        "persistence response output directory is not UTF-8".to_string(),
+                    )
+                })?;
+                BorrowedFiles::validate(output.files)?;
+                Ok(Self::Written {
+                    start_frame: range.start,
+                    end_frame: range.end,
+                    frames,
+                    export_start_frame: export_range.start,
+                    export_frames: export_range.end - export_range.start,
+                    duration_seconds: frames as f64 / f64::from(sample_rate),
+                    lost_frames: losses.lost_frames(),
+                    retention_lost_frames: losses.retention_lost_frames,
+                    cleared_frames: losses.cleared_frames,
+                    capture_dropped_frames: losses.capture_dropped_frames,
+                    output_directory,
+                    files: BorrowedFiles(output.files),
+                })
+            }
+            CommittedPersistenceRef::SkippedSilent {
+                range,
+                frames,
+                losses,
+            } => {
+                validate_consumed_geometry(range, frames)?;
+                let losses = loss_fields(losses);
+                Ok(Self::SkippedSilent {
+                    start_frame: range.start,
+                    end_frame: range.end,
+                    frames,
+                    duration_seconds: frames as f64 / f64::from(sample_rate),
+                    lost_frames: losses.lost_frames,
+                    retention_lost_frames: losses.retention_lost_frames,
+                    cleared_frames: losses.cleared_frames,
+                    capture_dropped_frames: losses.capture_dropped_frames,
+                })
+            }
+            CommittedPersistenceRef::SkippedByPolicy {
+                range,
+                frames,
+                losses,
+            } => {
+                validate_consumed_geometry(range, frames)?;
+                let losses = loss_fields(losses);
+                Ok(Self::SkippedByPolicy {
+                    start_frame: range.start,
+                    end_frame: range.end,
+                    frames,
+                    duration_seconds: frames as f64 / f64::from(sample_rate),
+                    lost_frames: losses.lost_frames,
+                    retention_lost_frames: losses.retention_lost_frames,
+                    cleared_frames: losses.cleared_frames,
+                    capture_dropped_frames: losses.capture_dropped_frames,
+                })
+            }
+            CommittedPersistenceRef::NoNewAudio { losses } => {
+                let losses = loss_fields(losses);
+                Ok(Self::NoNewAudio {
+                    lost_frames: losses.lost_frames,
+                    retention_lost_frames: losses.retention_lost_frames,
+                    cleared_frames: losses.cleared_frames,
+                    capture_dropped_frames: losses.capture_dropped_frames,
+                })
+            }
+        }
+    }
+}
+
+fn loss_fields(losses: LossBreakdown) -> LossFields {
+    LossFields {
+        lost_frames: losses.lost_frames(),
+        retention_lost_frames: losses.retention_lost_frames,
+        cleared_frames: losses.cleared_frames,
+        capture_dropped_frames: losses.capture_dropped_frames,
+    }
+}
+
+struct LossFields {
+    lost_frames: u64,
+    retention_lost_frames: u64,
+    cleared_frames: u64,
+    capture_dropped_frames: u64,
+}
+
+fn validate_consumed_geometry(range: FrameRange, frames: u64) -> Result<()> {
+    if range.end < range.start || range.end - range.start != frames {
+        return Err(LambError::Control(
+            "persistence response consumed range is inconsistent".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_geometry(range: FrameRange, export_range: FrameRange, frames: u64) -> Result<()> {
+    validate_consumed_geometry(range, frames)?;
+    if export_range.start < range.start
+        || export_range.end != range.end
+        || export_range.end < export_range.start
+    {
+        return Err(LambError::Control(
+            "persistence response export range is inconsistent".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+struct BorrowedFiles<'a>(FilePlan<'a>);
+
+impl<'a> BorrowedFiles<'a> {
+    fn validate(files: FilePlan<'a>) -> Result<()> {
+        for file in files.iter() {
+            file.final_path().to_str().ok_or_else(|| {
+                LambError::Control("persistence response file path is not UTF-8".to_string())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for BorrowedFiles<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for file in self.0.iter() {
+            let path = file.final_path().to_str().ok_or_else(|| {
+                serde::ser::Error::custom("persistence response file path is not UTF-8")
+            })?;
+            sequence.serialize_element(path)?;
+        }
+        sequence.end()
+    }
+}
+
 pub fn client_send_simple(socket: &Path, command: &str) -> Result<()> {
     let request = match command {
         "recall" => ControlRequest::Recall,
@@ -634,6 +875,287 @@ pub fn client_threshold(socket: &Path, request: ThresholdRequest) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activity::{ActivityDetectorKind, ChannelExportMode, FrozenExportDecision};
+    use crate::capture_arena::{CaptureArena, CaptureRuntimeConfig};
+    use crate::dump::{CommittedPersistenceRef, FrameRange, LossBreakdown};
+    use crate::dump::{DumpCoordinator, PolicyPersistenceRequest};
+    use crate::export_policy::{
+        ChannelActivityPolicy, ExportCommand, ResolvedActivityPolicy, ResolvedExportPolicy,
+        ResolvedLayout,
+    };
+    use crate::memory_plan::{SessionMemoryInputs, SessionMemoryPlan};
+    use crate::persistence_workspace::{PersistenceWorkspace, PersistenceWorkspaceConfig};
+    use crate::sample_ring::{RingConfig, SampleFormat};
+    use std::time::Duration;
+
+    fn persistence_status() -> DaemonStatus {
+        DaemonStatus {
+            state: "capturing".to_string(),
+            active_export_count: 0,
+            pending_recall_count: 0,
+            buffer_capacity_seconds: 1.0,
+            retained_seconds: 1.0,
+            dropped_frames: 0,
+            target: None,
+            resolved_target: None,
+            sample_rate: 100,
+            channel_count: 1,
+            format: "F32LE".to_string(),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn borrowed_persistence_json_serializes_non_written_outcomes_compatibly() {
+        let status = persistence_status();
+        let outcomes = [
+            CommittedPersistenceRef::SkippedSilent {
+                range: FrameRange { start: 10, end: 20 },
+                frames: 10,
+                losses: LossBreakdown::default(),
+            },
+            CommittedPersistenceRef::SkippedByPolicy {
+                range: FrameRange { start: 20, end: 30 },
+                frames: 10,
+                losses: LossBreakdown::default(),
+            },
+            CommittedPersistenceRef::NoNewAudio {
+                losses: LossBreakdown::default(),
+            },
+        ];
+        for outcome in outcomes {
+            let expected = match &outcome {
+                CommittedPersistenceRef::SkippedSilent {
+                    range,
+                    frames,
+                    losses,
+                } => PersistenceOutcomeResponse::SkippedSilent {
+                    start_frame: range.start,
+                    end_frame: range.end,
+                    frames: *frames,
+                    duration_seconds: 0.1,
+                    lost_frames: losses.lost_frames(),
+                    retention_lost_frames: losses.retention_lost_frames,
+                    cleared_frames: losses.cleared_frames,
+                    capture_dropped_frames: losses.capture_dropped_frames,
+                },
+                CommittedPersistenceRef::SkippedByPolicy {
+                    range,
+                    frames,
+                    losses,
+                } => PersistenceOutcomeResponse::SkippedByPolicy {
+                    start_frame: range.start,
+                    end_frame: range.end,
+                    frames: *frames,
+                    duration_seconds: 0.1,
+                    lost_frames: losses.lost_frames(),
+                    retention_lost_frames: losses.retention_lost_frames,
+                    cleared_frames: losses.cleared_frames,
+                    capture_dropped_frames: losses.capture_dropped_frames,
+                },
+                CommittedPersistenceRef::NoNewAudio { losses } => {
+                    PersistenceOutcomeResponse::NoNewAudio {
+                        lost_frames: losses.lost_frames(),
+                        retention_lost_frames: losses.retention_lost_frames,
+                        cleared_frames: losses.cleared_frames,
+                        capture_dropped_frames: losses.capture_dropped_frames,
+                    }
+                }
+                CommittedPersistenceRef::Written { .. } => unreachable!(),
+            };
+            let mut bytes = Vec::new();
+            write_persistence_response(&mut bytes, true, "persisted", &status, 100, outcome)
+                .unwrap();
+            assert_eq!(bytes.last(), Some(&b'\n'));
+            let response: ControlResponse = serde_json::from_slice(&bytes).unwrap();
+            assert!(response.ok);
+            assert_eq!(response.message, "persisted");
+            assert_eq!(response.status, Some(status.clone()));
+            assert_eq!(response.persistence_outcome.unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn borrowed_persistence_json_written_round_trips_canonical_multi_output_plan() {
+        let plan = SessionMemoryPlan::calculate(SessionMemoryInputs {
+            retention_frames: 8,
+            channels: 2,
+            sample_rate: 100,
+            sample_format: SampleFormat::F32Le,
+            chunk_frames: 8,
+            max_active_snapshots: 1,
+            sample_bytes: 4,
+            split_when_over_bytes: 1_000_000,
+            control_queue_capacity: 2,
+            worker_stack_bytes: 64 * 1024,
+            capture_queue_slots: 8,
+            capture_slot_frames: 8,
+            capture_worker_stack_bytes: 256 * 1024,
+            io_buffer_bytes_per_channel: 1024,
+            maximum_path_bytes: 256,
+            maximum_calibration_seconds: 0,
+            headroom: 1.0,
+        })
+        .unwrap();
+        let (arena, ingress) = CaptureArena::new(
+            &plan,
+            CaptureRuntimeConfig {
+                ring: RingConfig {
+                    channels: 2,
+                    sample_rate: 100,
+                    format: SampleFormat::F32Le,
+                    chunk_frames: 8,
+                    chunk_count: 1,
+                    max_active_snapshots: 1,
+                },
+                queue_slots: 8,
+                slot_frames: 8,
+                sample_bytes: 4,
+                worker_stack_bytes: 256 * 1024,
+            },
+        )
+        .unwrap();
+        ingress.try_push_interleaved(&[0.25; 8], 2).unwrap();
+        let mut workspace = PersistenceWorkspace::new(
+            &plan,
+            PersistenceWorkspaceConfig {
+                retention_frames: 8,
+                channels: 2,
+                sample_rate: 100,
+                sample_format: SampleFormat::F32Le,
+                chunk_frames: 8,
+                sample_bytes: 4,
+                split_when_over_bytes: 1_000_000,
+                io_buffer_bytes_per_channel: 1024,
+                maximum_path_bytes: 256,
+            },
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+        let policy = ResolvedExportPolicy::new(
+            output.clone(),
+            ResolvedLayout::FlatDetailed,
+            ResolvedActivityPolicy {
+                detector: ActivityDetectorKind::ExactZero,
+                channels: ["channel-0", "channel-1"]
+                    .map(|name| ChannelActivityPolicy {
+                        name: name.to_string(),
+                        mode: ChannelExportMode::Auto,
+                        threshold: None,
+                    })
+                    .to_vec(),
+                whole_export_exact_zero_gate: false,
+                trim_leading_silence: false,
+            },
+        )
+        .unwrap();
+        let coordinator =
+            DumpCoordinator::with_frozen_decision(FrozenExportDecision::new(&plan).unwrap());
+        coordinator
+            .persist_policy_with_delivery(
+                &arena,
+                &mut workspace,
+                PolicyPersistenceRequest {
+                    command: ExportCommand::Recall,
+                    policy: &policy,
+                    profile: "control-json",
+                    staging_root: &root.path().join("staging"),
+                    timestamp: "20260818T120000",
+                },
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                |outcome| {
+                    let CommittedPersistenceRef::Written {
+                        range,
+                        export_range,
+                        frames,
+                        losses,
+                        output: completed,
+                    } = outcome
+                    else {
+                        panic!("must write")
+                    };
+                    assert_eq!(completed.files.len(), 2);
+                    let expected_files: Vec<_> = completed
+                        .files
+                        .iter()
+                        .map(|file| file.final_path().to_path_buf())
+                        .collect();
+                    let mut bytes = Vec::new();
+                    write_persistence_response(
+                        &mut bytes,
+                        true,
+                        "written fixture",
+                        &persistence_status(),
+                        100,
+                        CommittedPersistenceRef::Written {
+                            range,
+                            export_range,
+                            frames,
+                            losses,
+                            output: completed,
+                        },
+                    )
+                    .unwrap();
+                    assert!(bytes.ends_with(b"\n"));
+                    let response: ControlResponse = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(response.threshold_report, None);
+                    assert_eq!(response.status, Some(persistence_status()));
+                    assert_eq!(response.message, "written fixture");
+                    assert_eq!(
+                        response.persistence_outcome,
+                        Some(PersistenceOutcomeResponse::Written {
+                            start_frame: 0,
+                            end_frame: 4,
+                            frames: 4,
+                            export_start_frame: 0,
+                            export_frames: 4,
+                            duration_seconds: 0.04,
+                            lost_frames: 0,
+                            retention_lost_frames: 0,
+                            cleared_frames: 0,
+                            capture_dropped_frames: 0,
+                            output_directory: output,
+                            files: expected_files
+                        })
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn borrowed_persistence_json_rejects_zero_rate_and_inconsistent_ranges() {
+        let mut bytes = Vec::new();
+        let zero_rate = write_persistence_response(
+            &mut bytes,
+            true,
+            "x",
+            &persistence_status(),
+            0,
+            CommittedPersistenceRef::NoNewAudio {
+                losses: LossBreakdown::default(),
+            },
+        )
+        .unwrap_err();
+        assert!(zero_rate.to_string().contains("sample rate"));
+        let bad_range = write_persistence_response(
+            &mut bytes,
+            true,
+            "x",
+            &persistence_status(),
+            100,
+            CommittedPersistenceRef::SkippedSilent {
+                range: FrameRange { start: 2, end: 3 },
+                frames: 2,
+                losses: LossBreakdown::default(),
+            },
+        )
+        .unwrap_err();
+        assert!(bad_range.to_string().contains("consumed range"));
+    }
 
     #[test]
     fn formats_written_persistence_outcome_with_paths_and_loss_warning() {

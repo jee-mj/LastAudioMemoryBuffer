@@ -12,13 +12,17 @@ use crate::capture_runtime::{
     DEFAULT_IO_BUFFER_BYTES_PER_CHANNEL, DEFAULT_MAXIMUM_PATH_BYTES, DEFAULT_WORKER_STACK_BYTES,
 };
 use crate::config::{self, LambConfig};
+#[cfg(test)]
+use crate::control::PersistenceOutcomeResponse;
 use crate::control::{
-    CalibrationEvaluation, CalibrationReportStatus, ConfiguredInputReport, ControlRequest,
-    ControlResponse, DaemonStatus, PersistenceOutcomeResponse, StoredThresholdReport,
+    write_persistence_response, CalibrationEvaluation, CalibrationReportStatus,
+    ConfiguredInputReport, ControlRequest, ControlResponse, DaemonStatus, StoredThresholdReport,
     ThresholdChannelReport, ThresholdReport, ThresholdRequest,
 };
 use crate::control_server::{spawn_operation_worker, EnqueueError, OperationLane};
-use crate::dump::{DumpCoordinator, DumpOutcome, PolicyPersistenceRequest};
+#[cfg(test)]
+use crate::dump::DumpOutcome;
+use crate::dump::{CommittedPersistenceRef, DumpCoordinator, PolicyPersistenceRequest};
 use crate::error::{io_error, LambError, Result};
 use crate::export_policy::{ExportCommand, ResolvedExportPolicy};
 use crate::persistence_workspace::PersistenceWorkspace;
@@ -36,7 +40,7 @@ const PERSIST_TIMEOUT: Duration = Duration::from_secs(60);
 const APP_STAGING_ROOT: &str = "/tmp/LAMB/staging";
 
 /// The preallocated persistence runtime shared by one capture session. The
-/// arena is `Arc`-shared so `status` stays responsive while `persist` serializes
+/// arena is `Arc`-shared so `status` stays responsive while persistence serializes
 /// on the workspace mutex; capture never touches either.
 struct CaptureSession {
     arena: Arc<crate::capture_arena::CaptureArena>,
@@ -100,6 +104,41 @@ impl CaptureSession {
         })
     }
 
+    fn persist_with_delivery<F>(
+        &self,
+        command: ExportCommand,
+        timestamp: &str,
+        deliver: F,
+    ) -> Result<()>
+    where
+        F: for<'view> FnOnce(CommittedPersistenceRef<'view>) -> Result<()>,
+    {
+        let policy = self
+            .policy
+            .lock()
+            .map_err(|_| LambError::Control("session export policy lock poisoned".to_string()))?;
+        let mut workspace = self
+            .workspace
+            .lock()
+            .map_err(|_| LambError::Control("persistence workspace lock poisoned".to_string()))?;
+        self.coordinator.persist_policy_with_delivery(
+            &self.arena,
+            &mut workspace,
+            PolicyPersistenceRequest {
+                command,
+                policy: &policy,
+                profile: &self.profile_name,
+                staging_root: Path::new(APP_STAGING_ROOT),
+                timestamp,
+            },
+            PERSIST_TIMEOUT,
+            PERSIST_TIMEOUT,
+            deliver,
+        )
+    }
+
+    /// Allocating compatibility adapter retained solely for legacy unit tests.
+    #[cfg(test)]
     fn persist(&self, command: ExportCommand, timestamp: &str) -> Result<DumpOutcome> {
         let policy = self
             .policy
@@ -446,9 +485,17 @@ fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
         DEFAULT_WORKER_STACK_BYTES as usize,
         {
             let ctx = Arc::clone(&ctx);
-            move |(request, stream): (ControlRequest, UnixStream)| {
-                let response = handle_request(&ctx, request);
-                let _ = write_response(stream, &response);
+            move |(request, stream): (ControlRequest, UnixStream)| match request {
+                ControlRequest::Recall => {
+                    legacy_persistence_delivery(&ctx, ExportCommand::Recall, stream)
+                }
+                ControlRequest::Dump => {
+                    legacy_persistence_delivery(&ctx, ExportCommand::Dump, stream)
+                }
+                request => {
+                    let response = handle_request(&ctx, request);
+                    let _ = write_response(stream, &response);
+                }
             }
         },
         {
@@ -647,8 +694,18 @@ where
             let ctx = Arc::clone(&ctx);
             move |(request, stream): (ControlRequest, UnixStream)| {
                 before_operation(&request);
-                let response = handle_idle_request(&ctx, request);
-                let _ = write_response(stream, &response);
+                match request {
+                    ControlRequest::Recall => {
+                        app_persistence_delivery(&ctx, ExportCommand::Recall, stream)
+                    }
+                    ControlRequest::Dump => {
+                        app_persistence_delivery(&ctx, ExportCommand::Dump, stream)
+                    }
+                    request => {
+                        let response = handle_idle_request(&ctx, request);
+                        let _ = write_response(stream, &response);
+                    }
+                }
             }
         },
         {
@@ -918,9 +975,9 @@ fn handle_idle_request(ctx: &IdleDaemonContext, request: ControlRequest) -> Cont
                 threshold_report: None,
             }
         }
-        ControlRequest::Recall => handle_app_recall(ctx),
+        ControlRequest::Recall => persistence_delivery_only_response(idle_status_response(ctx)),
         ControlRequest::Clear => handle_app_clear(ctx),
-        ControlRequest::Dump => handle_app_dump(ctx),
+        ControlRequest::Dump => persistence_delivery_only_response(idle_status_response(ctx)),
         ControlRequest::Reload => match reload_app_config(ctx) {
             Ok(()) => ControlResponse {
                 ok: true,
@@ -1079,7 +1136,7 @@ fn validate_runtime_environment(cfg: &LambConfig) -> Result<()> {
 
 fn handle_request(ctx: &DaemonContext, request: ControlRequest) -> ControlResponse {
     match request {
-        ControlRequest::Recall => handle_recall(ctx),
+        ControlRequest::Recall => persistence_delivery_only_response(status_response(ctx)),
         ControlRequest::Clear => match ctx.session.clear() {
             Ok(()) => ControlResponse {
                 ok: true,
@@ -1099,7 +1156,7 @@ fn handle_request(ctx: &DaemonContext, request: ControlRequest) -> ControlRespon
                 }
             }
         },
-        ControlRequest::Dump => handle_dump(ctx),
+        ControlRequest::Dump => persistence_delivery_only_response(status_response(ctx)),
         ControlRequest::Status => ControlResponse {
             ok: true,
             message: "status".to_string(),
@@ -1186,6 +1243,16 @@ fn status_response(ctx: &DaemonContext) -> DaemonStatus {
     }
 }
 
+fn persistence_delivery_only_response(status: DaemonStatus) -> ControlResponse {
+    ControlResponse {
+        ok: false,
+        message: "persistence commands require operation-worker delivery".to_string(),
+        status: Some(status),
+        persistence_outcome: None,
+        threshold_report: None,
+    }
+}
+
 fn status_resolved_target(ctx: &DaemonContext) -> Option<String> {
     if let Some(target) = ctx.resolved_target.as_ref() {
         return Some(match target.id {
@@ -1202,18 +1269,82 @@ fn set_last_error(ctx: &DaemonContext, message: String) {
     }
 }
 
+fn legacy_persistence_delivery(
+    ctx: &DaemonContext,
+    command: ExportCommand,
+    mut stream: UnixStream,
+) {
+    let timestamp = iso8601_compact_label();
+    let mut entered = false;
+    let result = ctx
+        .session
+        .persist_with_delivery(command, &timestamp, |outcome| {
+            entered = true;
+            let status = status_response(ctx);
+            let message = persistence_message_from_committed(&outcome);
+            write_persistence_response(
+                &mut stream,
+                true,
+                &message,
+                &status,
+                ctx.session.sample_rate,
+                outcome,
+            )
+        });
+    if let Err(error) = result {
+        set_last_error(ctx, error.to_string());
+        if !entered {
+            let response = ControlResponse {
+                ok: false,
+                message: error.to_string(),
+                status: Some(status_response(ctx)),
+                persistence_outcome: None,
+                threshold_report: None,
+            };
+            let _ = write_response(stream, &response);
+        }
+    }
+}
+
+fn persistence_message_from_committed(outcome: &CommittedPersistenceRef<'_>) -> String {
+    match outcome {
+        CommittedPersistenceRef::Written { frames, losses, .. } => {
+            persistence_message("written", *frames, losses.lost_frames())
+        }
+        CommittedPersistenceRef::SkippedSilent { frames, losses, .. } => {
+            persistence_message("skipped exact-zero audio", *frames, losses.lost_frames())
+        }
+        CommittedPersistenceRef::SkippedByPolicy { frames, losses, .. } => {
+            persistence_message("skipped by policy", *frames, losses.lost_frames())
+        }
+        CommittedPersistenceRef::NoNewAudio { losses } if losses.lost_frames() == 0 => {
+            "no new audio".to_string()
+        }
+        CommittedPersistenceRef::NoNewAudio { losses } => format!(
+            "no new audio; warning: {} frames lost before persistence",
+            losses.lost_frames()
+        ),
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 fn handle_dump(ctx: &DaemonContext) -> ControlResponse {
     let timestamp = iso8601_compact_label();
     let result = ctx.session.persist(ExportCommand::Dump, &timestamp);
     legacy_persistence_response(ctx, result)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn handle_recall(ctx: &DaemonContext) -> ControlResponse {
     let timestamp = iso8601_compact_label();
     let result = ctx.session.persist(ExportCommand::Recall, &timestamp);
     legacy_persistence_response(ctx, result)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn legacy_persistence_response(
     ctx: &DaemonContext,
     result: Result<DumpOutcome>,
@@ -2322,6 +2453,62 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn app_persistence_delivery(
+    ctx: &IdleDaemonContext,
+    command: ExportCommand,
+    mut stream: UnixStream,
+) {
+    let session = match ctx.runtime.lock() {
+        Ok(runtime) => runtime.session.clone(),
+        Err(error) => {
+            drop(error.into_inner());
+            let response = app_lock_error_response(ctx);
+            let _ = write_response(stream, &response);
+            return;
+        }
+    };
+    let Some(session) = session else {
+        let response = ControlResponse {
+            ok: false,
+            message: "capture is not running".to_string(),
+            status: Some(idle_status_response(ctx)),
+            persistence_outcome: None,
+            threshold_report: None,
+        };
+        let _ = write_response(stream, &response);
+        return;
+    };
+    let timestamp = iso8601_compact_label();
+    let mut entered = false;
+    let result = session.persist_with_delivery(command, &timestamp, |outcome| {
+        entered = true;
+        let status = idle_status_response(ctx);
+        let message = persistence_message_from_committed(&outcome);
+        write_persistence_response(
+            &mut stream,
+            true,
+            &message,
+            &status,
+            session.sample_rate,
+            outcome,
+        )
+    });
+    if let Err(error) = result {
+        set_app_last_error(ctx, error.to_string());
+        if !entered {
+            let response = ControlResponse {
+                ok: false,
+                message: error.to_string(),
+                status: Some(idle_status_response(ctx)),
+                persistence_outcome: None,
+                threshold_report: None,
+            };
+            let _ = write_response(stream, &response);
+        }
+    }
+}
+
+#[cfg(test)]
 fn handle_app_recall(ctx: &IdleDaemonContext) -> ControlResponse {
     let session = match ctx.runtime.lock() {
         Ok(runtime) => runtime.session.clone(),
@@ -2383,6 +2570,7 @@ fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
     }
 }
 
+#[cfg(test)]
 fn handle_app_dump(ctx: &IdleDaemonContext) -> ControlResponse {
     let session = match ctx.runtime.lock() {
         Ok(runtime) => runtime.session.clone(),
@@ -2406,6 +2594,7 @@ fn handle_app_dump(ctx: &IdleDaemonContext) -> ControlResponse {
     app_persistence_response(ctx, result, session.sample_rate)
 }
 
+#[cfg(test)]
 fn app_persistence_response(
     ctx: &IdleDaemonContext,
     result: Result<DumpOutcome>,
@@ -2426,6 +2615,7 @@ fn app_persistence_response(
     }
 }
 
+#[cfg(test)]
 fn persistence_response(
     outcome: DumpOutcome,
     sample_rate: u32,
