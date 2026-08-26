@@ -4699,6 +4699,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(session.calibration_sample_frames, 3_000);
+        assert_eq!(&*session.policy.lock().unwrap(), &profile.export_policy);
         assert_eq!(session.configured_inputs[0].name, "right");
         assert_eq!(session.configured_inputs[1].name, "left");
         assert_eq!(
