@@ -1340,7 +1340,12 @@ fn common_crop_wavs_preserve_staggered_onsets_and_untrimmed_tail() {
             u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
             ENCODED_FRAMES as u32 * 3
         );
-        let decoded: Vec<_> = bytes[44..].chunks_exact(3).map(s24).collect();
+        let decoded: Vec<_> = bytes[44..]
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|sample| s24(sample))
+            .collect();
         assert_eq!(decoded.len(), ENCODED_FRAMES as usize);
         assert!(decoded[..expected_onset as usize]
             .iter()

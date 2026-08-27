@@ -2069,8 +2069,8 @@ fn validate_wav(path: &Path, rate: u32, frames: u64) -> Result<f32> {
             .map_err(|_| LambError::Validation("WAV payload length overflow".into()))?;
         file.read_exact(&mut payload[..chunk_len])
             .map_err(|e| io_error(path, e))?;
-        for bytes in payload[..chunk_len].chunks_exact(4) {
-            let sample = f32::from_le_bytes(bytes.try_into().expect("four-byte WAV sample"));
+        for bytes in payload[..chunk_len].as_chunks::<4>().0 {
+            let sample = f32::from_le_bytes(*bytes);
             if !sample.is_finite() {
                 return Err(LambError::Validation(
                     "calibration WAV contains a non-finite sample".into(),

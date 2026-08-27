@@ -85,7 +85,9 @@ fn wav_s24(path: &Path) -> Vec<i32> {
     assert_eq!(u16::from_le_bytes(bytes[34..36].try_into().unwrap()), 24);
     assert_eq!(&bytes[36..40], b"data");
     bytes[44..]
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|sample| {
             let sign = if sample[2] & 0x80 == 0 { 0 } else { 0xff };
             i32::from_le_bytes([sample[0], sample[1], sample[2], sign])
