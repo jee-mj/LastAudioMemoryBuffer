@@ -14,9 +14,10 @@ use lamb::capture_arena::{CaptureArena, CaptureRuntimeConfig};
 use lamb::capture_runtime::DEFAULT_MAXIMUM_PATH_BYTES;
 use lamb::control::{
     send_request, write_persistence_response, CalibrationEvaluation, CalibrationReportStatus,
-    ConfiguredInputReport, ControlRequest, ControlResponse, DaemonStatus,
-    PersistenceClientResponseSeed, PersistenceOutcomeResponse, StoredThresholdReport,
-    ThresholdChannelReport, ThresholdReport, ThresholdRequest,
+    CaptureState, ConfiguredInputReport, ControlRequest, ControlResponse, DaemonLifecycleStatus,
+    DaemonState, DaemonStatus, ErrorClass, PersistenceClientResponseSeed,
+    PersistenceOutcomeResponse, RetryPolicy, StoredThresholdReport, ThresholdChannelReport,
+    ThresholdReport, ThresholdRequest,
 };
 use lamb::dump::{CommittedPersistenceRef, DumpCoordinator, PolicyPersistenceRequest};
 use lamb::export_policy::{
@@ -153,6 +154,7 @@ fn threshold_report_is_optional_for_legacy_response_compatibility() {
         ok: true,
         message: "threshold updated".to_string(),
         status: None,
+        error_context: lamb::control::ControlErrorContext::default(),
         persistence_outcome: None,
         threshold_report: Some(report.clone()),
     };
@@ -161,6 +163,60 @@ fn threshold_report_is_optional_for_legacy_response_compatibility() {
             .unwrap(),
         response
     );
+}
+
+#[test]
+fn supervisor_status_wire_golden_includes_legacy_and_additive_fields() {
+    let status = DaemonStatus {
+        state: "waiting-for-device".to_string(),
+        active_export_count: 0,
+        pending_recall_count: 0,
+        buffer_capacity_seconds: 0.0,
+        retained_seconds: 0.0,
+        dropped_frames: 0,
+        target: Some("studio-input".to_string()),
+        resolved_target: None,
+        sample_rate: 0,
+        channel_count: 0,
+        format: "F32LE".to_string(),
+        last_error: Some("selected target is missing".to_string()),
+        lifecycle: DaemonLifecycleStatus {
+            daemon_state: DaemonState::Degraded,
+            capture_state: CaptureState::WaitingForDevice,
+            error_class: Some(ErrorClass::Transient),
+            last_error: Some("selected target is missing".to_string()),
+            retry_policy: RetryPolicy::BoundedBackoff,
+            retry_attempt: 3,
+            next_retry_at: Some(1_700_000_005),
+            active_profile: Some("studio".to_string()),
+            resolved_target: None,
+        },
+    };
+
+    assert_eq!(
+        serde_json::to_string(&status).unwrap(),
+        r#"{"state":"waiting-for-device","active_export_count":0,"pending_recall_count":0,"buffer_capacity_seconds":0.0,"retained_seconds":0.0,"dropped_frames":0,"target":"studio-input","resolved_target":null,"sample_rate":0,"channel_count":0,"format":"F32LE","last_error":"selected target is missing","daemonState":"degraded","captureState":"waiting-for-device","errorClass":"transient","lastError":"selected target is missing","retryPolicy":"bounded-backoff","retryAttempt":3,"nextRetryAt":1700000005,"activeProfile":"studio","resolvedTarget":null}"#
+    );
+}
+
+#[test]
+fn legacy_status_wire_deserializes_with_additive_defaults() {
+    let old = r#"{"state":"capturing","active_export_count":0,"pending_recall_count":0,"buffer_capacity_seconds":5.0,"retained_seconds":2.5,"dropped_frames":7,"target":"studio-input","resolved_target":"fake","sample_rate":48000,"channel_count":2,"format":"F32LE","last_error":null}"#;
+    let status: DaemonStatus = serde_json::from_str(old).unwrap();
+
+    assert_eq!(status.state, "capturing");
+    assert_eq!(status.active_export_count, 0);
+    assert_eq!(status.pending_recall_count, 0);
+    assert_eq!(status.buffer_capacity_seconds, 5.0);
+    assert_eq!(status.retained_seconds, 2.5);
+    assert_eq!(status.dropped_frames, 7);
+    assert_eq!(status.target.as_deref(), Some("studio-input"));
+    assert_eq!(status.resolved_target.as_deref(), Some("fake"));
+    assert_eq!(status.sample_rate, 48_000);
+    assert_eq!(status.channel_count, 2);
+    assert_eq!(status.format, "F32LE");
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.lifecycle, DaemonLifecycleStatus::default());
 }
 
 #[test]
@@ -212,6 +268,7 @@ fn persistence_written_response_round_trips_with_source_frame_metadata() {
         ok: true,
         message: "written".to_string(),
         status: None,
+        error_context: lamb::control::ControlErrorContext::default(),
         persistence_outcome: Some(PersistenceOutcomeResponse::Written {
             start_frame: 100,
             end_frame: 350,
@@ -242,6 +299,7 @@ fn persistence_non_written_responses_round_trip_as_successes() {
             ok: true,
             message: "skipped silent".to_string(),
             status: None,
+            error_context: lamb::control::ControlErrorContext::default(),
             persistence_outcome: Some(PersistenceOutcomeResponse::SkippedSilent {
                 start_frame: 350,
                 end_frame: 450,
@@ -258,6 +316,7 @@ fn persistence_non_written_responses_round_trip_as_successes() {
             ok: true,
             message: "no new audio".to_string(),
             status: None,
+            error_context: lamb::control::ControlErrorContext::default(),
             persistence_outcome: Some(PersistenceOutcomeResponse::NoNewAudio {
                 lost_frames: 0,
                 retention_lost_frames: 0,
@@ -334,6 +393,7 @@ fn streaming_response_fixture(file_count: usize) -> (Vec<u8>, Vec<u8>) {
         ok: true,
         message: "written fixture".to_string(),
         status: None,
+        error_context: lamb::control::ControlErrorContext::default(),
         persistence_outcome: Some(PersistenceOutcomeResponse::Written {
             start_frame: 100,
             end_frame: 350,
@@ -560,6 +620,7 @@ fn response_allocation_measurement(
                             channel_count: CHANNELS,
                             format: "F32LE".to_string(),
                             last_error: None,
+                            lifecycle: lamb::control::DaemonLifecycleStatus::default(),
                         };
                         write_persistence_response(
                             &mut io::sink(),
@@ -1211,7 +1272,7 @@ splitWhenOverBytes = 3900000000
 }
 
 #[test]
-fn tight_memory_max_fails_before_capture_or_socket_startup() {
+fn tight_memory_max_is_inspectable_without_capture_allocation() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("control.sock");
     let out = temp.path().join("out");
@@ -1253,25 +1314,45 @@ splitWhenOverBytes = 3900000000
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_lamb"))
+    let exe = env!("CARGO_BIN_EXE_lamb");
+    let mut child = Command::new(exe)
         .arg("daemon")
         .arg("--config")
         .arg(&config)
         .env("LAMB_SKIP_RUNTIME_VALIDATION", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_socket(&mut child, &socket);
+
+    let status = Command::new(exe)
+        .arg("status")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
         .output()
         .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["daemonState"], "degraded");
+    assert_eq!(status["captureState"], "faulted");
+    assert_eq!(status["errorClass"], "permanent");
+    assert_eq!(status["retryPolicy"], "manual");
+    assert_eq!(status["retryAttempt"], 0);
+    assert_eq!(status["nextRetryAt"], serde_json::Value::Null);
+    assert_eq!(status["sample_rate"], 0);
+    assert_eq!(status["channel_count"], 0);
+    assert!(status["lastError"].as_str().unwrap().contains("memory"));
+    assert!(child.try_wait().unwrap().is_none());
 
-    assert!(
-        !output.status.success(),
-        "daemon should refuse a plan that exceeds memory.max"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("memory"),
-        "startup error should mention memory, got: {stderr}"
-    );
-    assert!(
-        !socket.exists(),
-        "control socket must not be created when memory validation fails"
-    );
+    let stop = Command::new(exe)
+        .arg("stop")
+        .arg("--socket")
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert!(stop.status.success());
+    assert!(child.wait().unwrap().success());
+    assert!(!socket.exists());
 }

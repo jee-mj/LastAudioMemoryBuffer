@@ -144,6 +144,51 @@ fn pipewire_ports_derive_ordered_channels_and_names() {
 }
 
 #[test]
+fn parse_retains_socket_before_static_conflict_is_reported() {
+    let text = r#"
+configVersion = 1
+user = "test"
+backend = "pipewire"
+target = "studio-input"
+channels = 4
+capturePorts = [
+  { source = "capture_AUX0", name = "mic" },
+  { source = "capture_AUX1", name = "gtr" },
+]
+seconds = 30
+sampleRate = 48000
+sampleFormat = "F32LE"
+dontRemix = true
+outputDir = "/tmp/lamb-out"
+maxActiveSnapshots = 1
+allowQueuedRecall = false
+controlSocketPath = "/tmp/lamb-invalid.sock"
+controlPermissions = "0600"
+
+[memory]
+headroom = 1.2
+
+[export]
+mode = "per-channel"
+format = "wav"
+splitWhenOverBytes = 1073741824
+"#;
+    let path = std::path::Path::new("legacy.toml");
+    let parsed = lamb::config::parse_config_text(path, text).unwrap();
+
+    assert_eq!(
+        parsed.control_socket_path,
+        std::path::PathBuf::from("/tmp/lamb-invalid.sock")
+    );
+    assert!(parsed
+        .validate_static()
+        .unwrap_err()
+        .to_string()
+        .contains("channels conflicts with capturePorts"));
+    assert!(lamb::config::load_config_text(path, text).is_err());
+}
+
+#[test]
 fn toml_config_without_consent_loads() {
     let temp = tempfile::tempdir().unwrap();
     let output_dir = temp.path().join("out");

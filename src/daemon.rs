@@ -3,8 +3,11 @@ use crate::calibration::{ConfiguredInputIdentity, ResolvedLiveInputIdentity};
 use crate::capture_arena::CaptureArenaStatus;
 use crate::capture_fake::FakeCapture;
 use crate::capture_jack::{JackCapture, JackCaptureConfig};
+#[cfg(test)]
+use crate::capture_pipewire::ResolvedSourcePort;
 use crate::capture_pipewire::{
-    PipeWireCapture, PipeWireCaptureConfig, PipeWireHealth, ResolvedTarget,
+    PipeWireCapture, PipeWireCaptureConfig, PipeWireHealth, PipeWireStartupError, ResolvedTarget,
+    TargetResolutionError,
 };
 use crate::capture_runtime::{
     CaptureRuntime, CaptureRuntimeParams, DEFAULT_CAPTURE_QUEUE_SLOTS,
@@ -15,11 +18,16 @@ use crate::config::{self, LambConfig};
 #[cfg(test)]
 use crate::control::PersistenceOutcomeResponse;
 use crate::control::{
-    write_persistence_response, CalibrationEvaluation, CalibrationReportStatus,
-    ConfiguredInputReport, ControlRequest, ControlResponse, DaemonStatus, StoredThresholdReport,
-    ThresholdChannelReport, ThresholdReport, ThresholdRequest,
+    write_persistence_response, CalibrationEvaluation, CalibrationReportStatus, CaptureState,
+    ConfiguredInputReport, ControlRequest, ControlResponse, DaemonState, DaemonStatus, ErrorClass,
+    RetryPolicy, StoredThresholdReport, ThresholdChannelReport, ThresholdReport, ThresholdRequest,
 };
 use crate::control_server::{spawn_operation_worker, EnqueueError, OperationLane};
+use crate::daemon_lifecycle::{
+    spawn_retry_scheduler, CaptureAttemptId, LifecycleState, RetryClock, RetryInstant,
+    RetrySchedulerHandle, RuntimeCaptureFault, RuntimeFaultSink, ScheduledOperation,
+    SystemRetryClock,
+};
 #[cfg(test)]
 use crate::dump::DumpOutcome;
 use crate::dump::{CommittedPersistenceRef, DumpCoordinator, PolicyPersistenceRequest};
@@ -29,15 +37,54 @@ use crate::persistence_workspace::PersistenceWorkspace;
 use crate::profile;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PERSIST_TIMEOUT: Duration = Duration::from_secs(60);
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const APP_STAGING_ROOT: &str = "/tmp/LAMB/staging";
+static NEXT_CAPTURE_ATTEMPT_ID: AtomicU64 = AtomicU64::new(0);
+
+fn allocate_capture_attempt_id() -> std::result::Result<CaptureAttemptId, CaptureAttemptError> {
+    NEXT_CAPTURE_ATTEMPT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .and_then(CaptureAttemptId::checked_after)
+        .ok_or_else(|| CaptureAttemptError {
+            class: ErrorClass::Fatal,
+            capture_state: CaptureState::Faulted,
+            message: "capture attempt identity overflow".to_string(),
+        })
+}
+
+#[cfg(test)]
+static AFTER_START_CONFIG_PERSIST_HOOK: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> =
+    Mutex::new(None);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalMutationKind {
+    LegacySuccess,
+    AppSuccess,
+    Failure,
+    StopCapture,
+    RunningStartNoop,
+    PersistenceAdmission,
+}
+
+#[cfg(test)]
+struct FinalMutationPause {
+    kind: FinalMutationKind,
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
 
 /// The preallocated persistence runtime shared by one capture session. The
 /// arena is `Arc`-shared so `status` stays responsive while persistence serializes
@@ -53,6 +100,10 @@ struct CaptureSession {
     configured_inputs: Vec<ConfiguredInputIdentity>,
     resolved_live_inputs: Vec<Option<ResolvedLiveInputIdentity>>,
     calibration_sample_frames: u64,
+    #[cfg(test)]
+    attempt_resource_probes: Vec<Box<dyn Send + Sync>>,
+    #[cfg(test)]
+    status_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 struct SessionCalibrationTarget {
@@ -66,29 +117,62 @@ struct SessionCalibrationTarget {
 }
 
 impl CaptureSession {
+    fn from_legacy_runtime(
+        runtime: CaptureRuntime,
+        prepared: &PreparedLegacyConfig,
+        resolved: &ResolvedCaptureState,
+        channel_names: Vec<String>,
+    ) -> Self {
+        let _ = channel_names;
+        Self {
+            arena: Arc::new(runtime.arena),
+            workspace: Mutex::new(runtime.workspace),
+            coordinator: Arc::new(DumpCoordinator::with_frozen_decision(
+                runtime.frozen_export_decision,
+            )),
+            sample_rate: resolved.sample_rate,
+            channel_count: resolved.channel_count,
+            profile_name: "legacy".to_string(),
+            policy: Mutex::new(prepared.session_export_policy.clone()),
+            configured_inputs: Vec::new(),
+            resolved_live_inputs: Vec::new(),
+            calibration_sample_frames: 0,
+            #[cfg(test)]
+            attempt_resource_probes: Vec::new(),
+            #[cfg(test)]
+            status_hook: None,
+        }
+    }
+
+    #[cfg(test)]
     fn from_app_runtime(
         runtime: CaptureRuntime,
         profile: &profile::ResolvedProfile,
         sample_rate: u32,
         resolved_live_inputs: Vec<Option<ResolvedLiveInputIdentity>>,
     ) -> Result<Self> {
-        let configured_inputs = configured_identities(profile)?;
-        let channel_count = u32::try_from(profile.ports.len())
-            .map_err(|_| LambError::Capture("profile channel count exceeds u32".to_string()))?;
-        if configured_inputs.len() != resolved_live_inputs.len()
-            || configured_inputs.len() != profile.ports.len()
-            || channel_count == 0
-            || configured_inputs
-                .iter()
-                .zip(&resolved_live_inputs)
-                .any(|(configured, live)| !session_input_is_coherent(configured, live.as_ref()))
-        {
-            return Err(LambError::Capture(
-                "configured and resolved session input ordering is incoherent".to_string(),
-            ));
-        }
+        let (configured_inputs, channel_count) =
+            validate_app_session_inputs(profile, &resolved_live_inputs)?;
+        Ok(Self::from_validated_app_runtime(
+            runtime,
+            profile,
+            sample_rate,
+            configured_inputs,
+            resolved_live_inputs,
+            channel_count,
+        ))
+    }
+
+    fn from_validated_app_runtime(
+        runtime: CaptureRuntime,
+        profile: &profile::ResolvedProfile,
+        sample_rate: u32,
+        configured_inputs: Vec<ConfiguredInputIdentity>,
+        resolved_live_inputs: Vec<Option<ResolvedLiveInputIdentity>>,
+        channel_count: u32,
+    ) -> Self {
         let calibration_sample_frames = runtime.calibration_sample_frames();
-        Ok(Self {
+        Self {
             arena: Arc::new(runtime.arena),
             workspace: Mutex::new(runtime.workspace),
             coordinator: Arc::new(DumpCoordinator::with_frozen_decision(
@@ -101,7 +185,11 @@ impl CaptureSession {
             configured_inputs,
             resolved_live_inputs,
             calibration_sample_frames,
-        })
+            #[cfg(test)]
+            attempt_resource_probes: Vec::new(),
+            #[cfg(test)]
+            status_hook: None,
+        }
     }
 
     fn persist_with_delivery<F>(
@@ -168,6 +256,10 @@ impl CaptureSession {
     }
 
     fn status(&self) -> Result<CaptureArenaStatus> {
+        #[cfg(test)]
+        if let Some(hook) = self.status_hook.as_ref() {
+            hook();
+        }
         self.arena.status(PERSIST_TIMEOUT)
     }
 
@@ -189,6 +281,28 @@ impl CaptureSession {
         log_recovery_summary(&summary);
         summary
     }
+}
+
+fn validate_app_session_inputs(
+    profile: &profile::ResolvedProfile,
+    resolved_live_inputs: &[Option<ResolvedLiveInputIdentity>],
+) -> Result<(Vec<ConfiguredInputIdentity>, u32)> {
+    let configured_inputs = configured_identities(profile)?;
+    let channel_count = u32::try_from(profile.ports.len())
+        .map_err(|_| LambError::Capture("profile channel count exceeds u32".to_string()))?;
+    if configured_inputs.len() != resolved_live_inputs.len()
+        || configured_inputs.len() != profile.ports.len()
+        || channel_count == 0
+        || configured_inputs
+            .iter()
+            .zip(resolved_live_inputs)
+            .any(|(configured, live)| !session_input_is_coherent(configured, live.as_ref()))
+    {
+        return Err(LambError::Capture(
+            "configured and resolved session input ordering is incoherent".to_string(),
+        ));
+    }
+    Ok((configured_inputs, channel_count))
 }
 
 fn session_input_is_coherent(
@@ -264,6 +378,319 @@ fn legacy_runtime_params(cfg: &LambConfig) -> CaptureRuntimeParams {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PreparedLegacyConfig {
+    static_config: Arc<LambConfig>,
+    session_export_policy: ResolvedExportPolicy,
+    runtime_params: CaptureRuntimeParams,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedCaptureState {
+    channel_count: u32,
+    sample_rate: u32,
+    resolved_target: Option<String>,
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing the PipeWire resolution payload would complicate capture-start ownership"
+)]
+enum ResolvedLegacyBackend {
+    Fake,
+    PipeWire {
+        config: PipeWireCaptureConfig,
+        target: ResolvedTarget,
+    },
+}
+
+struct ResolvedLegacyCapture {
+    state: ResolvedCaptureState,
+    channel_names: Vec<String>,
+    backend: ResolvedLegacyBackend,
+}
+
+fn prepare_legacy_config(cfg: LambConfig) -> Result<PreparedLegacyConfig> {
+    cfg.validate_static()?;
+    let channel_count = match cfg.backend.as_str() {
+        "pipewire" => u32::try_from(cfg.resolved_capture_ports()?.len()).map_err(|_| {
+            LambError::Validation("capturePorts exceeds supported channel count".to_string())
+        })?,
+        "fake" => cfg.channels.unwrap_or(2),
+        backend => {
+            return Err(LambError::Validation(format!(
+                "unsupported legacy backend {backend}"
+            )))
+        }
+    };
+    let runtime_params = legacy_runtime_params(&cfg);
+    CaptureRuntime::validate_plan(runtime_params, cfg.sample_rate, channel_count)?;
+    let session_export_policy = cfg.resolved_session_export_policy()?;
+    Ok(PreparedLegacyConfig {
+        static_config: Arc::new(cfg),
+        session_export_policy,
+        runtime_params,
+    })
+}
+
+fn resolve_legacy_capture_with<F>(
+    prepared: &PreparedLegacyConfig,
+    resolve_pipewire: F,
+) -> Result<ResolvedLegacyCapture>
+where
+    F: FnOnce(&PipeWireCaptureConfig) -> Result<ResolvedTarget>,
+{
+    let cfg = prepared.static_config.as_ref();
+    match cfg.backend.as_str() {
+        "fake" => Ok(ResolvedLegacyCapture {
+            state: ResolvedCaptureState {
+                channel_count: cfg.channels.unwrap_or(2),
+                sample_rate: cfg.sample_rate,
+                resolved_target: Some(cfg.backend.clone()),
+            },
+            channel_names: cfg.channel_map.clone().unwrap_or_default(),
+            backend: ResolvedLegacyBackend::Fake,
+        }),
+        "pipewire" => {
+            let config = PipeWireCaptureConfig::from_lamb_config(cfg)?;
+            let channel_names = config.channel_names();
+            let target = resolve_pipewire(&config)?;
+            let resolved_target = Some(match target.id {
+                Some(id) => format!("{} ({id})", target.name),
+                None => target.name.clone(),
+            });
+            Ok(ResolvedLegacyCapture {
+                state: ResolvedCaptureState {
+                    channel_count: target.channels,
+                    sample_rate: target.sample_rate,
+                    resolved_target,
+                },
+                channel_names,
+                backend: ResolvedLegacyBackend::PipeWire { config, target },
+            })
+        }
+        backend => Err(LambError::Validation(format!(
+            "unsupported legacy backend {backend}"
+        ))),
+    }
+}
+
+#[allow(dead_code)]
+fn resolve_legacy_capture(prepared: &PreparedLegacyConfig) -> Result<ResolvedLegacyCapture> {
+    resolve_legacy_capture_with(prepared, crate::capture_pipewire::resolve_target)
+}
+
+#[cfg(test)]
+fn start_legacy_capture_with<R, S, T>(
+    prepared: &PreparedLegacyConfig,
+    resolve_pipewire: R,
+    start_resolved: S,
+) -> Result<T>
+where
+    R: FnOnce(&PipeWireCaptureConfig) -> Result<ResolvedTarget>,
+    S: FnOnce(&PreparedLegacyConfig, ResolvedLegacyCapture) -> Result<T>,
+{
+    let resolved = resolve_legacy_capture_with(prepared, resolve_pipewire)?;
+    start_resolved(prepared, resolved)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureAttemptError {
+    class: ErrorClass,
+    capture_state: CaptureState,
+    message: String,
+}
+
+trait LegacyCaptureStarter: Send + Sync {
+    fn start(
+        &self,
+        prepared: &PreparedLegacyConfig,
+        _fault_sink: RuntimeFaultSink,
+    ) -> std::result::Result<ActiveCapture, CaptureAttemptError>;
+
+    fn prepare_app(
+        &self,
+        _profile: &profile::ResolvedProfile,
+        _params: CaptureRuntimeParams,
+        _fault_sink: RuntimeFaultSink,
+    ) -> std::result::Result<Option<PreparedAppCapture>, CaptureAttemptError> {
+        Ok(None)
+    }
+}
+
+struct PreparedAppCapture {
+    backend: CaptureBackend,
+    runtime: CaptureRuntime,
+    health: Option<PipeWireHealth>,
+    resolved_live_inputs: Vec<Option<ResolvedLiveInputIdentity>>,
+    session_resource_probes: Vec<Box<dyn Send + Sync>>,
+}
+
+struct RealLegacyCaptureStarter;
+
+impl LegacyCaptureStarter for RealLegacyCaptureStarter {
+    fn start(
+        &self,
+        prepared: &PreparedLegacyConfig,
+        fault_sink: RuntimeFaultSink,
+    ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+        if std::env::var_os("LAMB_SKIP_RUNTIME_VALIDATION").is_none() {
+            validate_runtime_environment(prepared.static_config.as_ref())
+                .map_err(classify_legacy_attempt_error)?;
+        }
+        start_legacy_capture(prepared, fault_sink)
+    }
+}
+
+struct ActiveCapture {
+    backend: Option<CaptureBackend>,
+    session: Option<Arc<CaptureSession>>,
+    health: Option<PipeWireHealth>,
+    resolved: ResolvedCaptureState,
+    #[cfg(test)]
+    backend_resource_probe: Option<Box<dyn Send + Sync>>,
+}
+
+impl Drop for ActiveCapture {
+    fn drop(&mut self) {
+        drop(self.backend.take());
+        #[cfg(test)]
+        drop(self.backend_resource_probe.take());
+        drop(self.session.take());
+    }
+}
+
+fn start_legacy_capture(
+    prepared: &PreparedLegacyConfig,
+    fault_sink: RuntimeFaultSink,
+) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+    if prepared.static_config.backend == "pipewire" {
+        return start_legacy_capture_with_pipewire_start(
+            prepared,
+            fault_sink,
+            crate::capture_pipewire::resolve_target_typed,
+            PipeWireCapture::start_with_resolved,
+        );
+    }
+    let resolved = resolve_legacy_capture_with(prepared, crate::capture_pipewire::resolve_target)
+        .map_err(classify_legacy_attempt_error)?;
+    start_resolved_legacy_capture(prepared, resolved, fault_sink)
+        .map_err(classify_legacy_attempt_error)
+}
+
+fn start_legacy_capture_with_pipewire_start<R, S>(
+    prepared: &PreparedLegacyConfig,
+    fault_sink: RuntimeFaultSink,
+    resolve: R,
+    start: S,
+) -> std::result::Result<ActiveCapture, CaptureAttemptError>
+where
+    R: FnOnce(&PipeWireCaptureConfig) -> std::result::Result<ResolvedTarget, TargetResolutionError>,
+    S: FnOnce(
+        PipeWireCaptureConfig,
+        ResolvedTarget,
+        CaptureRuntimeParams,
+        RuntimeFaultSink,
+    ) -> std::result::Result<(PipeWireCapture, CaptureRuntime), PipeWireStartupError>,
+{
+    let config = PipeWireCaptureConfig::from_lamb_config(prepared.static_config.as_ref())
+        .map_err(classify_legacy_attempt_error)?;
+    let channel_names = config.channel_names();
+    let target = resolve(&config).map_err(classify_pipewire_resolution_error)?;
+    let resolved_target = Some(match target.id {
+        Some(id) => format!("{} ({id})", target.name),
+        None => target.name.clone(),
+    });
+    eprintln!("lamb: {}", target.log_message());
+    let (capture, runtime) = start(config, target.clone(), prepared.runtime_params, fault_sink)
+        .map_err(|error| match error {
+            PipeWireStartupError::Resolution(error) => classify_pipewire_resolution_error(error),
+            PipeWireStartupError::Capture(error) => classify_legacy_attempt_error(error),
+        })?;
+    let health = Some(capture.health());
+    let session = Arc::new(CaptureSession::from_legacy_runtime(
+        runtime,
+        prepared,
+        &ResolvedCaptureState {
+            channel_count: target.channels,
+            sample_rate: target.sample_rate,
+            resolved_target: resolved_target.clone(),
+        },
+        channel_names.clone(),
+    ));
+    Ok(ActiveCapture {
+        backend: Some(CaptureBackend::PipeWire(capture, channel_names)),
+        session: Some(session),
+        health,
+        resolved: ResolvedCaptureState {
+            channel_count: target.channels,
+            sample_rate: target.sample_rate,
+            resolved_target,
+        },
+        #[cfg(test)]
+        backend_resource_probe: None,
+    })
+}
+
+fn start_resolved_legacy_capture(
+    prepared: &PreparedLegacyConfig,
+    resolved: ResolvedLegacyCapture,
+    fault_sink: RuntimeFaultSink,
+) -> Result<ActiveCapture> {
+    let state = resolved.state.clone();
+    let channel_names = resolved.channel_names;
+    let (backend, runtime) = match resolved.backend {
+        ResolvedLegacyBackend::Fake => {
+            let (runtime, ingress) = CaptureRuntime::build(
+                prepared.runtime_params,
+                state.sample_rate,
+                state.channel_count,
+            )?;
+            let capture = FakeCapture::start(
+                ingress,
+                state.channel_count,
+                prepared.static_config.chunk_frames.unwrap_or(25),
+            )?;
+            (
+                CaptureBackend::Fake(capture, channel_names.clone()),
+                runtime,
+            )
+        }
+        ResolvedLegacyBackend::PipeWire { config, target } => {
+            eprintln!("lamb: {}", target.log_message());
+            let (capture, runtime) = PipeWireCapture::start_with_resolved(
+                config,
+                target,
+                prepared.runtime_params,
+                fault_sink,
+            )
+            .map_err(PipeWireStartupError::into_lamb_error)?;
+            (
+                CaptureBackend::PipeWire(capture, channel_names.clone()),
+                runtime,
+            )
+        }
+    };
+    let health = match &backend {
+        CaptureBackend::PipeWire(capture, _) => Some(capture.health()),
+        _ => None,
+    };
+    let session = Arc::new(CaptureSession::from_legacy_runtime(
+        runtime,
+        prepared,
+        &state,
+        channel_names,
+    ));
+    Ok(ActiveCapture {
+        backend: Some(backend),
+        session: Some(session),
+        health,
+        resolved: state,
+        #[cfg(test)]
+        backend_resource_probe: None,
+    })
+}
+
 fn app_runtime_params(profile: &profile::ResolvedProfile) -> CaptureRuntimeParams {
     CaptureRuntimeParams {
         seconds: profile.buffer_seconds,
@@ -281,51 +708,134 @@ fn app_runtime_params(profile: &profile::ResolvedProfile) -> CaptureRuntimeParam
     }
 }
 
-pub fn run_from_config_path(path: &Path) -> Result<()> {
-    match fs::read_to_string(path) {
-        Ok(text) if is_legacy_runtime_config(&text) => {
-            let cfg = expand_runtime_paths(config::load_config_text(path, &text)?)?;
-            run_capture_config(cfg)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigFamily {
+    App,
+    Legacy,
+}
+
+struct BootstrapConfig {
+    config_path: PathBuf,
+    text: Option<String>,
+    family: ConfigFamily,
+    control_socket_path: PathBuf,
+}
+
+#[cfg_attr(
+    test,
+    expect(
+        clippy::large_enum_variant,
+        reason = "boxing prepared lifecycle state would risk late transaction ownership changes"
+    )
+)]
+enum PreparedBootstrap {
+    App(app_config::LoadedAppConfig),
+    Legacy(PreparedLegacyConfig),
+    #[cfg(test)]
+    TestAppCandidate {
+        candidate: AppRuntimeState,
+        entered: Option<Arc<std::sync::Barrier>>,
+        release: Option<Arc<std::sync::Barrier>>,
+    },
+    Faulted {
+        family: ConfigFamily,
+        fallback_app_config: app_config::AppConfig,
+        message: String,
+    },
+}
+
+fn bootstrap_config(path: &Path) -> Result<BootstrapConfig> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(LambError::non_restartable_bootstrap(io_error(path, source)));
         }
-        Ok(_) => run_app_config_idle_from_path(path),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            run_app_config_idle_from_path(path)
+    };
+    let parsed = text
+        .as_deref()
+        .and_then(|text| toml::from_str::<toml::Value>(text).ok());
+    let family = if parsed
+        .as_ref()
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("configVersion"))
+    {
+        ConfigFamily::Legacy
+    } else {
+        ConfigFamily::App
+    };
+    let socket_template = match (family, text.as_deref()) {
+        (ConfigFamily::Legacy, Some(_)) => parsed
+            .as_ref()
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get("controlSocketPath"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(app_config::default_control_socket_path),
+        (ConfigFamily::App, Some(text)) => app_config::parse_config_text(path, text)
+            .map(|cfg| cfg.daemon.control_socket_path)
+            .unwrap_or_else(|_| app_config::default_control_socket_path()),
+        (_, None) => app_config::default_control_socket_path(),
+    };
+    let control_socket_path = expand_control_socket_path(&socket_template)
+        .map_err(LambError::non_restartable_bootstrap)?;
+    Ok(BootstrapConfig {
+        config_path: path.to_path_buf(),
+        text,
+        family,
+        control_socket_path,
+    })
+}
+
+fn prepare_bootstrap_config(bootstrap: &BootstrapConfig) -> PreparedBootstrap {
+    match (bootstrap.family, bootstrap.text.as_deref()) {
+        (ConfigFamily::Legacy, Some(text)) => {
+            config::parse_config_text(&bootstrap.config_path, text)
+                .and_then(expand_runtime_paths)
+                .and_then(prepare_legacy_config)
+                .map(PreparedBootstrap::Legacy)
+                .unwrap_or_else(|error| PreparedBootstrap::Faulted {
+                    family: ConfigFamily::Legacy,
+                    fallback_app_config: app_config::AppConfig::default(),
+                    message: error.to_string(),
+                })
         }
-        Err(source) => Err(io_error(path, source)),
+        (ConfigFamily::App, Some(text)) => {
+            let loaded = match app_config::parse_config_text(&bootstrap.config_path, text) {
+                Ok(config) => app_config::LoadedAppConfig {
+                    config,
+                    state: ConfigLoadState::Loaded,
+                    error: None,
+                },
+                Err(error) => app_config::LoadedAppConfig {
+                    config: app_config::AppConfig::default(),
+                    state: ConfigLoadState::Invalid,
+                    error: Some(error.to_string()),
+                },
+            };
+            PreparedBootstrap::App(loaded)
+        }
+        (ConfigFamily::App, None) => PreparedBootstrap::App(app_config::LoadedAppConfig {
+            config: app_config::AppConfig::default(),
+            state: ConfigLoadState::Missing,
+            error: None,
+        }),
+        (ConfigFamily::Legacy, None) => PreparedBootstrap::Faulted {
+            family: ConfigFamily::Legacy,
+            fallback_app_config: app_config::AppConfig::default(),
+            message: format!("config file not found: {}", bootstrap.config_path.display()),
+        },
     }
 }
 
-fn run_app_config_idle_from_path(path: &Path) -> Result<()> {
-    let loaded = app_config::load_optional_config(path)?;
-    let calibration_root = crate::calibration::default_state_root()?;
-    if loaded.state == ConfigLoadState::Loaded {
-        match reconcile_startup_calibrations(&calibration_root, &loaded) {
-            Ok(pending) => {
-                for path in pending {
-                    eprintln!("lamb: calibration cleanup pending: {}", path.display());
-                }
-            }
-            Err(error) => eprintln!("lamb: calibration startup cleanup failed: {error}"),
-        }
-    }
-    match loaded.state {
-        ConfigLoadState::Loaded => run_app_config_daemon(path, loaded.config, calibration_root),
-        ConfigLoadState::Missing | ConfigLoadState::Invalid => {
-            let reason = match loaded.state {
-                ConfigLoadState::Missing => format!("config file not found: {}", path.display()),
-                ConfigLoadState::Invalid => loaded
-                    .error
-                    .unwrap_or_else(|| format!("invalid config file: {}", path.display())),
-                _ => unreachable!(),
-            };
-            run_idle_fallback(
-                path,
-                loaded.config.daemon.control_socket_path,
-                reason,
-                calibration_root,
-            )
-        }
-    }
+pub fn run_from_config_path(path: &Path) -> Result<()> {
+    let bootstrap = bootstrap_config(path)?;
+    let prepared = prepare_bootstrap_config(&bootstrap);
+    let socket = ControlSocketOwner::bind(bootstrap.control_socket_path.clone())
+        .map_err(LambError::non_restartable_bootstrap)?;
+    let ctx = build_idle_context(bootstrap, prepared)?;
+    attempt_configured_start(&ctx, &RealLegacyCaptureStarter)?;
+    run_idle_listener(ctx, socket)
 }
 
 fn reconcile_startup_calibrations(
@@ -339,30 +849,13 @@ fn reconcile_startup_calibrations(
     crate::calibration::CalibrationStore::cleanup_root(calibration_root, &referenced)
 }
 
-fn run_idle_fallback(
-    path: &Path,
-    socket_template: String,
-    reason: String,
-    calibration_root: PathBuf,
-) -> Result<()> {
-    let control_socket_path = expand_control_socket_path(&socket_template)?;
-    let listener = bind_control_socket(&control_socket_path)?;
-    run_idle_fallback_on_listener(
-        path.to_path_buf(),
-        control_socket_path,
-        reason,
-        calibration_root,
-        listener,
-        |_| {},
-    )
-}
-
+#[cfg(test)]
 fn run_idle_fallback_on_listener<F>(
     config_path: PathBuf,
     control_socket_path: PathBuf,
     reason: String,
     calibration_root: PathBuf,
-    listener: UnixListener,
+    socket: ControlSocketOwner,
     before_operation: F,
 ) -> Result<()>
 where
@@ -374,6 +867,10 @@ where
         calibration_root,
         runtime: Mutex::new(AppRuntimeState {
             config: app_config::AppConfig::default(),
+            config_family: ConfigFamily::App,
+            prepared_legacy: None,
+            resolved_capture: None,
+            lifecycle: LifecycleState::ready_stopped(None),
             state: "unconfigured".to_string(),
             last_error: Some(reason.clone()),
             config_load_error: Some(reason),
@@ -384,170 +881,40 @@ where
             #[cfg(test)]
             test_capture_attached: false,
         }),
+        clock: Arc::new(SystemRetryClock::default()),
+        scheduler: RetrySchedulerHandle::new(),
+        operation_authority: Mutex::new(()),
+        operation_epoch: AtomicU64::new(0),
+        #[cfg(test)]
+        final_mutation_pause: Mutex::new(None),
         stop: AtomicBool::new(false),
+        first_fatal: std::sync::OnceLock::new(),
     });
 
-    run_idle_listener_with_hook(ctx, listener, before_operation)
+    run_idle_listener_with_hook(ctx, socket, before_operation)
 }
 
-fn is_legacy_runtime_config(text: &str) -> bool {
-    toml::from_str::<toml::Value>(text)
-        .ok()
-        .and_then(|value| {
-            value
-                .as_table()
-                .map(|table| table.contains_key("configVersion"))
-        })
-        .unwrap_or_else(|| {
-            text.lines()
-                .any(|line| line.trim_start().starts_with("configVersion"))
-        })
-}
-
-fn run_capture_config(mut cfg: LambConfig) -> Result<()> {
-    if std::env::var_os("LAMB_SKIP_RUNTIME_VALIDATION").is_none() {
-        validate_runtime_environment(&cfg)?;
-    }
-    let params = legacy_runtime_params(&cfg);
-
-    let mut resolved_target = None;
-    let mut fake_capture = None;
-    let mut pipewire_capture = None;
-    let (sample_rate, _channel_names, runtime) = match cfg.backend.as_str() {
-        "fake" => {
-            let channels = cfg.channels.unwrap_or(2);
-            let (runtime, ingress) = CaptureRuntime::build(params, cfg.sample_rate, channels)?;
-            fake_capture = Some(FakeCapture::start(
-                ingress,
-                channels,
-                cfg.chunk_frames.unwrap_or(25),
-            )?);
-            let channel_names = cfg.channel_map.clone().unwrap_or_default();
-            (cfg.sample_rate, channel_names, runtime)
-        }
-        "pipewire" => {
-            let pipewire_cfg = PipeWireCaptureConfig::from_lamb_config(&cfg)?;
-            let channel_names = pipewire_cfg.channel_names();
-            let resolved = crate::capture_pipewire::resolve_target(&pipewire_cfg)?;
-            eprintln!("lamb: {}", resolved.log_message());
-            cfg.channels = Some(resolved.channels);
-            cfg.sample_rate = resolved.sample_rate;
-            resolved_target = Some(resolved.clone());
-            let (capture, runtime) =
-                PipeWireCapture::start_with_resolved(pipewire_cfg, resolved, params)?;
-            pipewire_capture = Some(capture);
-            (cfg.sample_rate, channel_names, runtime)
-        }
-        other => return Err(LambError::Capture(format!("unsupported backend {other}"))),
-    };
-
-    let parent = cfg
-        .control_socket_path
-        .parent()
-        .ok_or_else(|| LambError::Control("control socket path has no parent".to_string()))?;
-    fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
-    if cfg.control_socket_path.exists() {
-        fs::remove_file(&cfg.control_socket_path)
-            .map_err(|source| io_error(&cfg.control_socket_path, source))?;
-    }
-    let listener = UnixListener::bind(&cfg.control_socket_path)
-        .map_err(|source| io_error(&cfg.control_socket_path, source))?;
-    fs::set_permissions(&cfg.control_socket_path, fs::Permissions::from_mode(0o600))
-        .map_err(|source| io_error(&cfg.control_socket_path, source))?;
-
-    let policy = cfg.resolved_session_export_policy()?;
-    let session = CaptureSession {
-        arena: Arc::new(runtime.arena),
-        workspace: Mutex::new(runtime.workspace),
-        coordinator: Arc::new(DumpCoordinator::with_frozen_decision(
-            runtime.frozen_export_decision,
-        )),
-        sample_rate,
-        channel_count: cfg.channels.unwrap_or(2),
-        profile_name: "legacy".to_string(),
-        policy: Mutex::new(policy),
-        configured_inputs: Vec::new(),
-        resolved_live_inputs: Vec::new(),
-        calibration_sample_frames: 0,
-    };
-    let _recovery = session.recover_startup(Path::new(APP_STAGING_ROOT));
-    let ctx = Arc::new(DaemonContext {
-        cfg,
-        session,
-        resolved_target,
-        stop: AtomicBool::new(false),
-        last_error: Mutex::new(None),
-        capture_health: pipewire_capture.as_ref().map(PipeWireCapture::health),
-    });
-    let lane = Arc::new(OperationLane::new(DEFAULT_CONTROL_QUEUE_CAPACITY as usize)?);
-    let worker = spawn_operation_worker(
-        Arc::clone(&lane),
-        DEFAULT_WORKER_STACK_BYTES as usize,
-        {
-            let ctx = Arc::clone(&ctx);
-            move |(request, stream): (ControlRequest, UnixStream)| match request {
-                ControlRequest::Recall => {
-                    legacy_persistence_delivery(&ctx, ExportCommand::Recall, stream)
-                }
-                ControlRequest::Dump => {
-                    legacy_persistence_delivery(&ctx, ExportCommand::Dump, stream)
-                }
-                request => {
-                    let response = handle_request(&ctx, request);
-                    let _ = write_response(stream, &response);
-                }
-            }
-        },
-        {
-            let ctx = Arc::clone(&ctx);
-            move |(_request, stream): (ControlRequest, UnixStream)| {
-                let response = ControlResponse {
-                    ok: false,
-                    message: "shutting down".to_string(),
-                    status: Some(status_response(&ctx)),
-                    persistence_outcome: None,
-                    threshold_report: None,
-                };
-                let _ = write_response(stream, &response);
-            }
-        },
-    );
-    listener
-        .set_nonblocking(true)
-        .map_err(|source| io_error(&ctx.cfg.control_socket_path, source))?;
-
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if let Err(err) = route_legacy_stream(&ctx, &lane, stream) {
-                    if let Ok(mut last) = ctx.last_error.lock() {
-                        *last = Some(err.to_string());
-                    }
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => {
-                if let Ok(mut last) = ctx.last_error.lock() {
-                    *last = Some(err.to_string());
-                }
-            }
-        }
-        if ctx.stop.load(Ordering::Acquire) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    lane.close();
-    let _ = worker.join();
-
-    if let Some(capture) = fake_capture {
-        capture.stop();
-    }
-    if let Some(capture) = pipewire_capture {
-        capture.stop();
-    }
-    let _ = fs::remove_file(&ctx.cfg.control_socket_path);
-    Ok(())
+#[cfg(test)]
+fn finish_legacy_capture_startup_with<L, F, P, T>(
+    active: ActiveCapture,
+    prepared: &PreparedLegacyConfig,
+    listener: L,
+    final_listener_setup: F,
+    publish: P,
+) -> Result<T>
+where
+    F: FnOnce(&L) -> Result<()>,
+    P: FnOnce(ActiveCapture, L) -> Result<T>,
+{
+    let session = active
+        .session
+        .as_ref()
+        .expect("active capture always owns a session");
+    debug_assert_eq!(session.channel_count, active.resolved.channel_count);
+    debug_assert_eq!(session.sample_rate, active.resolved.sample_rate);
+    debug_assert_eq!(prepared.static_config.backend, "fake");
+    final_listener_setup(&listener)?;
+    publish(active, listener)
 }
 
 fn expand_runtime_paths(mut cfg: LambConfig) -> Result<LambConfig> {
@@ -560,25 +927,1573 @@ fn expand_runtime_paths(mut cfg: LambConfig) -> Result<LambConfig> {
     Ok(cfg)
 }
 
-struct DaemonContext {
-    cfg: LambConfig,
-    session: CaptureSession,
-    resolved_target: Option<ResolvedTarget>,
-    stop: AtomicBool,
-    last_error: Mutex<Option<String>>,
-    capture_health: Option<PipeWireHealth>,
-}
-
 struct IdleDaemonContext {
     config_path: PathBuf,
     control_socket_path: PathBuf,
     calibration_root: PathBuf,
     runtime: Mutex<AppRuntimeState>,
+    clock: Arc<dyn RetryClock>,
+    scheduler: RetrySchedulerHandle,
+    operation_authority: Mutex<()>,
+    operation_epoch: AtomicU64,
+    #[cfg(test)]
+    final_mutation_pause: Mutex<Option<FinalMutationPause>>,
     stop: AtomicBool,
+    first_fatal: std::sync::OnceLock<String>,
+}
+
+#[derive(Debug)]
+enum OperationJob {
+    Client {
+        request: ControlRequest,
+        stream: UnixStream,
+    },
+    Internal(ScheduledOperation),
+}
+
+#[cfg(test)]
+fn pause_before_final_mutation(ctx: &IdleDaemonContext, kind: FinalMutationKind) {
+    let pause = {
+        let mut configured = ctx.final_mutation_pause.lock().unwrap();
+        if configured.as_ref().is_some_and(|pause| pause.kind == kind) {
+            configured.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        pause.entered.wait();
+        pause.release.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_before_final_mutation(_ctx: &IdleDaemonContext, _kind: FinalMutationKind) {}
+
+fn build_idle_context(
+    bootstrap: BootstrapConfig,
+    prepared: PreparedBootstrap,
+) -> Result<Arc<IdleDaemonContext>> {
+    build_idle_context_with_dependencies(
+        bootstrap,
+        prepared,
+        &RealLegacyCaptureStarter,
+        &RealLegacyStartupRecovery,
+        Arc::new(SystemRetryClock::default()),
+    )
+}
+
+fn build_idle_context_with_dependencies(
+    bootstrap: BootstrapConfig,
+    prepared: PreparedBootstrap,
+    app_starter: &dyn LegacyCaptureStarter,
+    startup_recovery: &dyn LegacyStartupRecovery,
+    clock: Arc<dyn RetryClock>,
+) -> Result<Arc<IdleDaemonContext>> {
+    let calibration_root = crate::calibration::default_state_root()?;
+    let scheduler = RetrySchedulerHandle::new();
+    let mut runtime = AppRuntimeState {
+        config: app_config::AppConfig::default(),
+        config_family: bootstrap.family,
+        prepared_legacy: None,
+        resolved_capture: None,
+        lifecycle: LifecycleState::ready_stopped(None),
+        state: "unconfigured".to_string(),
+        last_error: None,
+        config_load_error: None,
+        active_profile: None,
+        capture: None,
+        capture_health: None,
+        session: None,
+        #[cfg(test)]
+        test_capture_attached: false,
+    };
+    match prepared {
+        PreparedBootstrap::App(loaded) => {
+            if loaded.state == ConfigLoadState::Loaded {
+                match reconcile_startup_calibrations(&calibration_root, &loaded) {
+                    Ok(pending) => {
+                        for path in pending {
+                            eprintln!("lamb: calibration cleanup pending: {}", path.display());
+                        }
+                    }
+                    Err(error) => eprintln!("lamb: calibration startup cleanup failed: {error}"),
+                }
+            }
+            if let Err(error) = apply_loaded_app_config_inner(
+                &mut runtime,
+                loaded,
+                &bootstrap.config_path,
+                &calibration_root,
+                app_starter,
+                startup_recovery,
+                clock.now(),
+                scheduler.fault_sink(
+                    1,
+                    allocate_capture_attempt_id()
+                        .map_err(|error| LambError::Capture(error.message))?,
+                ),
+            ) {
+                let backend = runtime.capture.take();
+                let session = runtime.session.take();
+                runtime.capture_health = None;
+                runtime.resolved_capture = None;
+                let error = classify_legacy_attempt_error(error);
+                if error.class == ErrorClass::Fatal {
+                    drop_capture_then_session(backend, session);
+                    return Err(LambError::Capture(error.message));
+                }
+                apply_capture_attempt_error_to_state(&mut runtime, error, clock.now())
+                    .map_err(|error| LambError::DaemonFatal(error.message))?;
+                drop_capture_then_session(backend, session);
+            }
+        }
+        PreparedBootstrap::Legacy(prepared) => {
+            runtime.config_family = ConfigFamily::Legacy;
+            runtime.prepared_legacy = Some(prepared);
+            runtime.state = "starting".to_string();
+            runtime.lifecycle.mark_starting(None);
+        }
+        PreparedBootstrap::Faulted {
+            family,
+            fallback_app_config,
+            message,
+        } => {
+            runtime.config = fallback_app_config;
+            runtime.config_family = family;
+            runtime.state = "faulted".to_string();
+            runtime.last_error = Some(message.clone());
+            runtime.config_load_error = Some(message.clone());
+            runtime.lifecycle.mark_permanent(message);
+        }
+        #[cfg(test)]
+        PreparedBootstrap::TestAppCandidate { .. } => {
+            unreachable!("test app candidates are transaction-only")
+        }
+    }
+    let ctx = Arc::new(IdleDaemonContext {
+        config_path: bootstrap.config_path,
+        control_socket_path: bootstrap.control_socket_path,
+        calibration_root,
+        runtime: Mutex::new(runtime),
+        clock,
+        scheduler,
+        operation_authority: Mutex::new(()),
+        operation_epoch: AtomicU64::new(0),
+        #[cfg(test)]
+        final_mutation_pause: Mutex::new(None),
+        stop: AtomicBool::new(false),
+        first_fatal: std::sync::OnceLock::new(),
+    });
+    let (published_health, published_generation) = {
+        let runtime = ctx
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (runtime.capture_health.clone(), runtime.lifecycle.generation)
+    };
+    ctx.scheduler.invalidate(published_generation);
+    if let Some(health) = published_health {
+        health.arm();
+    }
+    let scheduled = ctx.runtime.lock().ok().and_then(|runtime| {
+        runtime
+            .lifecycle
+            .next_retry_at
+            .map(|due| (runtime.lifecycle.generation, due))
+    });
+    if let Some((generation, due)) = scheduled {
+        ctx.scheduler.schedule_retry(generation, due);
+    }
+    Ok(ctx)
+}
+
+fn classify_legacy_attempt_error(error: LambError) -> CaptureAttemptError {
+    let (class, capture_state) = match error {
+        LambError::Config(_) | LambError::Validation(_) => {
+            (ErrorClass::Permanent, CaptureState::Faulted)
+        }
+        LambError::DaemonFatal(_)
+        | LambError::CaptureInvariant(_)
+        | LambError::ControlInvariant(_)
+        | LambError::ExportInvariant(_) => (ErrorClass::Fatal, CaptureState::Faulted),
+        _ => (ErrorClass::Transient, CaptureState::Faulted),
+    };
+    CaptureAttemptError {
+        class,
+        capture_state,
+        message: error.to_string(),
+    }
+}
+
+fn classify_pipewire_resolution_error(error: TargetResolutionError) -> CaptureAttemptError {
+    let (class, capture_state) = match error {
+        TargetResolutionError::TargetMissing(_)
+        | TargetResolutionError::PortMissing(_)
+        | TargetResolutionError::TargetChanged(_) => {
+            (ErrorClass::Transient, CaptureState::WaitingForDevice)
+        }
+        TargetResolutionError::BackendUnavailable(_) => {
+            (ErrorClass::Transient, CaptureState::Faulted)
+        }
+        TargetResolutionError::InvalidSelector(_) => (ErrorClass::Permanent, CaptureState::Faulted),
+    };
+    CaptureAttemptError {
+        class,
+        capture_state,
+        message: error.to_string(),
+    }
+}
+
+fn runtime_fault_sink_for_attempt(
+    ctx: &IdleDaemonContext,
+    operation_generation: Option<u64>,
+) -> std::result::Result<RuntimeFaultSink, CaptureAttemptError> {
+    let generation = match operation_generation {
+        Some(generation) => generation,
+        None => ctx
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lifecycle
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| CaptureAttemptError {
+                class: ErrorClass::Fatal,
+                capture_state: CaptureState::Faulted,
+                message: "capture generation overflow".to_string(),
+            })?,
+    };
+    Ok(ctx
+        .scheduler
+        .fault_sink(generation, allocate_capture_attempt_id()?))
+}
+
+fn start_app_pipewire_capture(
+    config: PipeWireCaptureConfig,
+    params: CaptureRuntimeParams,
+    fault_sink: RuntimeFaultSink,
+) -> std::result::Result<(PipeWireCapture, CaptureRuntime), CaptureAttemptError> {
+    let resolved = crate::capture_pipewire::resolve_target_typed(&config)
+        .map_err(classify_pipewire_resolution_error)?;
+    eprintln!("lamb: {}", resolved.log_message());
+    PipeWireCapture::start_with_resolved(config, resolved, params, fault_sink).map_err(|error| {
+        match error {
+            PipeWireStartupError::Resolution(error) => classify_pipewire_resolution_error(error),
+            PipeWireStartupError::Capture(error) => classify_legacy_attempt_error(error),
+        }
+    })
+}
+
+fn apply_capture_attempt_error_to_state(
+    runtime: &mut AppRuntimeState,
+    error: CaptureAttemptError,
+    now: RetryInstant,
+) -> std::result::Result<(), CaptureAttemptError> {
+    if error.class == ErrorClass::Fatal {
+        return Err(error);
+    }
+    runtime.state = "faulted".to_string();
+    runtime.last_error = Some(error.message.clone());
+    runtime.config_load_error = Some(error.message.clone());
+    match error.class {
+        ErrorClass::Transient => {
+            runtime
+                .lifecycle
+                .mark_transient(error.capture_state, error.message, now);
+        }
+        ErrorClass::Permanent => runtime.lifecycle.mark_permanent(error.message),
+        ErrorClass::Fatal => unreachable!("fatal capture errors are rejected before mutation"),
+    }
+    Ok(())
+}
+
+fn publish_capture_attempt_error(ctx: &IdleDaemonContext, error: CaptureAttemptError) {
+    if error.class == ErrorClass::Fatal {
+        signal_fatal(ctx, error.message);
+        return;
+    }
+    let authority = lock_operation_authority(ctx);
+    let (scheduled, published_generation, active, fatal_message) = {
+        let (mut runtime, recovered_poison) = lock_runtime_recovering_poison(ctx);
+        let active = if recovered_poison {
+            take_active_capture(&mut runtime)
+        } else {
+            (None, None)
+        };
+        let publication = match runtime.lifecycle.begin_operation() {
+            Ok(generation) => {
+                runtime.state = "faulted".to_string();
+                runtime.last_error = Some(error.message.clone());
+                runtime.config_load_error = Some(error.message.clone());
+                let scheduled = match error.class {
+                    ErrorClass::Transient => {
+                        runtime.lifecycle.mark_transient(
+                            error.capture_state,
+                            error.message,
+                            ctx.clock.now(),
+                        );
+                        runtime.lifecycle.next_retry_at.map(|due| (generation, due))
+                    }
+                    ErrorClass::Permanent => {
+                        runtime.lifecycle.mark_permanent(error.message);
+                        None
+                    }
+                    ErrorClass::Fatal => {
+                        unreachable!("fatal capture error is handled before publication")
+                    }
+                };
+                (scheduled, generation, None)
+            }
+            Err(generation_error) => {
+                let message = generation_error.to_string();
+                (None, runtime.lifecycle.generation, Some(message))
+            }
+        };
+        if recovered_poison {
+            ctx.runtime.clear_poison();
+        }
+        let (scheduled, generation, fatal_message) = publication;
+        (scheduled, generation, active, fatal_message)
+    };
+    if fatal_message.is_none() {
+        if let Some((generation, due)) = scheduled {
+            ctx.scheduler.schedule_retry(generation, due);
+        } else {
+            ctx.scheduler.invalidate(published_generation);
+        }
+    }
+    drop(authority);
+    drop_capture_then_session(active.0, active.1);
+    if let Some(message) = fatal_message {
+        signal_fatal(ctx, message);
+    }
+}
+
+trait LegacyStartupRecovery: Send + Sync {
+    fn failed_count(&self, session: &CaptureSession) -> Result<usize>;
+}
+
+struct RealLegacyStartupRecovery;
+
+impl LegacyStartupRecovery for RealLegacyStartupRecovery {
+    fn failed_count(&self, session: &CaptureSession) -> Result<usize> {
+        Ok(session.recover_startup(Path::new(APP_STAGING_ROOT)).failed)
+    }
+}
+
+fn attempt_configured_start(
+    ctx: &IdleDaemonContext,
+    legacy_starter: &dyn LegacyCaptureStarter,
+) -> Result<()> {
+    attempt_configured_start_with_recovery(ctx, legacy_starter, &RealLegacyStartupRecovery)
+}
+
+struct PreparedCommandConfig {
+    prepared: PreparedBootstrap,
+    control_socket_path: PathBuf,
+}
+
+fn begin_command_operation(
+    ctx: &IdleDaemonContext,
+) -> std::result::Result<u64, CaptureAttemptError> {
+    let authority = lock_operation_authority(ctx);
+    if ctx.stop.load(Ordering::SeqCst) {
+        return Err(shutdown_attempt_error());
+    }
+    let token = ctx
+        .operation_epoch
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| CaptureAttemptError {
+            class: ErrorClass::Fatal,
+            capture_state: CaptureState::Faulted,
+            message: "operation epoch overflow".to_string(),
+        })?
+        + 1;
+    drop(authority);
+    Ok(token)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BegunOperation {
+    token: u64,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationEntry {
+    Command,
+    DirectStop,
+}
+
+fn begin_new_operation_generation(
+    ctx: &IdleDaemonContext,
+    entry: OperationEntry,
+) -> std::result::Result<BegunOperation, CaptureAttemptError> {
+    let _authority = lock_operation_authority(ctx);
+    if ctx.stop.load(Ordering::SeqCst) {
+        return Err(shutdown_attempt_error());
+    }
+    let token = ctx
+        .operation_epoch
+        .load(Ordering::SeqCst)
+        .checked_add(1)
+        .ok_or_else(|| CaptureAttemptError {
+            class: ErrorClass::Fatal,
+            capture_state: CaptureState::Faulted,
+            message: "operation epoch overflow".to_string(),
+        })?;
+    let mut runtime = ctx
+        .runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = runtime
+        .lifecycle
+        .begin_operation()
+        .map_err(|error| CaptureAttemptError {
+            class: ErrorClass::Fatal,
+            capture_state: CaptureState::Faulted,
+            message: error.to_string(),
+        })?;
+    let health_to_rebind = if entry == OperationEntry::Command {
+        runtime.capture_health.clone()
+    } else {
+        None
+    };
+    ctx.operation_epoch.store(token, Ordering::SeqCst);
+    ctx.scheduler.invalidate(generation);
+    if entry == OperationEntry::DirectStop {
+        ctx.stop.store(true, Ordering::SeqCst);
+        runtime.lifecycle.mark_stopping();
+        ctx.scheduler.stop();
+    }
+    ctx.runtime.clear_poison();
+    drop(runtime);
+    if let Some(health) = health_to_rebind {
+        if let Some(attempt_id) = health.attempt_id() {
+            health.rebind_and_arm(ctx.scheduler.fault_sink(generation, attempt_id));
+        }
+    }
+    Ok(BegunOperation { token, generation })
+}
+
+fn lock_operation_authority(ctx: &IdleDaemonContext) -> std::sync::MutexGuard<'_, ()> {
+    ctx.operation_authority
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_runtime_recovering_poison(
+    ctx: &IdleDaemonContext,
+) -> (std::sync::MutexGuard<'_, AppRuntimeState>, bool) {
+    match ctx.runtime.lock() {
+        Ok(runtime) => (runtime, false),
+        Err(poisoned) => (poisoned.into_inner(), true),
+    }
+}
+
+fn operation_is_current(ctx: &IdleDaemonContext, token: u64) -> bool {
+    !ctx.stop.load(Ordering::SeqCst) && ctx.operation_epoch.load(Ordering::SeqCst) == token
+}
+
+fn shutdown_attempt_error() -> CaptureAttemptError {
+    CaptureAttemptError {
+        class: ErrorClass::Transient,
+        capture_state: CaptureState::Stopped,
+        message: "daemon is shutting down".to_string(),
+    }
+}
+
+fn superseded_response(ctx: &IdleDaemonContext) -> ControlResponse {
+    let status = idle_status_response(ctx);
+    ControlResponse::failure(
+        if ctx.stop.load(Ordering::SeqCst) {
+            "daemon is shutting down"
+        } else {
+            "capture operation was superseded"
+        },
+        Some(status.clone()),
+        Some(ErrorClass::Transient),
+        status.lifecycle.daemon_state,
+        status.lifecycle.capture_state,
+    )
+}
+
+fn prepare_config_from_disk(
+    path: &Path,
+    requested_profile: Option<&str>,
+) -> std::result::Result<PreparedCommandConfig, CaptureAttemptError> {
+    let bootstrap = bootstrap_config(path).map_err(classify_legacy_attempt_error)?;
+    let mut prepared = prepare_bootstrap_config(&bootstrap);
+    if let PreparedBootstrap::App(loaded) = &mut prepared {
+        if loaded.state != ConfigLoadState::Loaded {
+            return Err(CaptureAttemptError {
+                class: ErrorClass::Permanent,
+                capture_state: CaptureState::Faulted,
+                message: loaded
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("config file not found: {}", path.display())),
+            });
+        }
+        if let Some(profile) = requested_profile
+            .map(str::trim)
+            .filter(|profile| !profile.is_empty())
+        {
+            if !loaded.config.profiles.contains_key(profile) {
+                return Err(CaptureAttemptError {
+                    class: ErrorClass::Permanent,
+                    capture_state: CaptureState::Faulted,
+                    message: format!("profile {profile} does not exist"),
+                });
+            }
+            loaded.config.daemon.active_profile = Some(profile.to_string());
+        }
+        profile::resolve_active_profile(&loaded.config).map_err(classify_legacy_attempt_error)?;
+    }
+    match prepared {
+        PreparedBootstrap::Faulted { message, .. } => Err(CaptureAttemptError {
+            class: ErrorClass::Permanent,
+            capture_state: CaptureState::Faulted,
+            message,
+        }),
+        prepared => Ok(PreparedCommandConfig {
+            prepared,
+            control_socket_path: bootstrap.control_socket_path,
+        }),
+    }
+}
+
+fn validate_candidate_socket(
+    ctx: &IdleDaemonContext,
+    candidate: &PreparedCommandConfig,
+) -> std::result::Result<(), CaptureAttemptError> {
+    if candidate.control_socket_path == ctx.control_socket_path {
+        Ok(())
+    } else {
+        Err(CaptureAttemptError {
+            class: ErrorClass::Permanent,
+            capture_state: CaptureState::Faulted,
+            message: format!(
+                "candidate control socket {} differs from bound socket {}",
+                candidate.control_socket_path.display(),
+                ctx.control_socket_path.display()
+            ),
+        })
+    }
+}
+
+fn current_capture_is_running(ctx: &IdleDaemonContext) -> bool {
+    ctx.runtime
+        .lock()
+        .map(|runtime| {
+            runtime.capture.is_some()
+                && runtime.session.is_some()
+                && runtime.lifecycle.capture_state == CaptureState::Running
+        })
+        .unwrap_or(false)
+}
+
+fn command_failure_without_state_mutation(
+    ctx: &IdleDaemonContext,
+    error: CaptureAttemptError,
+) -> ControlResponse {
+    let lifecycle = ctx
+        .runtime
+        .lock()
+        .map(|runtime| runtime.lifecycle.clone())
+        .unwrap_or_else(|_| {
+            let mut lifecycle = LifecycleState::ready_stopped(None);
+            lifecycle.mark_permanent("runtime state lock poisoned".to_string());
+            lifecycle
+        });
+    ControlResponse::failure(
+        error.message,
+        Some(idle_status_response(ctx)),
+        Some(error.class),
+        lifecycle.daemon_state,
+        lifecycle.capture_state,
+    )
+}
+
+fn fatal_failure_response(ctx: &IdleDaemonContext, message: String) -> ControlResponse {
+    let status = idle_status_response(ctx);
+    ControlResponse::failure(
+        message,
+        Some(status.clone()),
+        Some(ErrorClass::Fatal),
+        status.lifecycle.daemon_state,
+        status.lifecycle.capture_state,
+    )
+}
+
+fn command_attempt_failure(
+    ctx: &IdleDaemonContext,
+    token: u64,
+    error: CaptureAttemptError,
+    preserve_running: bool,
+) -> ControlResponse {
+    command_attempt_failure_with_generation(ctx, token, None, error, preserve_running)
+}
+
+fn command_attempt_failure_with_generation(
+    ctx: &IdleDaemonContext,
+    token: u64,
+    operation_generation: Option<u64>,
+    error: CaptureAttemptError,
+    preserve_running: bool,
+) -> ControlResponse {
+    let authority = lock_operation_authority(ctx);
+    if !operation_is_current(ctx, token) {
+        drop(authority);
+        return superseded_response(ctx);
+    }
+    if error.class == ErrorClass::Fatal {
+        let message = error.message;
+        drop(authority);
+        signal_fatal(ctx, message.clone());
+        return fatal_failure_response(ctx, message);
+    }
+    if preserve_running && current_capture_is_running(ctx) {
+        let response = command_failure_without_state_mutation(ctx, error);
+        drop(authority);
+        return response;
+    }
+    let (scheduled, published_generation, active, fatal_message) = {
+        let (mut runtime, recovered_poison) = lock_runtime_recovering_poison(ctx);
+        if !operation_is_current(ctx, token) {
+            if recovered_poison {
+                ctx.runtime.clear_poison();
+            }
+            drop(runtime);
+            drop(authority);
+            return superseded_response(ctx);
+        }
+        pause_before_final_mutation(ctx, FinalMutationKind::Failure);
+        let generation = match operation_generation {
+            Some(generation) if runtime.lifecycle.generation == generation => Some(generation),
+            Some(_) => {
+                if recovered_poison {
+                    ctx.runtime.clear_poison();
+                }
+                drop(runtime);
+                drop(authority);
+                return superseded_response(ctx);
+            }
+            None => match runtime.lifecycle.begin_operation() {
+                Ok(generation) => Some(generation),
+                Err(_) if recovered_poison => None,
+                Err(_) => {
+                    drop(runtime);
+                    drop(authority);
+                    return superseded_response(ctx);
+                }
+            },
+        };
+        let active = if recovered_poison {
+            take_active_capture(&mut runtime)
+        } else {
+            (None, None)
+        };
+        let publication = if let Some(generation) = generation {
+            runtime.state = "faulted".to_string();
+            runtime.last_error = Some(error.message.clone());
+            runtime.config_load_error = Some(error.message.clone());
+            let scheduled = match error.class {
+                ErrorClass::Transient => {
+                    runtime.lifecycle.mark_transient(
+                        error.capture_state,
+                        error.message,
+                        ctx.clock.now(),
+                    );
+                    runtime.lifecycle.next_retry_at.map(|due| (generation, due))
+                }
+                ErrorClass::Permanent => {
+                    runtime.lifecycle.mark_permanent(error.message);
+                    None
+                }
+                ErrorClass::Fatal => {
+                    unreachable!("fatal command error is returned before publication")
+                }
+            };
+            (scheduled, generation, None)
+        } else {
+            let message = "operation generation overflow while recovering poisoned runtime";
+            (
+                None,
+                runtime.lifecycle.generation,
+                Some(message.to_string()),
+            )
+        };
+        if recovered_poison {
+            ctx.runtime.clear_poison();
+        }
+        (publication.0, publication.1, active, publication.2)
+    };
+    if fatal_message.is_none() {
+        if let Some((generation, due)) = scheduled {
+            ctx.scheduler.schedule_retry(generation, due);
+        } else {
+            ctx.scheduler.invalidate(published_generation);
+        }
+    }
+    drop(authority);
+    drop_capture_then_session(active.0, active.1);
+    if let Some(message) = fatal_message {
+        signal_fatal(ctx, message.clone());
+        fatal_failure_response(ctx, message)
+    } else {
+        current_failure_response(ctx)
+    }
+}
+
+fn current_failure_response(ctx: &IdleDaemonContext) -> ControlResponse {
+    let (message, class, daemon_state, capture_state) = ctx
+        .runtime
+        .lock()
+        .map(|runtime| {
+            (
+                runtime
+                    .lifecycle
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "capture command failed".to_string()),
+                runtime.lifecycle.error_class,
+                runtime.lifecycle.daemon_state,
+                runtime.lifecycle.capture_state,
+            )
+        })
+        .unwrap_or_else(|_| {
+            (
+                "runtime state lock poisoned".to_string(),
+                Some(ErrorClass::Permanent),
+                DaemonState::Degraded,
+                CaptureState::Faulted,
+            )
+        });
+    ControlResponse::failure(
+        message,
+        Some(idle_status_response(ctx)),
+        class,
+        daemon_state,
+        capture_state,
+    )
+}
+
+fn take_active_capture(
+    runtime: &mut AppRuntimeState,
+) -> (Option<CaptureBackend>, Option<Arc<CaptureSession>>) {
+    let backend = runtime.capture.take();
+    let session = runtime.session.take();
+    runtime.capture_health = None;
+    runtime.resolved_capture = None;
+    #[cfg(test)]
+    {
+        runtime.test_capture_attached = false;
+    }
+    (backend, session)
+}
+
+fn empty_runtime(family: ConfigFamily) -> AppRuntimeState {
+    AppRuntimeState {
+        config: app_config::AppConfig::default(),
+        config_family: family,
+        prepared_legacy: None,
+        resolved_capture: None,
+        lifecycle: LifecycleState::ready_stopped(None),
+        state: "unconfigured".to_string(),
+        last_error: None,
+        config_load_error: None,
+        active_profile: None,
+        capture: None,
+        capture_health: None,
+        session: None,
+        #[cfg(test)]
+        test_capture_attached: false,
+    }
+}
+
+fn publication_generation(
+    lifecycle: &mut LifecycleState,
+    operation_generation: Option<u64>,
+) -> Result<u64> {
+    match operation_generation {
+        Some(generation) if lifecycle.generation == generation => Ok(generation),
+        Some(_) => Err(LambError::Control(
+            "capture operation superseded".to_string(),
+        )),
+        None => lifecycle.begin_operation(),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "arguments mirror the atomic prepared-install transaction and its policy flags"
+)]
+fn install_prepared_then_follow_start_mode(
+    ctx: &IdleDaemonContext,
+    token: u64,
+    prepared: PreparedBootstrap,
+    legacy_starter: &dyn LegacyCaptureStarter,
+    legacy_recovery: &dyn LegacyStartupRecovery,
+    old_already_detached: bool,
+    force_start: bool,
+    activate: bool,
+) -> ControlResponse {
+    install_prepared_then_follow_start_mode_with_generation(
+        ctx,
+        token,
+        None,
+        prepared,
+        legacy_starter,
+        legacy_recovery,
+        old_already_detached,
+        force_start,
+        activate,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "generation-aware installation must carry the same atomic transaction inputs"
+)]
+fn install_prepared_then_follow_start_mode_with_generation(
+    ctx: &IdleDaemonContext,
+    token: u64,
+    operation_generation: Option<u64>,
+    prepared: PreparedBootstrap,
+    legacy_starter: &dyn LegacyCaptureStarter,
+    legacy_recovery: &dyn LegacyStartupRecovery,
+    old_already_detached: bool,
+    force_start: bool,
+    activate: bool,
+) -> ControlResponse {
+    if !operation_is_current(ctx, token) {
+        return superseded_response(ctx);
+    }
+    match prepared {
+        PreparedBootstrap::Legacy(prepared) => {
+            if !operation_is_current(ctx, token) {
+                return superseded_response(ctx);
+            }
+            let fault_sink = match runtime_fault_sink_for_attempt(ctx, operation_generation) {
+                Ok(sink) => sink,
+                Err(error) => {
+                    return command_attempt_failure_with_generation(
+                        ctx,
+                        token,
+                        operation_generation,
+                        error,
+                        !old_already_detached,
+                    );
+                }
+            };
+            let mut active = match legacy_starter.start(&prepared, fault_sink) {
+                Ok(active) => active,
+                Err(error) => {
+                    return command_attempt_failure_with_generation(
+                        ctx,
+                        token,
+                        operation_generation,
+                        error,
+                        !old_already_detached,
+                    );
+                }
+            };
+            if !operation_is_current(ctx, token) {
+                drop(active);
+                return superseded_response(ctx);
+            }
+            if let Some(session) = active.session.as_ref() {
+                let recovery = legacy_recovery.failed_count(session).and_then(|failed| {
+                    if failed == 0 {
+                        Ok(())
+                    } else {
+                        Err(LambError::Control(format!(
+                            "legacy startup recovery failed for {failed} transaction(s)"
+                        )))
+                    }
+                });
+                if let Err(error) = recovery {
+                    drop(active);
+                    return command_attempt_failure_with_generation(
+                        ctx,
+                        token,
+                        operation_generation,
+                        classify_legacy_attempt_error(error),
+                        !old_already_detached,
+                    );
+                }
+            }
+            if !operation_is_current(ctx, token) {
+                drop(active);
+                return superseded_response(ctx);
+            }
+            let authority = lock_operation_authority(ctx);
+            if !operation_is_current(ctx, token) {
+                drop(authority);
+                drop(active);
+                return superseded_response(ctx);
+            }
+            pause_before_final_mutation(ctx, FinalMutationKind::LegacySuccess);
+            let published_health = active.health.take();
+            let old = {
+                let (mut runtime, recovered_poison) = lock_runtime_recovering_poison(ctx);
+                let Ok(generation) =
+                    publication_generation(&mut runtime.lifecycle, operation_generation)
+                else {
+                    if recovered_poison {
+                        ctx.runtime.clear_poison();
+                    }
+                    drop(runtime);
+                    drop(authority);
+                    drop(active);
+                    return superseded_response(ctx);
+                };
+                let old = if old_already_detached && !recovered_poison {
+                    (None, None)
+                } else {
+                    take_active_capture(&mut runtime)
+                };
+                let resolved = active.resolved.clone();
+                let session = active
+                    .session
+                    .take()
+                    .expect("successful capture owns its session");
+                let backend = active
+                    .backend
+                    .take()
+                    .expect("successful capture owns its backend");
+                runtime.capture_health = published_health.clone();
+                runtime.config_family = ConfigFamily::Legacy;
+                runtime.prepared_legacy = Some(prepared);
+                runtime.active_profile = None;
+                runtime.capture = Some(backend);
+                runtime.session = Some(session);
+                runtime.resolved_capture = Some(resolved.clone());
+                runtime.state = "capturing".to_string();
+                runtime.last_error = None;
+                runtime.config_load_error = None;
+                runtime
+                    .lifecycle
+                    .mark_running(None, resolved.resolved_target);
+                if recovered_poison {
+                    ctx.runtime.clear_poison();
+                }
+                (old, generation)
+            };
+            ctx.scheduler.invalidate(old.1);
+            if let Some(health) = published_health {
+                health.arm();
+            }
+            let response =
+                ControlResponse::success("config reloaded", Some(idle_status_response(ctx)));
+            drop(authority);
+            drop(active);
+            drop_capture_then_session((old.0).0, (old.0).1);
+            response
+        }
+        PreparedBootstrap::App(mut loaded) => {
+            let configured_start_mode = loaded.config.daemon.start_mode.clone();
+            if force_start {
+                loaded.config.daemon.start_mode = "auto".to_string();
+            }
+            if !operation_is_current(ctx, token) {
+                return superseded_response(ctx);
+            }
+            let mut candidate = empty_runtime(ConfigFamily::App);
+            let fault_sink = match runtime_fault_sink_for_attempt(ctx, operation_generation) {
+                Ok(sink) => sink,
+                Err(error) => {
+                    return command_attempt_failure_with_generation(
+                        ctx,
+                        token,
+                        operation_generation,
+                        error,
+                        !old_already_detached,
+                    );
+                }
+            };
+            if let Err(error) = apply_loaded_app_config_inner_with_checkpoint(
+                &mut candidate,
+                loaded,
+                &ctx.config_path,
+                &ctx.calibration_root,
+                legacy_starter,
+                legacy_recovery,
+                ctx.clock.now(),
+                false,
+                fault_sink,
+                || {
+                    if operation_is_current(ctx, token) {
+                        Ok(())
+                    } else {
+                        Err(LambError::Control(
+                            "capture operation superseded".to_string(),
+                        ))
+                    }
+                },
+            ) {
+                if !operation_is_current(ctx, token) {
+                    return superseded_response(ctx);
+                }
+                return command_attempt_failure(
+                    ctx,
+                    token,
+                    classify_legacy_attempt_error(error),
+                    !old_already_detached,
+                );
+            }
+            candidate.config.daemon.start_mode = configured_start_mode;
+            if !operation_is_current(ctx, token) {
+                drop(candidate);
+                return superseded_response(ctx);
+            }
+            if !matches!(
+                candidate.lifecycle.capture_state,
+                CaptureState::Running | CaptureState::Stopped
+            ) {
+                let error = CaptureAttemptError {
+                    class: candidate
+                        .lifecycle
+                        .error_class
+                        .unwrap_or(ErrorClass::Transient),
+                    capture_state: candidate.lifecycle.capture_state,
+                    message: candidate
+                        .lifecycle
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "capture start failed".to_string()),
+                };
+                drop(candidate);
+                return command_attempt_failure_with_generation(
+                    ctx,
+                    token,
+                    operation_generation,
+                    error,
+                    !old_already_detached,
+                );
+            }
+            if activate {
+                let save_result = {
+                    let authority = lock_operation_authority(ctx);
+                    if !operation_is_current(ctx, token) {
+                        drop(authority);
+                        None
+                    } else {
+                        pause_before_final_mutation(ctx, FinalMutationKind::PersistenceAdmission);
+                        let result = profile::save_config(&ctx.config_path, &candidate.config);
+                        drop(authority);
+                        Some(result)
+                    }
+                };
+                let Some(save_result) = save_result else {
+                    drop(candidate);
+                    return superseded_response(ctx);
+                };
+                if let Err(error) = save_result {
+                    drop(candidate);
+                    return command_attempt_failure_with_generation(
+                        ctx,
+                        token,
+                        operation_generation,
+                        classify_legacy_attempt_error(error),
+                        !old_already_detached,
+                    );
+                }
+                #[cfg(test)]
+                if let Some(hook) = AFTER_START_CONFIG_PERSIST_HOOK.lock().unwrap().take() {
+                    hook();
+                }
+            }
+            let authority = lock_operation_authority(ctx);
+            if !operation_is_current(ctx, token) {
+                drop(authority);
+                drop(candidate);
+                return superseded_response(ctx);
+            }
+            pause_before_final_mutation(ctx, FinalMutationKind::AppSuccess);
+            let published_health = candidate.capture_health.clone();
+            let old = {
+                let (mut runtime, recovered_poison) = lock_runtime_recovering_poison(ctx);
+                let Ok(generation) =
+                    publication_generation(&mut runtime.lifecycle, operation_generation)
+                else {
+                    if recovered_poison {
+                        ctx.runtime.clear_poison();
+                    }
+                    drop(runtime);
+                    drop(authority);
+                    drop(candidate);
+                    return superseded_response(ctx);
+                };
+                let old = if old_already_detached && !recovered_poison {
+                    (None, None)
+                } else {
+                    take_active_capture(&mut runtime)
+                };
+                candidate.lifecycle.generation = generation;
+                *runtime = candidate;
+                if recovered_poison {
+                    ctx.runtime.clear_poison();
+                }
+                (old, generation)
+            };
+            ctx.scheduler.invalidate(old.1);
+            if let Some(health) = published_health {
+                health.arm();
+            }
+            let response =
+                ControlResponse::success("config reloaded", Some(idle_status_response(ctx)));
+            drop(authority);
+            drop_capture_then_session((old.0).0, (old.0).1);
+            response
+        }
+        #[cfg(test)]
+        PreparedBootstrap::TestAppCandidate {
+            mut candidate,
+            entered,
+            release,
+        } => {
+            if let Some(entered) = entered {
+                entered.wait();
+            }
+            if let Some(release) = release {
+                release.wait();
+            }
+            if !operation_is_current(ctx, token) {
+                drop(candidate);
+                return superseded_response(ctx);
+            }
+            if activate {
+                let save_result = {
+                    let authority = lock_operation_authority(ctx);
+                    if !operation_is_current(ctx, token) {
+                        drop(authority);
+                        None
+                    } else {
+                        pause_before_final_mutation(ctx, FinalMutationKind::PersistenceAdmission);
+                        let result = profile::save_config(&ctx.config_path, &candidate.config);
+                        drop(authority);
+                        Some(result)
+                    }
+                };
+                let Some(save_result) = save_result else {
+                    drop(candidate);
+                    return superseded_response(ctx);
+                };
+                if let Err(error) = save_result {
+                    drop(candidate);
+                    return command_attempt_failure_with_generation(
+                        ctx,
+                        token,
+                        operation_generation,
+                        classify_legacy_attempt_error(error),
+                        !old_already_detached,
+                    );
+                }
+                if let Some(hook) = AFTER_START_CONFIG_PERSIST_HOOK.lock().unwrap().take() {
+                    hook();
+                }
+            }
+            let authority = lock_operation_authority(ctx);
+            if !operation_is_current(ctx, token) {
+                drop(authority);
+                drop(candidate);
+                return superseded_response(ctx);
+            }
+            pause_before_final_mutation(ctx, FinalMutationKind::AppSuccess);
+            let old = {
+                let (mut runtime, recovered_poison) = lock_runtime_recovering_poison(ctx);
+                let Ok(generation) =
+                    publication_generation(&mut runtime.lifecycle, operation_generation)
+                else {
+                    if recovered_poison {
+                        ctx.runtime.clear_poison();
+                    }
+                    drop(runtime);
+                    drop(authority);
+                    drop(candidate);
+                    return superseded_response(ctx);
+                };
+                let old = if old_already_detached && !recovered_poison {
+                    (None, None)
+                } else {
+                    take_active_capture(&mut runtime)
+                };
+                candidate.lifecycle.generation = generation;
+                *runtime = candidate;
+                if recovered_poison {
+                    ctx.runtime.clear_poison();
+                }
+                (old, generation)
+            };
+            let response =
+                ControlResponse::success("config reloaded", Some(idle_status_response(ctx)));
+            ctx.scheduler.invalidate(old.1);
+            drop(authority);
+            drop_capture_then_session((old.0).0, (old.0).1);
+            response
+        }
+        PreparedBootstrap::Faulted { message, .. } => command_attempt_failure_with_generation(
+            ctx,
+            token,
+            operation_generation,
+            CaptureAttemptError {
+                class: ErrorClass::Permanent,
+                capture_state: CaptureState::Faulted,
+                message,
+            },
+            !old_already_detached,
+        ),
+    }
+}
+
+fn reload_daemon_config_with_recovery(
+    ctx: &IdleDaemonContext,
+    requested_profile: Option<&str>,
+    legacy_starter: &dyn LegacyCaptureStarter,
+    legacy_recovery: &dyn LegacyStartupRecovery,
+) -> ControlResponse {
+    reload_daemon_config_with_recovery_and_entry_hook(
+        ctx,
+        requested_profile,
+        legacy_starter,
+        legacy_recovery,
+        || {},
+    )
+}
+
+fn reload_daemon_config_with_recovery_and_entry_hook(
+    ctx: &IdleDaemonContext,
+    requested_profile: Option<&str>,
+    legacy_starter: &dyn LegacyCaptureStarter,
+    legacy_recovery: &dyn LegacyStartupRecovery,
+    after_entry: impl FnOnce(),
+) -> ControlResponse {
+    let operation = match begin_new_operation_generation(ctx, OperationEntry::Command) {
+        Ok(operation) => operation,
+        Err(error) => return command_failure_without_state_mutation(ctx, error),
+    };
+    let token = operation.token;
+    after_entry();
+    let candidate = match prepare_config_from_disk(&ctx.config_path, requested_profile) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return command_attempt_failure_with_generation(
+                ctx,
+                token,
+                Some(operation.generation),
+                error,
+                true,
+            );
+        }
+    };
+    if !operation_is_current(ctx, token) {
+        return superseded_response(ctx);
+    }
+    if let Err(error) = validate_candidate_socket(ctx, &candidate) {
+        return command_attempt_failure_with_generation(
+            ctx,
+            token,
+            Some(operation.generation),
+            error,
+            true,
+        );
+    }
+    install_prepared_then_follow_start_mode_with_generation(
+        ctx,
+        token,
+        Some(operation.generation),
+        candidate.prepared,
+        legacy_starter,
+        legacy_recovery,
+        false,
+        false,
+        false,
+    )
+}
+
+fn start_capture_transaction_with_recovery(
+    ctx: &IdleDaemonContext,
+    requested_profile: Option<&str>,
+    activate: bool,
+    legacy_starter: &dyn LegacyCaptureStarter,
+    legacy_recovery: &dyn LegacyStartupRecovery,
+) -> ControlResponse {
+    let operation = match begin_new_operation_generation(ctx, OperationEntry::Command) {
+        Ok(operation) => operation,
+        Err(error) => return command_failure_without_state_mutation(ctx, error),
+    };
+    let token = operation.token;
+    let authority = lock_operation_authority(ctx);
+    if !operation_is_current(ctx, token) {
+        drop(authority);
+        return superseded_response(ctx);
+    }
+    let running = current_capture_is_running(ctx);
+    if running {
+        if !operation_is_current(ctx, token) {
+            drop(authority);
+            return superseded_response(ctx);
+        }
+        pause_before_final_mutation(ctx, FinalMutationKind::RunningStartNoop);
+        let response =
+            ControlResponse::success("capture already running", Some(idle_status_response(ctx)));
+        drop(authority);
+        return response;
+    }
+    drop(authority);
+    let candidate = match prepare_config_from_disk(&ctx.config_path, requested_profile) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return command_attempt_failure_with_generation(
+                ctx,
+                token,
+                Some(operation.generation),
+                error,
+                false,
+            );
+        }
+    };
+    if !operation_is_current(ctx, token) {
+        return superseded_response(ctx);
+    }
+    if let Err(error) = validate_candidate_socket(ctx, &candidate) {
+        return command_attempt_failure_with_generation(
+            ctx,
+            token,
+            Some(operation.generation),
+            error,
+            false,
+        );
+    }
+    let authority = lock_operation_authority(ctx);
+    if !operation_is_current(ctx, token) {
+        drop(authority);
+        return superseded_response(ctx);
+    }
+    let old = {
+        let (mut runtime, recovered_poison) = lock_runtime_recovering_poison(ctx);
+        if runtime.lifecycle.generation != operation.generation {
+            if recovered_poison {
+                ctx.runtime.clear_poison();
+            }
+            drop(runtime);
+            drop(authority);
+            return superseded_response(ctx);
+        }
+        let old = take_active_capture(&mut runtime);
+        let active_profile = requested_profile
+            .map(str::to_string)
+            .or_else(|| runtime.lifecycle.active_profile.clone());
+        runtime.lifecycle.mark_starting(active_profile);
+        if recovered_poison {
+            ctx.runtime.clear_poison();
+        }
+        old
+    };
+    drop(authority);
+    drop_capture_then_session(old.0, old.1);
+    if !operation_is_current(ctx, token) {
+        return superseded_response(ctx);
+    }
+    let mut response = install_prepared_then_follow_start_mode_with_generation(
+        ctx,
+        token,
+        Some(operation.generation),
+        candidate.prepared,
+        legacy_starter,
+        legacy_recovery,
+        true,
+        true,
+        activate,
+    );
+    if response.ok {
+        response.message = requested_profile
+            .map(|profile| format!("capturing {profile}"))
+            .unwrap_or_else(|| "capture started".to_string());
+    }
+    response
+}
+
+fn stop_capture_transaction(ctx: &IdleDaemonContext) -> ControlResponse {
+    let operation = match begin_new_operation_generation(ctx, OperationEntry::Command) {
+        Ok(operation) => operation,
+        Err(error) => return command_failure_without_state_mutation(ctx, error),
+    };
+    let token = operation.token;
+    let authority = lock_operation_authority(ctx);
+    if !operation_is_current(ctx, token) {
+        drop(authority);
+        return superseded_response(ctx);
+    }
+    pause_before_final_mutation(ctx, FinalMutationKind::StopCapture);
+    cancel_active_calibration(ctx);
+    let active = {
+        let (mut runtime, recovered_poison) = match ctx.runtime.lock() {
+            Ok(runtime) => (runtime, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        if runtime.lifecycle.generation != operation.generation {
+            drop(runtime);
+            drop(authority);
+            return superseded_response(ctx);
+        }
+        let active = take_active_capture(&mut runtime);
+        runtime.state = if runtime.config_family == ConfigFamily::Legacy {
+            "stopped".to_string()
+        } else if runtime.active_profile.is_some() {
+            "idle".to_string()
+        } else {
+            "unconfigured".to_string()
+        };
+        runtime.last_error = None;
+        runtime.config_load_error = None;
+        let active_profile = runtime
+            .active_profile
+            .as_ref()
+            .map(|profile| profile.name.clone());
+        runtime.lifecycle.mark_stopped(active_profile);
+        if recovered_poison {
+            ctx.runtime.clear_poison();
+        }
+        active
+    };
+    let response = ControlResponse::success("capture stopped", Some(idle_status_response(ctx)));
+    drop(authority);
+    drop_capture_then_session(active.0, active.1);
+    response
+}
+
+fn release_capture_for_shutdown(ctx: &IdleDaemonContext) {
+    let active = {
+        let mut runtime = ctx
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active = take_active_capture(&mut runtime);
+        runtime.state = "stopping".to_string();
+        runtime.last_error = None;
+        runtime.config_load_error = None;
+        runtime.lifecycle.mark_stopping();
+        ctx.runtime.clear_poison();
+        active
+    };
+    drop_capture_then_session(active.0, active.1);
+}
+
+fn attempt_configured_start_with_recovery(
+    ctx: &IdleDaemonContext,
+    legacy_starter: &dyn LegacyCaptureStarter,
+    recovery: &dyn LegacyStartupRecovery,
+) -> Result<()> {
+    let prepared = ctx
+        .runtime
+        .lock()
+        .ok()
+        .and_then(|runtime| runtime.prepared_legacy.clone());
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    let fault_sink = match runtime_fault_sink_for_attempt(ctx, None) {
+        Ok(sink) => sink,
+        Err(error) => {
+            if error.class == ErrorClass::Fatal {
+                return Err(LambError::Capture(error.message));
+            }
+            publish_capture_attempt_error(ctx, error);
+            return Ok(());
+        }
+    };
+    match legacy_starter.start(&prepared, fault_sink) {
+        Ok(mut active) => {
+            let recovery_result = active
+                .session
+                .as_ref()
+                .ok_or(LambError::ControlInvariant(
+                    "successful capture is missing its session",
+                ))
+                .and_then(|session| recovery.failed_count(session))
+                .and_then(|failed| {
+                    if failed == 0 {
+                        Ok(())
+                    } else {
+                        Err(LambError::Control(format!(
+                            "legacy startup recovery failed for {failed} transaction(s)"
+                        )))
+                    }
+                });
+            if let Err(error) = recovery_result {
+                drop(active);
+                let error = classify_legacy_attempt_error(error);
+                if error.class == ErrorClass::Fatal {
+                    return Err(LambError::Capture(error.message));
+                }
+                publish_capture_attempt_error(ctx, error);
+                return Ok(());
+            }
+            let resolved = active.resolved.clone();
+            let session = active
+                .session
+                .take()
+                .expect("successful capture owns its session");
+            let backend = active
+                .backend
+                .take()
+                .expect("successful capture owns its backend");
+            let capture_health = active.health.take();
+            let published_health = capture_health.clone();
+            let authority = lock_operation_authority(ctx);
+            let mut runtime = ctx.runtime.lock().unwrap();
+            let generation = match runtime.lifecycle.begin_operation() {
+                Ok(generation) => generation,
+                Err(_) => {
+                    drop(runtime);
+                    drop(authority);
+                    drop_capture_then_session(Some(backend), Some(session));
+                    return Err(LambError::ControlInvariant(
+                        "initial capture publication generation overflow",
+                    ));
+                }
+            };
+            runtime.capture = Some(backend);
+            runtime.capture_health = capture_health;
+            runtime.session = Some(session);
+            runtime.resolved_capture = Some(resolved.clone());
+            runtime.state = "capturing".to_string();
+            runtime.last_error = None;
+            runtime.config_load_error = None;
+            runtime
+                .lifecycle
+                .mark_running(None, resolved.resolved_target);
+            drop(runtime);
+            ctx.scheduler.invalidate(generation);
+            if let Some(health) = published_health {
+                health.arm();
+            }
+            drop(authority);
+            Ok(())
+        }
+        Err(error) => {
+            if error.class == ErrorClass::Fatal {
+                Err(LambError::Capture(error.message))
+            } else {
+                publish_capture_attempt_error(ctx, error);
+                Ok(())
+            }
+        }
+    }
 }
 
 struct AppRuntimeState {
     config: app_config::AppConfig,
+    config_family: ConfigFamily,
+    prepared_legacy: Option<PreparedLegacyConfig>,
+    resolved_capture: Option<ResolvedCaptureState>,
+    lifecycle: LifecycleState,
     state: String,
     last_error: Option<String>,
     config_load_error: Option<String>,
@@ -593,6 +2508,7 @@ struct AppRuntimeState {
 impl AppRuntimeState {
     fn capture_matches_target(&self, target: &SessionCalibrationTarget) -> bool {
         match self.capture.as_ref() {
+            Some(CaptureBackend::Fake(_, _)) => false,
             Some(CaptureBackend::Jack(capture, _)) => {
                 target.active_profile.backend == "jack" && capture.sample_rate == target.sample_rate
             }
@@ -600,6 +2516,10 @@ impl AppRuntimeState {
                 target.active_profile.backend == "pipewire"
                     && capture.sample_rate == target.sample_rate
             }
+            #[cfg(test)]
+            Some(CaptureBackend::TestProbe(_)) => false,
+            #[cfg(test)]
+            Some(CaptureBackend::TestAppProbe { .. }) => true,
             None => {
                 #[cfg(test)]
                 {
@@ -616,115 +2536,254 @@ impl AppRuntimeState {
 
 #[allow(dead_code)]
 enum CaptureBackend {
+    Fake(FakeCapture, Vec<String>),
     Jack(JackCapture, Vec<String>),
     PipeWire(PipeWireCapture, Vec<String>),
+    #[cfg(test)]
+    TestProbe(Box<dyn Send + Sync>),
+    #[cfg(test)]
+    TestAppProbe {
+        resource: Box<dyn Send + Sync>,
+        sample_rate: u32,
+    },
+}
+
+struct PrivateAppCaptureAttempt {
+    backend: Option<CaptureBackend>,
+    runtime: Option<CaptureRuntime>,
+    session: Option<Arc<CaptureSession>>,
+}
+
+impl PrivateAppCaptureAttempt {
+    fn new(backend: CaptureBackend, runtime: CaptureRuntime) -> Self {
+        Self {
+            backend: Some(backend),
+            runtime: Some(runtime),
+            session: None,
+        }
+    }
+
+    fn backend(&self) -> &CaptureBackend {
+        self.backend.as_ref().expect("private attempt has backend")
+    }
+
+    fn take_runtime(&mut self) -> CaptureRuntime {
+        self.runtime
+            .take()
+            .expect("private attempt has capture runtime")
+    }
+
+    fn set_session(&mut self, session: Arc<CaptureSession>) {
+        self.session = Some(session);
+    }
+
+    fn session(&self) -> &Arc<CaptureSession> {
+        self.session.as_ref().expect("private attempt has session")
+    }
+
+    fn run_post_backend_step<F>(&mut self, step: F) -> Result<()>
+    where
+        F: FnOnce(&Arc<CaptureSession>) -> Result<()>,
+    {
+        step(self.session())
+    }
+
+    fn publish(mut self) -> (CaptureBackend, Arc<CaptureSession>) {
+        let backend = self.backend.take().expect("private attempt has backend");
+        let session = self.session.take().expect("private attempt has session");
+        debug_assert!(self.runtime.is_none());
+        (backend, session)
+    }
+
+    #[cfg(test)]
+    fn for_test(backend: CaptureBackend, session: Arc<CaptureSession>) -> Self {
+        Self {
+            backend: Some(backend),
+            runtime: None,
+            session: Some(session),
+        }
+    }
+}
+
+impl Drop for PrivateAppCaptureAttempt {
+    fn drop(&mut self) {
+        drop(self.backend.take());
+        drop(self.session.take());
+        drop(self.runtime.take());
+    }
 }
 
 impl CaptureBackend {
     fn runtime_error(&self) -> Option<String> {
         match self {
+            Self::Fake(_, _) => None,
             Self::Jack(_, _) => None,
             Self::PipeWire(capture, _) => capture.runtime_error(),
+            #[cfg(test)]
+            Self::TestProbe(_) => None,
+            #[cfg(test)]
+            Self::TestAppProbe { .. } => None,
         }
     }
 
     fn sample_rate(&self) -> u32 {
         match self {
+            CaptureBackend::Fake(_, _) => {
+                unreachable!("fake capture is not used by app-profile runtime")
+            }
             CaptureBackend::Jack(c, _) => c.sample_rate,
             CaptureBackend::PipeWire(c, _) => c.sample_rate,
+            #[cfg(test)]
+            CaptureBackend::TestProbe(_) => 0,
+            #[cfg(test)]
+            CaptureBackend::TestAppProbe { sample_rate, .. } => *sample_rate,
         }
     }
 }
 
-fn run_app_config_daemon(
-    path: &Path,
-    config: app_config::AppConfig,
-    calibration_root: PathBuf,
+fn run_idle_listener(ctx: Arc<IdleDaemonContext>, socket: ControlSocketOwner) -> Result<()> {
+    run_idle_listener_with_hook(ctx, socket, |_| {})
+}
+
+fn cancel_operation_job(ctx: &IdleDaemonContext, job: OperationJob) {
+    if let OperationJob::Client { stream, .. } = job {
+        let response = ControlResponse {
+            ok: false,
+            message: "shutting down".to_string(),
+            status: Some(idle_status_response(ctx)),
+            error_context: crate::control::ControlErrorContext::default(),
+            persistence_outcome: None,
+            threshold_report: None,
+        };
+        let _ = write_response(stream, &response);
+    }
+}
+
+fn finish_idle_listener_with_probe<F>(
+    ctx: Arc<IdleDaemonContext>,
+    mut socket: ControlSocketOwner,
+    lane: Arc<OperationLane<OperationJob>>,
+    scheduler_worker: std::thread::JoinHandle<()>,
+    worker: std::thread::JoinHandle<()>,
+    mut probe: F,
+) -> Result<()>
+where
+    F: FnMut(&'static str),
+{
+    ctx.scheduler.stop();
+    let mut first_error = scheduler_worker
+        .join()
+        .err()
+        .map(|_| LambError::Control("retry scheduler panicked".to_string()));
+    probe("scheduler-joined");
+
+    lane.close();
+    probe("lane-closed");
+    if worker.join().is_err() {
+        while let Some(job) = lane.pop() {
+            cancel_operation_job(&ctx, job);
+        }
+        if first_error.is_none() {
+            first_error = Some(LambError::Control("operation worker panicked".to_string()));
+        }
+    }
+    probe("worker-joined");
+
+    release_capture_for_shutdown(&ctx);
+    probe("capture-released");
+    let cleanup_result = socket.cleanup();
+    probe("socket-cleaned");
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    cleanup_result
+}
+
+fn finish_idle_listener(
+    ctx: Arc<IdleDaemonContext>,
+    socket: ControlSocketOwner,
+    lane: Arc<OperationLane<OperationJob>>,
+    scheduler_worker: std::thread::JoinHandle<()>,
+    worker: std::thread::JoinHandle<()>,
 ) -> Result<()> {
-    let control_socket_path = expand_control_socket_path(&config.daemon.control_socket_path)?;
-    let listener = bind_control_socket(&control_socket_path)?;
-
-    let mut state = AppRuntimeState {
-        config,
-        state: "unconfigured".to_string(),
-        last_error: None,
-        config_load_error: None,
-        active_profile: None,
-        capture: None,
-        capture_health: None,
-        session: None,
-        #[cfg(test)]
-        test_capture_attached: false,
-    };
-
-    match reload_app_config_inner(&mut state, path, &calibration_root) {
-        Ok(()) => {}
-        Err(err) => {
-            state.last_error = Some(err.to_string());
-        }
-    }
-
-    let ctx = Arc::new(IdleDaemonContext {
-        config_path: path.to_path_buf(),
-        control_socket_path,
-        calibration_root,
-        runtime: Mutex::new(state),
-        stop: AtomicBool::new(false),
-    });
-    run_idle_listener(ctx, listener)
-}
-
-fn run_idle_listener(ctx: Arc<IdleDaemonContext>, listener: UnixListener) -> Result<()> {
-    run_idle_listener_with_hook(ctx, listener, |_| {})
+    finish_idle_listener_with_probe(ctx, socket, lane, scheduler_worker, worker, |_| {})
 }
 
 fn run_idle_listener_with_hook<F>(
     ctx: Arc<IdleDaemonContext>,
-    listener: UnixListener,
+    socket: ControlSocketOwner,
     before_operation: F,
 ) -> Result<()>
 where
     F: Fn(&ControlRequest) + Send + 'static,
 {
+    run_idle_listener_with_dependencies(
+        ctx,
+        socket,
+        Arc::new(RealLegacyCaptureStarter),
+        Arc::new(RealLegacyStartupRecovery),
+        || {},
+        move |job| {
+            if let OperationJob::Client { request, .. } = job {
+                before_operation(request);
+            }
+        },
+        || {},
+    )
+}
+
+fn run_idle_listener_with_dependencies<C, B, A>(
+    ctx: Arc<IdleDaemonContext>,
+    socket: ControlSocketOwner,
+    legacy_starter: Arc<dyn LegacyCaptureStarter>,
+    legacy_recovery: Arc<dyn LegacyStartupRecovery>,
+    after_accept: C,
+    before_operation: B,
+    after_operation: A,
+) -> Result<()>
+where
+    C: Fn(),
+    B: Fn(&OperationJob) + Send + 'static,
+    A: Fn() + Send + 'static,
+{
+    debug_assert_eq!(ctx.control_socket_path, socket.path);
     let lane = Arc::new(OperationLane::new(DEFAULT_CONTROL_QUEUE_CAPACITY as usize)?);
+    let scheduler_worker = spawn_retry_scheduler(ctx.scheduler.clone(), Arc::clone(&ctx.clock), {
+        let lane = Arc::clone(&lane);
+        move |operation| {
+            lane.try_enqueue(OperationJob::Internal(operation))
+                .map_err(|(error, _)| error)
+        }
+    })
+    .map_err(|error| io_error("retry scheduler", error))?;
     let worker = spawn_operation_worker(
         Arc::clone(&lane),
         DEFAULT_WORKER_STACK_BYTES as usize,
         {
             let ctx = Arc::clone(&ctx);
-            move |(request, stream): (ControlRequest, UnixStream)| {
-                before_operation(&request);
-                match request {
-                    ControlRequest::Recall => {
-                        app_persistence_delivery(&ctx, ExportCommand::Recall, stream)
-                    }
-                    ControlRequest::Dump => {
-                        app_persistence_delivery(&ctx, ExportCommand::Dump, stream)
-                    }
-                    request => {
-                        let response = handle_idle_request(&ctx, request);
-                        let _ = write_response(stream, &response);
-                    }
-                }
+            let legacy_starter = Arc::clone(&legacy_starter);
+            let legacy_recovery = Arc::clone(&legacy_recovery);
+            move |job| {
+                ctx.scheduler.notify_lane_available();
+                before_operation(&job);
+                execute_operation_job_with_recovery(
+                    &ctx,
+                    job,
+                    legacy_starter.as_ref(),
+                    legacy_recovery.as_ref(),
+                );
+                after_operation();
             }
         },
         {
             let ctx = Arc::clone(&ctx);
-            move |(_request, stream): (ControlRequest, UnixStream)| {
-                let response = ControlResponse {
-                    ok: false,
-                    message: "shutting down".to_string(),
-                    status: Some(idle_status_response(&ctx)),
-                    persistence_outcome: None,
-                    threshold_report: None,
-                };
-                let _ = write_response(stream, &response);
-            }
+            move |job| cancel_operation_job(&ctx, job)
         },
     );
-    for stream in listener.incoming() {
+    for stream in socket.listener().incoming() {
         match stream {
             Ok(stream) => {
+                after_accept();
                 let _ = route_idle_stream(&ctx, &lane, stream);
             }
             Err(err) => {
@@ -735,13 +2794,12 @@ where
             break;
         }
     }
-    lane.close();
-    worker
-        .join()
-        .map_err(|_| LambError::Control("operation worker panicked".to_string()))?;
-
-    let _ = fs::remove_file(&ctx.control_socket_path);
-    Ok(())
+    let fatal = ctx.first_fatal.get().cloned();
+    let result = finish_idle_listener(ctx, socket, lane, scheduler_worker, worker);
+    match (fatal, result) {
+        (Some(message), _) => Err(LambError::Control(message)),
+        (None, result) => result,
+    }
 }
 
 fn expand_control_socket_path(socket_path: &str) -> Result<PathBuf> {
@@ -753,23 +2811,363 @@ fn expand_control_socket_path(socket_path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(socket_path))
 }
 
-fn bind_control_socket(path: &Path) -> Result<UnixListener> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        metadata.file_type().is_socket() && metadata.dev() == self.dev && metadata.ino() == self.ino
+    }
+}
+
+#[derive(Debug)]
+struct ControlSocketOwner {
+    listener: UnixListener,
+    path: PathBuf,
+    identity: SocketIdentity,
+    cleaned: bool,
+}
+
+#[derive(Debug)]
+struct StagingSocketGuard {
+    listener: Option<UnixListener>,
+    path: PathBuf,
+    identity: Option<SocketIdentity>,
+    armed: bool,
+}
+
+impl StagingSocketGuard {
+    fn new(listener: UnixListener, path: PathBuf) -> Self {
+        Self {
+            listener: Some(listener),
+            path,
+            identity: None,
+            armed: true,
+        }
+    }
+
+    fn set_identity(&mut self, identity: SocketIdentity) {
+        self.identity = Some(identity);
+    }
+
+    fn into_owner(mut self) -> ControlSocketOwner {
+        let listener = self
+            .listener
+            .take()
+            .expect("armed staging guard owns its listener");
+        let identity = self
+            .identity
+            .expect("staging identity is acquired before ownership transfer");
+        self.armed = false;
+        ControlSocketOwner {
+            listener,
+            path: self.path.clone(),
+            identity,
+            cleaned: false,
+        }
+    }
+}
+
+impl Drop for StagingSocketGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.identity {
+            Some(identity) => {
+                let _ = cleanup_socket_path(&self.path, identity);
+            }
+            None => {
+                if let Ok(metadata) = fs::symlink_metadata(&self.path) {
+                    if metadata.file_type().is_socket() {
+                        let _ = fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl ControlSocketOwner {
+    fn bind(path: PathBuf) -> Result<Self> {
+        Self::bind_with_setup(path, |_| Ok(()))
+    }
+
+    fn bind_with_setup<F>(path: PathBuf, setup: F) -> Result<Self>
+    where
+        F: FnOnce(&UnixListener) -> Result<()>,
+    {
+        Self::bind_with_hooks(path, || {}, setup)
+    }
+
+    fn bind_with_hooks<H, F>(path: PathBuf, after_pin: H, setup: F) -> Result<Self>
+    where
+        H: FnOnce(),
+        F: FnOnce(&UnixListener) -> Result<()>,
+    {
+        Self::bind_with_io(
+            path,
+            after_pin,
+            pin_socket_path,
+            |pinned| {
+                pinned
+                    .metadata()
+                    .map_err(|source| io_error("pinned socket", source))
+            },
+            setup,
+        )
+    }
+
+    fn bind_with_io<H, P, M, F>(
+        path: PathBuf,
+        after_pin: H,
+        pin: P,
+        pinned_metadata: M,
+        setup: F,
+    ) -> Result<Self>
+    where
+        H: FnOnce(),
+        P: FnOnce(&Path) -> Result<fs::File>,
+        M: FnOnce(&fs::File) -> Result<fs::Metadata>,
+        F: FnOnce(&UnixListener) -> Result<()>,
+    {
+        validate_unix_socket_path(&path)?;
+        let staging_path = private_socket_path(&path)?;
+        validate_unix_socket_path(&staging_path)?;
+        remove_stale_control_socket(&path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| LambError::Control("control socket path has no parent".to_string()))?;
+        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+
+        let listener =
+            UnixListener::bind(&staging_path).map_err(|source| io_error(&staging_path, source))?;
+        let mut staging = StagingSocketGuard::new(listener, staging_path.clone());
+        let path_metadata = fs::symlink_metadata(&staging_path)
+            .map_err(|source| io_error(&staging_path, source))?;
+        if !path_metadata.file_type().is_socket() {
+            return Err(LambError::Control(format!(
+                "private control path is not a socket at {}",
+                staging_path.display()
+            )));
+        }
+        let identity = SocketIdentity::from_metadata(&path_metadata);
+        staging.set_identity(identity);
+
+        let pinned = pin(&staging_path)?;
+        let metadata = pinned_metadata(&pinned)?;
+        if !identity.matches(&metadata) {
+            return Err(LambError::Control(format!(
+                "private control socket changed before pinning at {}",
+                staging_path.display()
+            )));
+        }
+        let mut owner = staging.into_owner();
+        after_pin();
+
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        let pinned_path = PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
+        fs::set_permissions(&pinned_path, permissions)
+            .map_err(|source| io_error(&staging_path, source))?;
+
+        match rename_noreplace(&staging_path, &path) {
+            Ok(()) => {}
+            Err(source) if source.raw_os_error() == Some(libc::EEXIST) => {
+                return Err(LambError::Control(format!(
+                    "control path changed during socket publication at {}",
+                    path.display()
+                )));
+            }
+            Err(source) => return Err(io_error(&path, source)),
+        }
+        owner.path = path;
+
+        setup(owner.listener())?;
+        Ok(owner)
+    }
+
+    fn listener(&self) -> &UnixListener {
+        &self.listener
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        cleanup_socket_path(&self.path, self.identity)?;
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
+
+fn validate_unix_socket_path(path: &Path) -> Result<()> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() > UNIX_SOCKET_PATH_MAX_BYTES {
+        return Err(LambError::Control(format!(
+            "control socket path exceeds Linux sockaddr_un.sun_path capacity ({} > {} bytes): {}",
+            bytes.len(),
+            UNIX_SOCKET_PATH_MAX_BYTES,
+            path.display()
+        )));
+    }
+    if bytes.contains(&0) {
+        return Err(LambError::Control(
+            "control socket path contains NUL".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn private_socket_path(path: &Path) -> Result<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| LambError::Control("control socket path has no parent".to_string()))?;
-    fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|source| io_error(path, source))?;
+    if path.file_name().is_none() {
+        return Err(LambError::Control(
+            "control socket path has no file name".to_string(),
+        ));
     }
-    let listener = UnixListener::bind(path).map_err(|source| io_error(path, source))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|source| io_error(path, source))?;
-    Ok(listener)
+    let mut random = 0_u64;
+    let read = unsafe {
+        libc::getrandom(
+            (&mut random as *mut u64).cast::<libc::c_void>(),
+            std::mem::size_of::<u64>(),
+            0,
+        )
+    };
+    if read != std::mem::size_of::<u64>() as isize {
+        return Err(io_error(parent, std::io::Error::last_os_error()));
+    }
+    Ok(parent.join(format!(".lamb-{:016x}", random)))
+}
+
+fn pin_socket_path(path: &Path) -> Result<fs::File> {
+    let nul_terminated = nul_terminated_path(path)?;
+    let fd = unsafe {
+        libc::open(
+            nul_terminated.as_ptr().cast::<libc::c_char>(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io_error(path, std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let from = nul_terminated_path(from).map_err(lamb_error_to_io)?;
+    let to = nul_terminated_path(to).map_err(lamb_error_to_io)?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr().cast::<libc::c_char>(),
+            libc::AT_FDCWD,
+            to.as_ptr().cast::<libc::c_char>(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn nul_terminated_path(path: &Path) -> Result<Vec<u8>> {
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.contains(&0) {
+        return Err(LambError::Control(
+            "control socket path contains NUL".to_string(),
+        ));
+    }
+    let mut nul_terminated = Vec::with_capacity(path_bytes.len() + 1);
+    nul_terminated.extend_from_slice(path_bytes);
+    nul_terminated.push(0);
+    Ok(nul_terminated)
+}
+
+fn lamb_error_to_io(error: LambError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+}
+
+fn cleanup_socket_path(path: &Path, identity: SocketIdentity) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if identity.matches(&metadata) => {
+            fs::remove_file(path).map_err(|source| io_error(path, source))
+        }
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error(path, source)),
+    }
+}
+
+impl Drop for ControlSocketOwner {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+fn remove_stale_control_socket(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io_error(path, source)),
+        Ok(metadata) => metadata,
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(LambError::Control(format!(
+            "refusing to replace non-socket control path {}",
+            path.display()
+        )));
+    }
+
+    let identity = SocketIdentity::from_metadata(&metadata);
+    let probe = UnixDatagram::unbound().map_err(|source| io_error(path, source))?;
+    match probe.connect(path) {
+        Err(source) if source.raw_os_error() == Some(libc::EPROTOTYPE) => {
+            Err(LambError::Control(format!(
+                "control socket already has a live listener at {}",
+                path.display()
+            )))
+        }
+        Err(source) if source.raw_os_error() == Some(libc::ECONNREFUSED) => {
+            match fs::symlink_metadata(path) {
+                Ok(current) if identity.matches(&current) => {
+                    fs::remove_file(path).map_err(|source| io_error(path, source))
+                }
+                Ok(_) => Err(LambError::Control(format!(
+                    "control socket changed while checking stale path {}",
+                    path.display()
+                ))),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(source) => Err(io_error(path, source)),
+            }
+        }
+        Ok(()) => Err(LambError::Control(format!(
+            "refusing control socket with unexpected probe response at {}",
+            path.display()
+        ))),
+        Err(source) => Err(io_error(path, source)),
+    }
 }
 
 fn read_request(stream: UnixStream) -> Result<(ControlRequest, UnixStream)> {
     stream
-        .set_read_timeout(Some(PERSIST_TIMEOUT))
+        .set_read_timeout(Some(CONTROL_REQUEST_TIMEOUT))
         .map_err(|source| LambError::Control(source.to_string()))?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -789,81 +3187,85 @@ fn write_response(stream: UnixStream, response: &ControlResponse) -> Result<()> 
     Ok(())
 }
 
-/// Publishes shutdown before direct-handler cancellation/status work that may
-/// need a runtime-owned lock. Routed Stop also closes admission first through
-/// `publish_stop_and_close_before`.
-fn publish_stop_before<F>(stop: &AtomicBool, lock_dependent_work: F)
-where
-    F: FnOnce(),
-{
-    stop.store(true, Ordering::Release);
-    lock_dependent_work();
+fn begin_shutdown(ctx: &IdleDaemonContext) {
+    if begin_new_operation_generation(ctx, OperationEntry::DirectStop).is_err() {
+        let _authority = lock_operation_authority(ctx);
+        ctx.stop.store(true, Ordering::SeqCst);
+        ctx.scheduler.stop();
+        let mut runtime = ctx
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.lifecycle.mark_stopping();
+        ctx.runtime.clear_poison();
+    }
 }
 
-fn publish_stop_and_close_before<T, F>(
-    stop: &AtomicBool,
-    lane: &OperationLane<T>,
-    lock_dependent_work: F,
-) where
-    F: FnOnce(),
-{
-    stop.store(true, Ordering::Release);
-    lane.close();
-    lock_dependent_work();
+fn signal_fatal(ctx: &IdleDaemonContext, message: String) {
+    let _ = ctx.first_fatal.set(message);
+    ctx.stop.store(true, Ordering::SeqCst);
+    ctx.scheduler.stop();
+    let _ = nonblocking_control_wake(&ctx.control_socket_path);
 }
 
-/// Routes one legacy control connection: status is answered directly (so it
-/// stays responsive during persistence), stop sets the stop flag, and mutating
-/// requests are transferred to the operation lane.
-fn route_legacy_stream(
-    ctx: &DaemonContext,
-    lane: &OperationLane<(ControlRequest, UnixStream)>,
-    stream: UnixStream,
-) -> Result<()> {
-    let (request, stream) = read_request(stream)?;
-    match request {
-        ControlRequest::Status => {
-            let response = ControlResponse {
-                ok: true,
-                message: "status".to_string(),
-                status: Some(status_response(ctx)),
-                persistence_outcome: None,
-                threshold_report: None,
-            };
-            write_response(stream, &response)
-        }
-        ControlRequest::Stop => {
-            publish_stop_and_close_before(&ctx.stop, lane, || {
-                ctx.session.arena.cancel_calibration();
-            });
-            let response = ControlResponse {
-                ok: true,
-                message: "stopping".to_string(),
-                status: Some(status_response(ctx)),
-                persistence_outcome: None,
-                threshold_report: None,
-            };
-            write_response(stream, &response)
-        }
-        request => match lane.try_enqueue((request, stream)) {
-            Ok(()) => Ok(()),
-            Err((EnqueueError::Full | EnqueueError::Closed, (_, stream))) => {
-                let response = ControlResponse {
-                    ok: false,
-                    message: "operation queue is busy or shutting down".to_string(),
-                    status: Some(status_response(ctx)),
-                    persistence_outcome: None,
-                    threshold_report: None,
-                };
-                write_response(stream, &response)
-            }
-        },
+fn nonblocking_control_wake(path: &Path) -> Result<()> {
+    validate_unix_socket_path(path)?;
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io_error(path, std::io::Error::last_os_error()));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let path_bytes = path.as_os_str().as_bytes();
+    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            address.sun_path.as_mut_ptr().cast::<u8>(),
+            path_bytes.len(),
+        );
+    }
+    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path)
+        .checked_add(path_bytes.len())
+        .and_then(|length| length.checked_add(1))
+        .and_then(|length| libc::socklen_t::try_from(length).ok())
+        .ok_or_else(|| LambError::Control("control socket address length overflow".to_string()))?;
+    let connected = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            address_len,
+        )
+    };
+    if connected == 0 {
+        return Ok(());
+    }
+
+    let source = std::io::Error::last_os_error();
+    let raw = source.raw_os_error();
+    // A successful/in-progress connect makes accept eligible. EAGAIN means the
+    // backlog is already full, so accept is also eligible; once accepted, the
+    // independently bounded request read makes the stop flag visible promptly.
+    if raw == Some(libc::EINPROGRESS)
+        || raw == Some(libc::EALREADY)
+        || raw == Some(libc::EAGAIN)
+        || raw == Some(libc::ECONNREFUSED)
+    {
+        Ok(())
+    } else {
+        Err(io_error(path, source))
     }
 }
 
 fn route_idle_stream(
     ctx: &IdleDaemonContext,
-    lane: &OperationLane<(ControlRequest, UnixStream)>,
+    lane: &OperationLane<OperationJob>,
     stream: UnixStream,
 ) -> Result<()> {
     let (request, stream) = read_request(stream)?;
@@ -873,156 +3275,356 @@ fn route_idle_stream(
                 ok: true,
                 message: "status".to_string(),
                 status: Some(idle_status_response(ctx)),
+                error_context: crate::control::ControlErrorContext::default(),
                 persistence_outcome: None,
                 threshold_report: None,
             };
             write_response(stream, &response)
         }
         ControlRequest::Stop => {
-            publish_stop_and_close_before(&ctx.stop, lane, || cancel_active_calibration(ctx));
+            begin_shutdown(ctx);
+            cancel_active_calibration(ctx);
             let response = ControlResponse {
                 ok: true,
                 message: "stopping".to_string(),
                 status: Some(idle_status_response(ctx)),
+                error_context: crate::control::ControlErrorContext::default(),
                 persistence_outcome: None,
                 threshold_report: None,
             };
             write_response(stream, &response)
         }
-        ControlRequest::StopCapture => {
-            cancel_active_calibration(ctx);
-            match lane.try_enqueue((ControlRequest::StopCapture, stream)) {
-                Ok(()) => Ok(()),
-                Err((EnqueueError::Full | EnqueueError::Closed, (_, stream))) => {
-                    let response = ControlResponse {
-                        ok: false,
-                        message: "operation queue is busy or shutting down".to_string(),
-                        status: Some(idle_status_response(ctx)),
-                        persistence_outcome: None,
-                        threshold_report: None,
-                    };
-                    write_response(stream, &response)
-                }
-            }
-        }
-        request => match lane.try_enqueue((request, stream)) {
+        request => match lane.try_enqueue(OperationJob::Client { request, stream }) {
             Ok(()) => Ok(()),
-            Err((EnqueueError::Full | EnqueueError::Closed, (_, stream))) => {
+            Err((
+                EnqueueError::Full | EnqueueError::Closed,
+                OperationJob::Client { stream, .. },
+            )) => {
                 let response = ControlResponse {
                     ok: false,
                     message: "operation queue is busy or shutting down".to_string(),
                     status: Some(idle_status_response(ctx)),
+                    error_context: crate::control::ControlErrorContext::default(),
                     persistence_outcome: None,
                     threshold_report: None,
                 };
                 write_response(stream, &response)
             }
+            Err((_, OperationJob::Internal(_))) => {
+                unreachable!("client admission returned internal job")
+            }
         },
     }
 }
 
+#[cfg(test)]
 fn handle_idle_request(ctx: &IdleDaemonContext, request: ControlRequest) -> ControlResponse {
+    handle_idle_request_with_recovery(
+        ctx,
+        request,
+        &RealLegacyCaptureStarter,
+        &RealLegacyStartupRecovery,
+    )
+}
+
+fn handle_idle_request_with_recovery(
+    ctx: &IdleDaemonContext,
+    request: ControlRequest,
+    legacy_starter: &dyn LegacyCaptureStarter,
+    legacy_recovery: &dyn LegacyStartupRecovery,
+) -> ControlResponse {
+    let legacy = ctx
+        .runtime
+        .lock()
+        .map(|runtime| runtime.config_family == ConfigFamily::Legacy)
+        .unwrap_or(false);
+    if legacy && matches!(&request, ControlRequest::Threshold { .. }) {
+        return ControlResponse {
+            ok: false,
+            message: "profile threshold commands are unsupported for legacy configuration"
+                .to_string(),
+            status: Some(idle_status_response(ctx)),
+            error_context: crate::control::ControlErrorContext::default(),
+            persistence_outcome: None,
+            threshold_report: None,
+        };
+    }
     match request {
         ControlRequest::Status => ControlResponse {
             ok: true,
             message: "status".to_string(),
             status: Some(idle_status_response(ctx)),
+            error_context: crate::control::ControlErrorContext::default(),
             persistence_outcome: None,
             threshold_report: None,
         },
         ControlRequest::Stop => {
-            publish_stop_before(&ctx.stop, || cancel_active_calibration(ctx));
+            begin_shutdown(ctx);
+            cancel_active_calibration(ctx);
             ControlResponse {
                 ok: true,
                 message: "stopping".to_string(),
                 status: Some(idle_status_response(ctx)),
+                error_context: crate::control::ControlErrorContext::default(),
                 persistence_outcome: None,
                 threshold_report: None,
             }
         }
         ControlRequest::StartCapture { profile, activate } => {
-            if let Some(response) = config_load_failure_response(ctx) {
-                return response;
-            }
-            match start_app_capture(ctx, profile, activate) {
-                Ok(message) => ControlResponse {
-                    ok: true,
-                    message,
-                    status: Some(idle_status_response(ctx)),
-                    persistence_outcome: None,
-                    threshold_report: None,
-                },
-                Err(err) => {
-                    set_app_last_error(ctx, err.to_string());
-                    ControlResponse {
-                        ok: false,
-                        message: err.to_string(),
-                        status: Some(idle_status_response(ctx)),
-                        persistence_outcome: None,
-                        threshold_report: None,
-                    }
-                }
-            }
+            start_capture_transaction_with_recovery(
+                ctx,
+                profile.as_deref(),
+                activate,
+                legacy_starter,
+                legacy_recovery,
+            )
         }
-        ControlRequest::StopCapture => {
-            cancel_active_calibration(ctx);
-            stop_app_capture(ctx);
-            ControlResponse {
-                ok: true,
-                message: "capture stopped".to_string(),
-                status: Some(idle_status_response(ctx)),
-                persistence_outcome: None,
-                threshold_report: None,
-            }
-        }
+        ControlRequest::StopCapture => stop_capture_transaction(ctx),
         ControlRequest::Recall => persistence_delivery_only_response(idle_status_response(ctx)),
         ControlRequest::Clear => handle_app_clear(ctx),
         ControlRequest::Dump => persistence_delivery_only_response(idle_status_response(ctx)),
-        ControlRequest::Reload => match reload_app_config(ctx) {
-            Ok(()) => ControlResponse {
-                ok: true,
-                message: "config reloaded".to_string(),
-                status: Some(idle_status_response(ctx)),
-                persistence_outcome: None,
-                threshold_report: None,
-            },
-            Err(err) => {
-                set_app_last_error(ctx, err.to_string());
-                ControlResponse {
-                    ok: false,
-                    message: err.to_string(),
-                    status: Some(idle_status_response(ctx)),
-                    persistence_outcome: None,
-                    threshold_report: None,
-                }
-            }
-        },
+        ControlRequest::Reload => {
+            reload_daemon_config_with_recovery(ctx, None, legacy_starter, legacy_recovery)
+        }
         ControlRequest::Threshold { request } => handle_app_threshold(ctx, request),
     }
 }
 
-fn cancel_active_calibration(ctx: &IdleDaemonContext) {
-    if let Ok(runtime) = ctx.runtime.lock() {
-        if let Some(session) = runtime.session.as_ref() {
-            session.arena.cancel_calibration();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduledGenerationDecision {
+    Current,
+    Stale,
+    Terminalized,
+}
+
+fn scheduled_generation_decision(
+    ctx: &IdleDaemonContext,
+    generation: u64,
+) -> ScheduledGenerationDecision {
+    let authority = lock_operation_authority(ctx);
+    let (mut runtime, recovered_poison) = lock_runtime_recovering_poison(ctx);
+    let generation_is_current = runtime.lifecycle.generation == generation;
+    let scheduler_stopped = ctx.scheduler.is_stopped();
+    if !recovered_poison {
+        return if scheduler_stopped {
+            ScheduledGenerationDecision::Terminalized
+        } else if generation_is_current {
+            ScheduledGenerationDecision::Current
+        } else {
+            ScheduledGenerationDecision::Stale
+        };
+    }
+    if !generation_is_current {
+        ctx.runtime.clear_poison();
+        return ScheduledGenerationDecision::Stale;
+    }
+
+    let no_active_ownership = runtime.capture.is_none()
+        && runtime.session.is_none()
+        && runtime.capture_health.is_none()
+        && runtime.resolved_capture.is_none();
+    #[cfg(test)]
+    let no_active_ownership = no_active_ownership && !runtime.test_capture_attached;
+    let retry_is_coherent = runtime.lifecycle.error_class == Some(ErrorClass::Transient)
+        && runtime.lifecycle.retry_policy == RetryPolicy::BoundedBackoff
+        && runtime.lifecycle.next_retry_at.is_some();
+    if !scheduler_stopped && no_active_ownership && retry_is_coherent {
+        ctx.runtime.clear_poison();
+        return ScheduledGenerationDecision::Current;
+    }
+
+    let active = take_active_capture(&mut runtime);
+    let message = "runtime state lock poison violated scheduled retry invariants".to_string();
+    ctx.runtime.clear_poison();
+    drop(runtime);
+    drop(authority);
+    drop_capture_then_session(active.0, active.1);
+    signal_fatal(ctx, message);
+    ScheduledGenerationDecision::Terminalized
+}
+
+fn execute_operation_job_with_recovery(
+    ctx: &IdleDaemonContext,
+    job: OperationJob,
+    legacy_starter: &dyn LegacyCaptureStarter,
+    legacy_recovery: &dyn LegacyStartupRecovery,
+) {
+    if ctx.stop.load(Ordering::Acquire) {
+        cancel_operation_job(ctx, job);
+        return;
+    }
+    match job {
+        OperationJob::Client { request, stream } => match request {
+            ControlRequest::Recall => app_persistence_delivery(ctx, ExportCommand::Recall, stream),
+            ControlRequest::Dump => app_persistence_delivery(ctx, ExportCommand::Dump, stream),
+            request => {
+                let response = handle_idle_request_with_recovery(
+                    ctx,
+                    request,
+                    legacy_starter,
+                    legacy_recovery,
+                );
+                let _ = write_response(stream, &response);
+                if response.error_context.error_class == Some(ErrorClass::Fatal) {
+                    signal_fatal(ctx, response.message);
+                }
+            }
+        },
+        OperationJob::Internal(ScheduledOperation::Retry { generation }) => {
+            execute_retry_operation(ctx, generation, legacy_starter, legacy_recovery)
         }
+        OperationJob::Internal(ScheduledOperation::RuntimeFault {
+            generation,
+            attempt_id,
+            fault,
+        }) => publish_runtime_fault(ctx, generation, attempt_id, fault),
+    }
+}
+
+fn execute_retry_operation(
+    ctx: &IdleDaemonContext,
+    generation: u64,
+    legacy_starter: &dyn LegacyCaptureStarter,
+    legacy_recovery: &dyn LegacyStartupRecovery,
+) {
+    if scheduled_generation_decision(ctx, generation) != ScheduledGenerationDecision::Current {
+        return;
+    }
+    let token = match begin_command_operation(ctx) {
+        Ok(token) => token,
+        Err(error) => {
+            if error.class == ErrorClass::Fatal {
+                signal_fatal(ctx, error.message);
+            }
+            return;
+        }
+    };
+    if scheduled_generation_decision(ctx, generation) != ScheduledGenerationDecision::Current
+        || !operation_is_current(ctx, token)
+    {
+        return;
+    }
+    let candidate = match prepare_config_from_disk(&ctx.config_path, None) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            let response = command_attempt_failure(ctx, token, error, false);
+            signal_fatal_response(ctx, &response);
+            return;
+        }
+    };
+    if scheduled_generation_decision(ctx, generation) != ScheduledGenerationDecision::Current
+        || !operation_is_current(ctx, token)
+    {
+        return;
+    }
+    if let Err(error) = validate_candidate_socket(ctx, &candidate) {
+        let response = command_attempt_failure(ctx, token, error, false);
+        signal_fatal_response(ctx, &response);
+        return;
+    }
+    if scheduled_generation_decision(ctx, generation) != ScheduledGenerationDecision::Current
+        || !operation_is_current(ctx, token)
+    {
+        return;
+    }
+    let response = install_prepared_then_follow_start_mode(
+        ctx,
+        token,
+        candidate.prepared,
+        legacy_starter,
+        legacy_recovery,
+        false,
+        true,
+        false,
+    );
+    signal_fatal_response(ctx, &response);
+}
+
+fn signal_fatal_response(ctx: &IdleDaemonContext, response: &ControlResponse) {
+    if response.error_context.error_class == Some(ErrorClass::Fatal) {
+        signal_fatal(ctx, response.message.clone());
+    }
+}
+
+fn publish_runtime_fault(
+    ctx: &IdleDaemonContext,
+    generation: u64,
+    attempt_id: CaptureAttemptId,
+    fault: RuntimeCaptureFault,
+) {
+    if scheduled_generation_decision(ctx, generation) != ScheduledGenerationDecision::Current {
+        return;
+    }
+    let authority = lock_operation_authority(ctx);
+    if ctx.stop.load(Ordering::SeqCst) {
+        return;
+    }
+    let (mut runtime, recovered_poison) = lock_runtime_recovering_poison(ctx);
+    if runtime.lifecycle.generation != generation
+        || runtime
+            .capture_health
+            .as_ref()
+            .and_then(PipeWireHealth::attempt_id)
+            != Some(attempt_id)
+    {
+        if recovered_poison {
+            ctx.runtime.clear_poison();
+        }
+        return;
+    }
+    let has_matching_capture = runtime.capture.is_some()
+        || runtime.session.is_some()
+        || runtime.capture_health.is_some()
+        || runtime.resolved_capture.is_some();
+    #[cfg(test)]
+    let has_matching_capture = has_matching_capture || runtime.test_capture_attached;
+    if !has_matching_capture {
+        if recovered_poison {
+            ctx.runtime.clear_poison();
+        }
+        return;
+    }
+    let (capture_state, message) = match fault {
+        RuntimeCaptureFault::DeviceDisconnected(message) => {
+            (CaptureState::WaitingForDevice, message)
+        }
+        RuntimeCaptureFault::BackendFault(message) => (CaptureState::Faulted, message),
+    };
+    let active = take_active_capture(&mut runtime);
+    runtime.state = "faulted".to_string();
+    runtime.last_error = Some(message.clone());
+    runtime.config_load_error = Some(message.clone());
+    runtime
+        .lifecycle
+        .mark_transient(capture_state, message, ctx.clock.now());
+    let due = runtime.lifecycle.next_retry_at;
+    if recovered_poison {
+        ctx.runtime.clear_poison();
+    }
+    drop(runtime);
+    drop_capture_then_session(active.0, active.1);
+    if let Some(due) = due {
+        ctx.scheduler.schedule_retry(generation, due);
+    }
+    drop(authority);
+}
+
+fn cancel_active_calibration(ctx: &IdleDaemonContext) {
+    let session = ctx
+        .runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .session
+        .clone();
+    if let Some(session) = session {
+        session.arena.cancel_calibration();
     }
 }
 
 fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
-    let runtime = ctx.runtime.lock().ok();
-    let (
-        state,
-        last_error,
-        resolved_target,
-        sample_rate,
-        channel_count,
-        format,
-        buffer_capacity,
-        retained,
-        dropped,
-        frozen_pending,
-    ) = if let Some(ref runtime) = runtime {
+    let runtime = ctx.runtime.lock();
+    let stopping = ctx.stop.load(Ordering::Acquire);
+    let snapshot = runtime.ok().map(|runtime| {
         let capture_fault = runtime
             .capture_health
             .as_ref()
@@ -1033,17 +3635,94 @@ fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
                     .as_ref()
                     .and_then(CaptureBackend::runtime_error)
             });
-        let state = if ctx.stop.load(Ordering::Acquire) {
-            "stopping".to_string()
-        } else if capture_fault.is_some() {
-            "faulted".to_string()
-        } else {
-            runtime.state.clone()
+        let legacy_target = runtime
+            .prepared_legacy
+            .as_ref()
+            .and_then(|prepared| prepared.static_config.target.clone());
+        let legacy_format = runtime
+            .prepared_legacy
+            .as_ref()
+            .map(|prepared| prepared.static_config.sample_format.clone());
+        (
+            stopping,
+            runtime.config_family,
+            runtime.state.clone(),
+            runtime.last_error.clone(),
+            runtime.config_load_error.clone(),
+            capture_fault,
+            runtime
+                .resolved_capture
+                .as_ref()
+                .and_then(|resolved| resolved.resolved_target.clone()),
+            runtime
+                .active_profile
+                .as_ref()
+                .map(|profile| profile.name.clone()),
+            legacy_target,
+            legacy_format,
+            runtime.session.clone(),
+            runtime.lifecycle.clone(),
+        )
+    });
+    let Some((
+        stopping,
+        config_family,
+        runtime_state,
+        runtime_last_error,
+        config_load_error,
+        capture_fault,
+        resolved_capture_target,
+        app_resolved_target,
+        legacy_target,
+        legacy_format,
+        session,
+        mut lifecycle_state,
+    )) = snapshot
+    else {
+        let mut lifecycle = LifecycleState::ready_stopped(None);
+        lifecycle.mark_permanent("runtime state lock poisoned".to_string());
+        return DaemonStatus {
+            state: "poisoned".to_string(),
+            active_export_count: 0,
+            pending_recall_count: 0,
+            buffer_capacity_seconds: 0.0,
+            retained_seconds: 0.0,
+            dropped_frames: 0,
+            target: Some(ctx.config_path.display().to_string()),
+            resolved_target: None,
+            sample_rate: 0,
+            channel_count: 0,
+            format: "".to_string(),
+            last_error: None,
+            lifecycle: lifecycle.status(ctx.clock.as_ref()),
         };
-        let last_error = capture_fault
-            .or_else(|| runtime.config_load_error.clone())
-            .or_else(|| runtime.last_error.clone());
-        if let Some(session) = runtime.session.as_ref() {
+    };
+
+    let state = if stopping {
+        "stopping".to_string()
+    } else if capture_fault.is_some() {
+        "faulted".to_string()
+    } else {
+        runtime_state
+    };
+    let last_error = capture_fault
+        .clone()
+        .or(config_load_error)
+        .or(runtime_last_error);
+    if stopping {
+        lifecycle_state.mark_stopping();
+    } else if let Some(error) = capture_fault {
+        lifecycle_state.daemon_state = DaemonState::Degraded;
+        lifecycle_state.capture_state = CaptureState::Faulted;
+        lifecycle_state.error_class = Some(ErrorClass::Transient);
+        lifecycle_state.last_error = Some(error);
+        lifecycle_state.retry_policy = RetryPolicy::Manual;
+        lifecycle_state.retry_attempt = 0;
+        lifecycle_state.next_retry_at = None;
+    }
+
+    let (sample_rate, channel_count, session_format, capacity, retained, dropped, frozen_pending) =
+        if let Some(session) = session {
             let (capacity, retained, dropped, frozen_pending) = match session.status() {
                 Ok(status) => (
                     status.capacity_frames,
@@ -1053,63 +3732,45 @@ fn idle_status_response(ctx: &IdleDaemonContext) -> DaemonStatus {
                 ),
                 Err(_) => (0, 0, 0, false),
             };
-            let capacity = capacity as f64 / f64::from(session.sample_rate);
-            let retained = retained as f64 / f64::from(session.sample_rate);
-            let resolved = runtime.active_profile.as_ref().map(|p| p.name.clone());
             (
-                state,
-                last_error,
-                resolved,
                 session.sample_rate,
                 session.channel_count,
                 "F32LE".to_string(),
-                capacity,
-                retained,
+                capacity as f64 / f64::from(session.sample_rate),
+                retained as f64 / f64::from(session.sample_rate),
                 dropped,
                 frozen_pending,
             )
         } else {
-            let resolved = runtime.active_profile.as_ref().map(|p| p.name.clone());
-            (
-                state,
-                last_error,
-                resolved,
-                0,
-                0,
-                "".to_string(),
-                0.0,
-                0.0,
-                0,
-                false,
-            )
-        }
-    } else {
-        (
-            "poisoned".to_string(),
-            None,
-            None,
-            0,
-            0,
-            "".to_string(),
-            0.0,
-            0.0,
-            0,
-            false,
-        )
+            (0, 0, "".to_string(), 0.0, 0.0, 0, false)
+        };
+    let (target, resolved_target, format) = match config_family {
+        ConfigFamily::Legacy => (
+            legacy_target,
+            resolved_capture_target,
+            legacy_format.unwrap_or_default(),
+        ),
+        ConfigFamily::App => (
+            Some(ctx.config_path.display().to_string()),
+            app_resolved_target,
+            session_format,
+        ),
     };
+
     DaemonStatus {
         state,
         active_export_count: u32::from(frozen_pending),
         pending_recall_count: 0,
-        buffer_capacity_seconds: buffer_capacity,
+        buffer_capacity_seconds: capacity,
         retained_seconds: retained,
         dropped_frames: dropped,
-        target: Some(ctx.config_path.display().to_string()),
+        target,
         resolved_target,
         sample_rate,
         channel_count,
         format,
         last_error,
+        lifecycle: lifecycle_state.status(ctx.clock.as_ref()),
     }
 }
 
@@ -1134,175 +3795,14 @@ fn validate_runtime_environment(cfg: &LambConfig) -> Result<()> {
     Ok(())
 }
 
-fn handle_request(ctx: &DaemonContext, request: ControlRequest) -> ControlResponse {
-    match request {
-        ControlRequest::Recall => persistence_delivery_only_response(status_response(ctx)),
-        ControlRequest::Clear => match ctx.session.clear() {
-            Ok(()) => ControlResponse {
-                ok: true,
-                message: "cleared".to_string(),
-                status: Some(status_response(ctx)),
-                persistence_outcome: None,
-                threshold_report: None,
-            },
-            Err(err) => {
-                set_last_error(ctx, err.to_string());
-                ControlResponse {
-                    ok: false,
-                    message: err.to_string(),
-                    status: Some(status_response(ctx)),
-                    persistence_outcome: None,
-                    threshold_report: None,
-                }
-            }
-        },
-        ControlRequest::Dump => persistence_delivery_only_response(status_response(ctx)),
-        ControlRequest::Status => ControlResponse {
-            ok: true,
-            message: "status".to_string(),
-            status: Some(status_response(ctx)),
-            persistence_outcome: None,
-            threshold_report: None,
-        },
-        ControlRequest::Stop => {
-            publish_stop_before(&ctx.stop, || {
-                ctx.session.arena.cancel_calibration();
-            });
-            ControlResponse {
-                ok: true,
-                message: "stopping".to_string(),
-                status: Some(status_response(ctx)),
-                persistence_outcome: None,
-                threshold_report: None,
-            }
-        }
-        ControlRequest::StartCapture { .. }
-        | ControlRequest::StopCapture
-        | ControlRequest::Reload => ControlResponse {
-            ok: false,
-            message: "command not available in legacy runtime config mode".to_string(),
-            status: Some(status_response(ctx)),
-            persistence_outcome: None,
-            threshold_report: None,
-        },
-        ControlRequest::Threshold { .. } => ControlResponse {
-            ok: false,
-            message: "profile threshold commands are unsupported for legacy configuration"
-                .to_string(),
-            status: Some(status_response(ctx)),
-            persistence_outcome: None,
-            threshold_report: None,
-        },
-    }
-}
-
-fn status_response(ctx: &DaemonContext) -> DaemonStatus {
-    let (capacity, retained, dropped, frozen_pending) = match ctx.session.status() {
-        Ok(status) => (
-            status.capacity_frames,
-            status.retained_frames,
-            status.dropped_frames,
-            status.frozen_pending,
-        ),
-        Err(_) => (0, 0, 0, false),
-    };
-    let sample_rate = ctx.session.sample_rate;
-    DaemonStatus {
-        state: if ctx.stop.load(Ordering::Acquire) {
-            "stopping".to_string()
-        } else if ctx
-            .capture_health
-            .as_ref()
-            .and_then(PipeWireHealth::fault)
-            .is_some()
-        {
-            "faulted".to_string()
-        } else {
-            "capturing".to_string()
-        },
-        active_export_count: u32::from(frozen_pending),
-        pending_recall_count: 0,
-        buffer_capacity_seconds: capacity as f64 / f64::from(sample_rate),
-        retained_seconds: retained as f64 / f64::from(sample_rate),
-        dropped_frames: dropped,
-        target: ctx.cfg.target.clone(),
-        resolved_target: status_resolved_target(ctx),
-        sample_rate,
-        channel_count: ctx.cfg.channels.unwrap_or_else(|| {
-            ctx.resolved_target
-                .as_ref()
-                .map(|target| target.channels)
-                .unwrap_or(2)
-        }),
-        format: ctx.cfg.sample_format.clone(),
-        last_error: ctx
-            .capture_health
-            .as_ref()
-            .and_then(PipeWireHealth::fault)
-            .or_else(|| ctx.last_error.lock().ok().and_then(|last| last.clone())),
-    }
-}
-
 fn persistence_delivery_only_response(status: DaemonStatus) -> ControlResponse {
     ControlResponse {
         ok: false,
         message: "persistence commands require operation-worker delivery".to_string(),
         status: Some(status),
+        error_context: crate::control::ControlErrorContext::default(),
         persistence_outcome: None,
         threshold_report: None,
-    }
-}
-
-fn status_resolved_target(ctx: &DaemonContext) -> Option<String> {
-    if let Some(target) = ctx.resolved_target.as_ref() {
-        return Some(match target.id {
-            Some(id) => format!("{} ({id})", target.name),
-            None => target.name.clone(),
-        });
-    }
-    Some(ctx.cfg.backend.clone())
-}
-
-fn set_last_error(ctx: &DaemonContext, message: String) {
-    if let Ok(mut last) = ctx.last_error.lock() {
-        *last = Some(message);
-    }
-}
-
-fn legacy_persistence_delivery(
-    ctx: &DaemonContext,
-    command: ExportCommand,
-    mut stream: UnixStream,
-) {
-    let timestamp = iso8601_compact_label();
-    let mut entered = false;
-    let result = ctx
-        .session
-        .persist_with_delivery(command, &timestamp, |outcome| {
-            entered = true;
-            let status = status_response(ctx);
-            let message = persistence_message_from_committed(&outcome);
-            write_persistence_response(
-                &mut stream,
-                true,
-                &message,
-                &status,
-                ctx.session.sample_rate,
-                outcome,
-            )
-        });
-    if let Err(error) = result {
-        set_last_error(ctx, error.to_string());
-        if !entered {
-            let response = ControlResponse {
-                ok: false,
-                message: error.to_string(),
-                status: Some(status_response(ctx)),
-                persistence_outcome: None,
-                threshold_report: None,
-            };
-            let _ = write_response(stream, &response);
-        }
     }
 }
 
@@ -1327,160 +3827,9 @@ fn persistence_message_from_committed(outcome: &CommittedPersistenceRef<'_>) -> 
     }
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-fn handle_dump(ctx: &DaemonContext) -> ControlResponse {
-    let timestamp = iso8601_compact_label();
-    let result = ctx.session.persist(ExportCommand::Dump, &timestamp);
-    legacy_persistence_response(ctx, result)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn handle_recall(ctx: &DaemonContext) -> ControlResponse {
-    let timestamp = iso8601_compact_label();
-    let result = ctx.session.persist(ExportCommand::Recall, &timestamp);
-    legacy_persistence_response(ctx, result)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn legacy_persistence_response(
-    ctx: &DaemonContext,
-    result: Result<DumpOutcome>,
-) -> ControlResponse {
-    match result {
-        Ok(outcome) => persistence_response(outcome, ctx.session.sample_rate, status_response(ctx)),
-        Err(err) => {
-            set_last_error(ctx, err.to_string());
-            ControlResponse {
-                ok: false,
-                message: err.to_string(),
-                status: Some(status_response(ctx)),
-                persistence_outcome: None,
-                threshold_report: None,
-            }
-        }
-    }
-}
-
-fn start_app_capture(
-    ctx: &IdleDaemonContext,
-    requested_profile: Option<String>,
-    activate: bool,
-) -> Result<String> {
-    let mut cfg = profile::load_config_for_mutation(&ctx.config_path)?;
-    let profile_name = requested_profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .or_else(|| cfg.daemon.active_profile.clone())
-        .ok_or_else(|| LambError::Validation("no active profile configured".to_string()))?;
-    let profile_config = cfg
-        .profiles
-        .get(&profile_name)
-        .ok_or_else(|| LambError::Config(format!("profile {profile_name} does not exist")))?;
-    let resolved = profile::validate_profile(&profile_name, profile_config)?;
-    if activate {
-        cfg.daemon.active_profile = Some(profile_name.clone());
-        profile::save_config(&ctx.config_path, &cfg)?;
-    }
-
-    let old_capture = {
-        let mut runtime = ctx
-            .runtime
-            .lock()
-            .map_err(|_| LambError::Control("runtime state lock poisoned".to_string()))?;
-        runtime.capture.take()
-    };
-    drop(old_capture);
-
-    let channel_names: Vec<String> = resolved.ports.iter().map(|p| p.name.clone()).collect();
-    let resolved_for_runtime = resolved.clone();
-    let params = app_runtime_params(&resolved);
-
-    let (backend, runtime_session) = match resolved.backend.as_str() {
-        "jack" => {
-            let jack_cfg = JackCaptureConfig::from_profile(&resolved);
-            let (capture, runtime) = JackCapture::start(jack_cfg, params).inspect_err(|err| {
-                set_app_fault(ctx, &cfg, Some(resolved.clone()), err.to_string());
-            })?;
-            (CaptureBackend::Jack(capture, channel_names), runtime)
-        }
-        "pipewire" => {
-            let pw_cfg = resolved.pipewire_config.clone().ok_or_else(|| {
-                let err =
-                    LambError::Validation("pipewire profile missing pipewire config".to_string());
-                set_app_fault(ctx, &cfg, Some(resolved.clone()), err.to_string());
-                err
-            })?;
-            let resolved_target =
-                crate::capture_pipewire::resolve_target(&pw_cfg).inspect_err(|err| {
-                    set_app_fault(ctx, &cfg, Some(resolved.clone()), err.to_string());
-                })?;
-            eprintln!("lamb: {}", resolved_target.log_message());
-            let (capture, runtime) =
-                PipeWireCapture::start_with_resolved(pw_cfg, resolved_target, params).inspect_err(
-                    |err| {
-                        set_app_fault(ctx, &cfg, Some(resolved.clone()), err.to_string());
-                    },
-                )?;
-            (CaptureBackend::PipeWire(capture, channel_names), runtime)
-        }
-        other => unreachable!("backend validated as jack or pipewire, got {other}"),
-    };
-
-    let session = Arc::new(CaptureSession::from_app_runtime(
-        runtime_session,
-        &resolved_for_runtime,
-        backend.sample_rate(),
-        match &backend {
-            CaptureBackend::Jack(_, _) => jack_live_identities(&resolved_for_runtime)?,
-            CaptureBackend::PipeWire(capture, _) => {
-                pipewire_live_identities(&resolved_for_runtime, capture.resolved_target())?
-            }
-        },
-    )?);
-    install_effective_session_activity_policy(
-        &cfg,
-        &resolved_for_runtime,
-        &session,
-        &ctx.calibration_root,
-        unix_now(),
-    )?;
-    let _ = session.recover_startup(Path::new(APP_STAGING_ROOT));
-
-    let mut runtime = ctx
-        .runtime
-        .lock()
-        .map_err(|_| LambError::Control("runtime state lock poisoned".to_string()))?;
-    runtime.config = cfg;
-    runtime.state = "capturing".to_string();
-    runtime.last_error = None;
-    runtime.active_profile = Some(resolved_for_runtime);
-    runtime.capture_health = match &backend {
-        CaptureBackend::PipeWire(capture, _) => Some(capture.health()),
-        CaptureBackend::Jack(_, _) => None,
-    };
-    runtime.capture = Some(backend);
-    runtime.session = Some(session);
-    Ok(format!("capturing {profile_name}"))
-}
-
-fn stop_app_capture(ctx: &IdleDaemonContext) {
-    if let Ok(mut runtime) = ctx.runtime.lock() {
-        let capture = runtime.capture.take();
-        runtime.capture_health = None;
-        runtime.session = None;
-        runtime.state = if runtime.active_profile.is_some() {
-            "idle".to_string()
-        } else {
-            "unconfigured".to_string()
-        };
-        runtime.last_error = None;
-        drop(capture);
-    }
+fn drop_capture_then_session<B, S>(backend: Option<B>, session: Option<S>) {
+    drop(backend);
+    drop(session);
 }
 
 fn app_lock_error_response(ctx: &IdleDaemonContext) -> ControlResponse {
@@ -1488,6 +3837,7 @@ fn app_lock_error_response(ctx: &IdleDaemonContext) -> ControlResponse {
         ok: false,
         message: "runtime state lock poisoned".to_string(),
         status: Some(idle_status_response(ctx)),
+        error_context: crate::control::ControlErrorContext::default(),
         persistence_outcome: None,
         threshold_report: None,
     }
@@ -1502,6 +3852,7 @@ fn config_load_failure_response(ctx: &IdleDaemonContext) -> Option<ControlRespon
             ok: false,
             message: error,
             status: Some(idle_status_response(ctx)),
+            error_context: crate::control::ControlErrorContext::default(),
             persistence_outcome: None,
             threshold_report: None,
         })
@@ -1543,6 +3894,7 @@ fn handle_app_threshold(ctx: &IdleDaemonContext, request: ThresholdRequest) -> C
             ok: true,
             message,
             status: Some(idle_status_response(ctx)),
+            error_context: crate::control::ControlErrorContext::default(),
             persistence_outcome: None,
             threshold_report: Some(report),
         },
@@ -1552,6 +3904,7 @@ fn handle_app_threshold(ctx: &IdleDaemonContext, request: ThresholdRequest) -> C
                 ok: false,
                 message: error.to_string(),
                 status: Some(idle_status_response(ctx)),
+                error_context: crate::control::ControlErrorContext::default(),
                 persistence_outcome: None,
                 threshold_report: None,
             }
@@ -2472,6 +4825,7 @@ fn app_persistence_delivery(
             ok: false,
             message: "capture is not running".to_string(),
             status: Some(idle_status_response(ctx)),
+            error_context: crate::control::ControlErrorContext::default(),
             persistence_outcome: None,
             threshold_report: None,
         };
@@ -2500,6 +4854,7 @@ fn app_persistence_delivery(
                 ok: false,
                 message: error.to_string(),
                 status: Some(idle_status_response(ctx)),
+                error_context: crate::control::ControlErrorContext::default(),
                 persistence_outcome: None,
                 threshold_report: None,
             };
@@ -2522,6 +4877,7 @@ fn handle_app_recall(ctx: &IdleDaemonContext) -> ControlResponse {
             ok: false,
             message: "capture is not running".to_string(),
             status: Some(idle_status_response(ctx)),
+            error_context: crate::control::ControlErrorContext::default(),
             persistence_outcome: None,
             threshold_report: None,
         };
@@ -2545,6 +4901,7 @@ fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
             ok: false,
             message: "capture is not running".to_string(),
             status: Some(idle_status_response(ctx)),
+            error_context: crate::control::ControlErrorContext::default(),
             persistence_outcome: None,
             threshold_report: None,
         };
@@ -2554,6 +4911,7 @@ fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
             ok: true,
             message: "cleared".to_string(),
             status: Some(idle_status_response(ctx)),
+            error_context: crate::control::ControlErrorContext::default(),
             persistence_outcome: None,
             threshold_report: None,
         },
@@ -2563,6 +4921,7 @@ fn handle_app_clear(ctx: &IdleDaemonContext) -> ControlResponse {
                 ok: false,
                 message: err.to_string(),
                 status: Some(idle_status_response(ctx)),
+                error_context: crate::control::ControlErrorContext::default(),
                 persistence_outcome: None,
                 threshold_report: None,
             }
@@ -2584,6 +4943,7 @@ fn handle_app_dump(ctx: &IdleDaemonContext) -> ControlResponse {
             ok: false,
             message: "capture is not running".to_string(),
             status: Some(idle_status_response(ctx)),
+            error_context: crate::control::ControlErrorContext::default(),
             persistence_outcome: None,
             threshold_report: None,
         };
@@ -2608,6 +4968,7 @@ fn app_persistence_response(
                 ok: false,
                 message: err.to_string(),
                 status: Some(idle_status_response(ctx)),
+                error_context: crate::control::ControlErrorContext::default(),
                 persistence_outcome: None,
                 threshold_report: None,
             }
@@ -2715,6 +5076,7 @@ fn persistence_response(
         ok: true,
         message,
         status: Some(status),
+        error_context: crate::control::ControlErrorContext::default(),
         persistence_outcome: Some(persistence_outcome),
         threshold_report: None,
     }
@@ -2728,43 +5090,53 @@ fn persistence_message(kind: &str, frames: u64, lost_frames: u64) -> String {
     }
 }
 
-fn set_app_fault(
-    ctx: &IdleDaemonContext,
-    cfg: &app_config::AppConfig,
-    resolved: Option<profile::ResolvedProfile>,
-    error: String,
-) {
-    if let Ok(mut runtime) = ctx.runtime.lock() {
-        runtime.config = cfg.clone();
-        runtime.state = "faulted".to_string();
-        runtime.last_error = Some(error);
-        runtime.active_profile = resolved;
-        runtime.capture = None;
-        runtime.capture_health = None;
-        runtime.session = None;
-    }
-}
-
 fn set_app_last_error(ctx: &IdleDaemonContext, error: String) {
     if let Ok(mut runtime) = ctx.runtime.lock() {
         runtime.last_error = Some(error);
     }
 }
 
-fn reload_app_config(ctx: &IdleDaemonContext) -> Result<()> {
-    let mut runtime = ctx
-        .runtime
-        .lock()
-        .map_err(|_| LambError::Control("runtime state lock poisoned".to_string()))?;
-    reload_app_config_inner(&mut runtime, &ctx.config_path, &ctx.calibration_root)
-}
-
-fn reload_app_config_inner(
+#[allow(clippy::too_many_arguments)]
+fn apply_loaded_app_config_inner(
     state: &mut AppRuntimeState,
+    loaded: app_config::LoadedAppConfig,
     path: &Path,
     calibration_root: &Path,
+    app_starter: &dyn LegacyCaptureStarter,
+    startup_recovery: &dyn LegacyStartupRecovery,
+    now: RetryInstant,
+    fault_sink: RuntimeFaultSink,
 ) -> Result<()> {
-    let loaded = app_config::load_optional_config(path)?;
+    apply_loaded_app_config_inner_with_checkpoint(
+        state,
+        loaded,
+        path,
+        calibration_root,
+        app_starter,
+        startup_recovery,
+        now,
+        true,
+        fault_sink,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_loaded_app_config_inner_with_checkpoint<F>(
+    state: &mut AppRuntimeState,
+    loaded: app_config::LoadedAppConfig,
+    path: &Path,
+    calibration_root: &Path,
+    app_starter: &dyn LegacyCaptureStarter,
+    startup_recovery: &dyn LegacyStartupRecovery,
+    now: RetryInstant,
+    begin_attempt_generation: bool,
+    fault_sink: RuntimeFaultSink,
+    mut checkpoint: F,
+) -> Result<()>
+where
+    F: FnMut() -> Result<()>,
+{
     match loaded.state {
         ConfigLoadState::Loaded => {
             state.config = loaded.config.clone();
@@ -2772,59 +5144,89 @@ fn reload_app_config_inner(
             if let Some(profile) = active_profile {
                 state.active_profile = Some(profile.clone());
                 if state.config.daemon.start_mode == "auto" {
+                    if begin_attempt_generation {
+                        state.lifecycle.begin_operation()?;
+                    }
+                    checkpoint()?;
                     state.capture.take();
                     state.capture_health = None;
                     state.session = None;
                     let channel_names: Vec<String> =
                         profile.ports.iter().map(|p| p.name.clone()).collect();
                     let params = app_runtime_params(&profile);
-                    let build = match profile.backend.as_str() {
-                        "jack" => {
-                            JackCapture::start(JackCaptureConfig::from_profile(&profile), params)
-                                .map(|(capture, runtime)| {
-                                    (CaptureBackend::Jack(capture, channel_names), runtime)
-                                })
-                        }
-                        "pipewire" => {
-                            if let Some(pw_cfg) = profile.pipewire_config.clone() {
-                                match crate::capture_pipewire::resolve_target(&pw_cfg) {
-                                    Ok(resolved_target) => {
-                                        eprintln!("lamb: {}", resolved_target.log_message());
-                                        PipeWireCapture::start_with_resolved(
-                                            pw_cfg,
-                                            resolved_target,
-                                            params,
-                                        )
-                                        .map(
-                                            |(capture, runtime)| {
-                                                (
-                                                    CaptureBackend::PipeWire(
-                                                        capture,
-                                                        channel_names,
-                                                    ),
-                                                    runtime,
-                                                )
-                                            },
+                    let injected =
+                        match app_starter.prepare_app(&profile, params, fault_sink.clone()) {
+                            Ok(injected) => injected,
+                            Err(error) => {
+                                apply_capture_attempt_error_to_state(state, error, now)
+                                    .map_err(|error| LambError::DaemonFatal(error.message))?;
+                                return Ok(());
+                            }
+                        };
+                    let build = match injected {
+                        Some(prepared) => Ok((
+                            prepared.backend,
+                            prepared.runtime,
+                            prepared.health,
+                            Some((
+                                prepared.resolved_live_inputs,
+                                prepared.session_resource_probes,
+                            )),
+                        )),
+                        None => match profile.backend.as_str() {
+                            "jack" => JackCapture::start(
+                                JackCaptureConfig::from_profile(&profile),
+                                params,
+                            )
+                            .map(|(capture, runtime)| {
+                                (
+                                    CaptureBackend::Jack(capture, channel_names),
+                                    runtime,
+                                    None,
+                                    None,
+                                )
+                            })
+                            .map_err(classify_legacy_attempt_error),
+                            "pipewire" => {
+                                if let Some(pw_cfg) = profile.pipewire_config.clone() {
+                                    start_app_pipewire_capture(pw_cfg, params, fault_sink).map(
+                                        |(capture, runtime)| {
+                                            (
+                                                CaptureBackend::PipeWire(capture, channel_names),
+                                                runtime,
+                                                None,
+                                                None,
+                                            )
+                                        },
+                                    )
+                                } else {
+                                    Err(classify_legacy_attempt_error(LambError::Validation(
+                                        "pipewire profile has no pipewire config".to_string(),
+                                    )))
+                                }
+                            }
+                            other => Err(classify_legacy_attempt_error(LambError::Validation(
+                                format!("unknown backend: {other}"),
+                            ))),
+                        },
+                    };
+                    checkpoint()?;
+                    match build {
+                        Ok((backend, runtime, injected_health, injected_inputs)) => {
+                            checkpoint()?;
+                            let mut attempt = PrivateAppCaptureAttempt::new(backend, runtime);
+                            let sample_rate = attempt.backend().sample_rate();
+                            let resolved_live_inputs = if let Some((resolved, ..)) =
+                                &injected_inputs
+                            {
+                                resolved.clone()
+                            } else {
+                                match attempt.backend() {
+                                    CaptureBackend::Fake(_, _) => {
+                                        unreachable!(
+                                            "fake capture is not used by app-profile runtime"
                                         )
                                     }
-                                    Err(err) => Err(err),
-                                }
-                            } else {
-                                Err(LambError::Validation(
-                                    "pipewire profile has no pipewire config".to_string(),
-                                ))
-                            }
-                        }
-                        other => Err(LambError::Validation(format!("unknown backend: {other}"))),
-                    };
-                    match build {
-                        Ok((backend, runtime)) => {
-                            let sample_rate = backend.sample_rate();
-                            let session = Arc::new(CaptureSession::from_app_runtime(
-                                runtime,
-                                &profile,
-                                sample_rate,
-                                match &backend {
                                     CaptureBackend::Jack(_, _) => jack_live_identities(&profile)?,
                                     CaptureBackend::PipeWire(capture, _) => {
                                         pipewire_live_identities(
@@ -2832,29 +5234,83 @@ fn reload_app_config_inner(
                                             capture.resolved_target(),
                                         )?
                                     }
-                                },
-                            )?);
-                            install_effective_session_activity_policy(
-                                &loaded.config,
+                                    #[cfg(test)]
+                                    CaptureBackend::TestProbe(_) => {
+                                        unreachable!("test-only capture backend")
+                                    }
+                                    #[cfg(test)]
+                                    CaptureBackend::TestAppProbe { .. } => {
+                                        unreachable!(
+                                            "test app backend requires injected identities"
+                                        )
+                                    }
+                                }
+                            };
+                            let (configured_inputs, channel_count) =
+                                validate_app_session_inputs(&profile, &resolved_live_inputs)?;
+                            let capture_runtime = attempt.take_runtime();
+                            let session = CaptureSession::from_validated_app_runtime(
+                                capture_runtime,
                                 &profile,
-                                &session,
-                                calibration_root,
-                                unix_now(),
-                            )?;
-                            let _ = session.recover_startup(Path::new(APP_STAGING_ROOT));
-                            state.session = Some(session);
+                                sample_rate,
+                                configured_inputs,
+                                resolved_live_inputs,
+                                channel_count,
+                            );
+                            #[cfg(test)]
+                            let mut session = session;
+                            #[cfg(test)]
+                            if let Some((_, probes)) = injected_inputs {
+                                session.attempt_resource_probes = probes;
+                            }
+                            attempt.set_session(Arc::new(session));
+                            attempt.run_post_backend_step(|session| {
+                                checkpoint()?;
+                                install_effective_session_activity_policy(
+                                    &loaded.config,
+                                    &profile,
+                                    session,
+                                    calibration_root,
+                                    unix_now(),
+                                )
+                            })?;
+                            checkpoint()?;
+                            let recovery_failed =
+                                startup_recovery.failed_count(attempt.session())?;
+                            if recovery_failed != 0 {
+                                return Err(LambError::Control(format!(
+                                    "app startup recovery failed for {recovery_failed} transaction(s)"
+                                )));
+                            }
+                            checkpoint()?;
                             state.state = "capturing".to_string();
                             state.last_error = None;
-                            state.capture_health = match &backend {
-                                CaptureBackend::PipeWire(capture, _) => Some(capture.health()),
-                                CaptureBackend::Jack(_, _) => None,
-                            };
+                            state.capture_health =
+                                injected_health.or_else(|| match attempt.backend() {
+                                    CaptureBackend::PipeWire(capture, _) => Some(capture.health()),
+                                    CaptureBackend::Fake(_, _) => {
+                                        unreachable!(
+                                            "fake capture is not used by app-profile runtime"
+                                        )
+                                    }
+                                    CaptureBackend::Jack(_, _) => None,
+                                    #[cfg(test)]
+                                    CaptureBackend::TestProbe(_) => None,
+                                    #[cfg(test)]
+                                    CaptureBackend::TestAppProbe { .. } => None,
+                                });
+                            let (backend, session) = attempt.publish();
+                            state.session = Some(session);
                             state.capture = Some(backend);
+                            state.lifecycle.mark_running(
+                                Some(profile.name.clone()),
+                                Some(profile.name.clone()),
+                            );
                         }
-                        Err(err) => {
-                            state.state = "faulted".to_string();
-                            state.last_error = Some(err.to_string());
+                        Err(error) => {
                             state.capture_health = None;
+                            apply_capture_attempt_error_to_state(state, error, now)
+                                .map_err(|error| LambError::DaemonFatal(error.message))?;
                         }
                     }
                 } else {
@@ -2863,6 +5319,7 @@ fn reload_app_config_inner(
                     state.capture = None;
                     state.capture_health = None;
                     state.session = None;
+                    state.lifecycle.mark_stopped(Some(profile.name.clone()));
                 }
             } else {
                 state.state = "unconfigured".to_string();
@@ -2871,6 +5328,7 @@ fn reload_app_config_inner(
                 state.capture = None;
                 state.capture_health = None;
                 state.session = None;
+                state.lifecycle.mark_stopped(None);
             }
             state.config_load_error = None;
             Ok(())
@@ -2880,11 +5338,12 @@ fn reload_app_config_inner(
             state.config = loaded.config;
             state.state = "unconfigured".to_string();
             state.last_error = Some(error.clone());
-            state.config_load_error = Some(error);
+            state.config_load_error = Some(error.clone());
             state.active_profile = None;
             state.capture = None;
             state.capture_health = None;
             state.session = None;
+            state.lifecycle.mark_permanent(error);
             Ok(())
         }
         ConfigLoadState::Invalid => {
@@ -2894,11 +5353,12 @@ fn reload_app_config_inner(
             state.config = loaded.config;
             state.state = "unconfigured".to_string();
             state.last_error = Some(error.clone());
-            state.config_load_error = Some(error);
+            state.config_load_error = Some(error.clone());
             state.active_profile = None;
             state.capture = None;
             state.capture_health = None;
             state.session = None;
+            state.lifecycle.mark_permanent(error);
             Ok(())
         }
     }
@@ -2934,9 +5394,5151 @@ fn iso8601_compact_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon_lifecycle::{RetryInstant, ScheduledOperation};
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
+    use std::sync::Condvar;
 
     const ROUTE_TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn test_legacy_pipewire_config() -> LambConfig {
+        config::parse_config_text(
+            Path::new("pipewire.toml"),
+            r#"
+configVersion = 1
+user = "test"
+backend = "pipewire"
+target = "studio-input"
+capturePorts = [
+  { source = "capture_AUX0", name = "mic" },
+  { source = "capture_AUX1", name = "gtr" },
+  { source = "capture_AUX2", name = "percL" },
+  { source = "capture_AUX3", name = "percR" },
+]
+seconds = 30
+sampleRate = 44100
+sampleFormat = "F32LE"
+dontRemix = true
+outputDir = "/tmp/lamb-test-out"
+maxActiveSnapshots = 1
+allowQueuedRecall = false
+controlSocketPath = "/tmp/lamb-test.sock"
+controlPermissions = "0600"
+
+[memory]
+headroom = 1.2
+
+[export]
+mode = "per-channel"
+format = "wav"
+splitWhenOverBytes = 1073741824
+"#,
+        )
+        .unwrap()
+    }
+
+    fn test_resolved_target(channels: u32, sample_rate: u32) -> ResolvedTarget {
+        ResolvedTarget {
+            id: Some(70),
+            name: "studio-input".to_string(),
+            description: Some("Test input".to_string()),
+            channels,
+            sample_rate,
+            format: "F32LE".to_string(),
+            source_ports: (0..channels)
+                .map(|index| ResolvedSourcePort {
+                    global_id: 100 + index,
+                    node_id: 70,
+                    port_id: index,
+                    name: format!("capture_AUX{index}"),
+                })
+                .collect(),
+            durable_live_key: None,
+        }
+    }
+
+    #[test]
+    fn socket_owner_unlinks_after_post_bind_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let error = ControlSocketOwner::bind_with_setup(path.clone(), |_| {
+            Err(LambError::Control("injected post-bind failure".to_string()))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected post-bind failure"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn socket_owner_does_not_adopt_or_chmod_replacement_during_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let error = ControlSocketOwner::bind_with_hooks(
+            path.clone(),
+            || {
+                std::fs::write(&path, b"foreign replacement").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("changed during socket publication"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn socket_owner_cleans_private_path_when_pin_fails_after_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let error = ControlSocketOwner::bind_with_io(
+            path.clone(),
+            || {},
+            |_| Err(LambError::Control("injected pin failure".to_string())),
+            |pinned| pinned.metadata().map_err(|source| io_error(&path, source)),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected pin failure"));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn socket_owner_cleans_private_path_when_pinned_metadata_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let error = ControlSocketOwner::bind_with_io(
+            path.clone(),
+            || {},
+            pin_socket_path,
+            |_| {
+                Err(LambError::Control(
+                    "injected pinned metadata failure".to_string(),
+                ))
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected pinned metadata failure"));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn socket_owner_refuses_regular_stale_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        std::fs::write(&path, b"do not delete").unwrap();
+        assert!(ControlSocketOwner::bind(path.clone()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"do not delete");
+    }
+
+    #[test]
+    fn socket_owner_preserves_foreign_live_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let foreign = UnixListener::bind(&path).unwrap();
+        let identity = std::fs::symlink_metadata(&path).unwrap();
+
+        assert!(ControlSocketOwner::bind(path.clone()).is_err());
+
+        let preserved = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(preserved.dev(), identity.dev());
+        assert_eq!(preserved.ino(), identity.ino());
+        drop(foreign);
+    }
+
+    #[test]
+    fn socket_owner_live_probe_queues_no_stream_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let foreign = UnixListener::bind(&path).unwrap();
+        foreign.set_nonblocking(true).unwrap();
+
+        assert!(ControlSocketOwner::bind(path.clone()).is_err());
+
+        let accept_error = foreign.accept().unwrap_err();
+        assert_eq!(accept_error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn socket_owner_preserves_socket_on_unexpected_probe_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let foreign = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        let identity = std::fs::symlink_metadata(&path).unwrap();
+
+        assert!(ControlSocketOwner::bind(path.clone()).is_err());
+
+        let preserved = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(preserved.dev(), identity.dev());
+        assert_eq!(preserved.ino(), identity.ino());
+        drop(foreign);
+    }
+
+    #[test]
+    fn socket_owner_replaces_stale_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let stale = UnixListener::bind(&path).unwrap();
+        drop(stale);
+
+        let owner = ControlSocketOwner::bind(path.clone()).unwrap();
+        let replacement_connection = UnixStream::connect(&path).unwrap();
+        drop(replacement_connection);
+        drop(owner);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn nonblocking_wake_tolerates_refused_stale_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let stale = UnixListener::bind(&path).unwrap();
+        drop(stale);
+
+        nonblocking_control_wake(&path).unwrap();
+
+        assert!(path.exists());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn socket_owner_removes_owned_path_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let owner = ControlSocketOwner::bind(path.clone()).unwrap();
+        assert!(path.exists());
+        drop(owner);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn fatal_listener_failure_exits_1_and_removes_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fatal-listener.sock");
+        let result: Result<()> = (|| {
+            let _owner = ControlSocketOwner::bind(path.clone())?;
+            assert!(path.exists());
+            Err(LambError::ControlInvariant(
+                "injected fatal listener failure",
+            ))
+        })();
+
+        let error = result.unwrap_err();
+        assert_eq!(error.process_exit_code(), 1);
+        assert_eq!(
+            error.to_string(),
+            "control error: injected fatal listener failure"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn socket_owner_does_not_unlink_replacement_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let owner = ControlSocketOwner::bind(path.clone()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        drop(owner);
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn resolving_four_pipewire_ports_preserves_static_config() {
+        let prepared = prepare_legacy_config(test_legacy_pipewire_config()).unwrap();
+        let before = prepared.static_config.as_ref().clone();
+        let resolved =
+            resolve_legacy_capture_with(&prepared, |_| Ok(test_resolved_target(4, 44_100)))
+                .unwrap();
+
+        assert_eq!(resolved.state.channel_count, 4);
+        assert_eq!(resolved.state.sample_rate, 44_100);
+        assert_eq!(prepared.static_config.as_ref(), &before);
+        assert_eq!(prepared.static_config.channels, None);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProbeResource {
+        Backend = 0,
+        Session = 1,
+        Arena = 2,
+        Workspace = 3,
+        Descriptor = 4,
+    }
+
+    #[derive(Default)]
+    struct AttemptResourceCounters {
+        live: [AtomicUsize; 5],
+        dropped: Mutex<Vec<ProbeResource>>,
+    }
+
+    impl AttemptResourceCounters {
+        fn lease(self: &Arc<Self>, resource: ProbeResource) -> AttemptResourceLease {
+            self.live[resource as usize].fetch_add(1, Ordering::SeqCst);
+            AttemptResourceLease {
+                counters: Arc::clone(self),
+                resource,
+            }
+        }
+
+        fn live(&self, resource: ProbeResource) -> usize {
+            self.live[resource as usize].load(Ordering::SeqCst)
+        }
+
+        fn dropped(&self) -> Vec<ProbeResource> {
+            self.dropped.lock().unwrap().clone()
+        }
+    }
+
+    struct AttemptResourceLease {
+        counters: Arc<AttemptResourceCounters>,
+        resource: ProbeResource,
+    }
+
+    impl Drop for AttemptResourceLease {
+        fn drop(&mut self) {
+            self.counters.live[self.resource as usize].fetch_sub(1, Ordering::SeqCst);
+            self.counters.dropped.lock().unwrap().push(self.resource);
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SupervisorSnapshot {
+        prepared_fingerprint: String,
+        backend_identity: Option<usize>,
+        session_identity: Option<usize>,
+        lifecycle: LifecycleState,
+        config_family: ConfigFamily,
+        status_json: String,
+    }
+
+    struct SupervisorHarness {
+        _temp: tempfile::TempDir,
+        config_path: PathBuf,
+        ctx: Arc<IdleDaemonContext>,
+        starter: ScriptedLegacyCaptureStarter,
+        resources: Arc<AttemptResourceCounters>,
+    }
+
+    struct ScriptedLegacyCaptureStarter {
+        outcomes: Mutex<VecDeque<std::result::Result<ActiveCapture, CaptureAttemptError>>>,
+    }
+
+    struct BlockingLegacyCaptureStarter {
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+        active: Mutex<Option<ActiveCapture>>,
+    }
+
+    struct ProductionPathAppStarter {
+        resources: Arc<AttemptResourceCounters>,
+    }
+
+    struct TransientAppStarter {
+        calls: AtomicUsize,
+    }
+
+    struct TransientThenSuccessfulAppStarter {
+        calls: AtomicUsize,
+        resources: Arc<AttemptResourceCounters>,
+    }
+
+    struct CountingSuccessfulRecovery {
+        calls: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct DaemonManualClock {
+        now_millis: AtomicU64,
+    }
+
+    impl RetryClock for DaemonManualClock {
+        fn now(&self) -> RetryInstant {
+            RetryInstant::from_millis(self.now_millis.load(Ordering::SeqCst))
+        }
+
+        fn unix_seconds(&self, instant: RetryInstant) -> u64 {
+            instant.as_millis() / 1_000
+        }
+    }
+
+    struct SuccessfulLegacyRecovery;
+
+    struct ScriptedLegacyRecovery(Result<()>);
+
+    struct NonzeroAppRecovery;
+
+    impl LegacyStartupRecovery for SuccessfulLegacyRecovery {
+        fn failed_count(&self, _session: &CaptureSession) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl LegacyStartupRecovery for CountingSuccessfulRecovery {
+        fn failed_count(&self, _session: &CaptureSession) -> Result<usize> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    impl LegacyStartupRecovery for ScriptedLegacyRecovery {
+        fn failed_count(&self, _session: &CaptureSession) -> Result<usize> {
+            match &self.0 {
+                Ok(()) => Ok(0),
+                Err(error) => Err(LambError::Control(error.to_string())),
+            }
+        }
+    }
+
+    impl LegacyStartupRecovery for NonzeroAppRecovery {
+        fn failed_count(&self, _session: &CaptureSession) -> Result<usize> {
+            Ok(1)
+        }
+    }
+
+    impl LegacyCaptureStarter for ScriptedLegacyCaptureStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            _fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted capture outcome")
+        }
+    }
+
+    impl LegacyCaptureStarter for BlockingLegacyCaptureStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            _fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            self.entered.wait();
+            self.release.wait();
+            Ok(self.active.lock().unwrap().take().unwrap())
+        }
+    }
+
+    impl LegacyCaptureStarter for ProductionPathAppStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            _fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            unreachable!("app production-path starter does not start legacy capture")
+        }
+
+        fn prepare_app(
+            &self,
+            profile: &profile::ResolvedProfile,
+            params: CaptureRuntimeParams,
+            _fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<Option<PreparedAppCapture>, CaptureAttemptError> {
+            let (runtime, _ingress) =
+                CaptureRuntime::build(params, 100, u32::try_from(profile.ports.len()).unwrap())
+                    .map_err(classify_legacy_attempt_error)?;
+            Ok(Some(PreparedAppCapture {
+                backend: CaptureBackend::TestAppProbe {
+                    resource: Box::new(self.resources.lease(ProbeResource::Backend)),
+                    sample_rate: 100,
+                },
+                runtime,
+                health: None,
+                resolved_live_inputs: jack_live_identities(profile)
+                    .map_err(classify_legacy_attempt_error)?,
+                session_resource_probes: vec![
+                    Box::new(self.resources.lease(ProbeResource::Session)),
+                    Box::new(self.resources.lease(ProbeResource::Arena)),
+                    Box::new(self.resources.lease(ProbeResource::Workspace)),
+                    Box::new(self.resources.lease(ProbeResource::Descriptor)),
+                ],
+            }))
+        }
+    }
+
+    impl LegacyCaptureStarter for TransientAppStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            _fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            unreachable!("app starter does not start legacy capture")
+        }
+
+        fn prepare_app(
+            &self,
+            _profile: &profile::ResolvedProfile,
+            _params: CaptureRuntimeParams,
+            _fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<Option<PreparedAppCapture>, CaptureAttemptError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "app device unavailable".to_string(),
+            })
+        }
+    }
+
+    impl LegacyCaptureStarter for TransientThenSuccessfulAppStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            _fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            unreachable!("app starter does not start legacy capture")
+        }
+
+        fn prepare_app(
+            &self,
+            profile: &profile::ResolvedProfile,
+            params: CaptureRuntimeParams,
+            fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<Option<PreparedAppCapture>, CaptureAttemptError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(CaptureAttemptError {
+                    class: ErrorClass::Transient,
+                    capture_state: CaptureState::WaitingForDevice,
+                    message: "app device unavailable".to_string(),
+                });
+            }
+            ProductionPathAppStarter {
+                resources: Arc::clone(&self.resources),
+            }
+            .prepare_app(profile, params, fault_sink)
+        }
+    }
+
+    impl SupervisorHarness {
+        fn running() -> Self {
+            let harness = Self::stopped();
+            let active = test_active_capture_with_resources(&harness.resources);
+            let resolved = active.resolved.clone();
+            let mut active = active;
+            let session = active.session.take().unwrap();
+            let backend = active.backend.take().unwrap();
+            let mut runtime = harness.ctx.runtime.lock().unwrap();
+            runtime.capture = Some(backend);
+            runtime.session = Some(session);
+            runtime.resolved_capture = Some(resolved.clone());
+            runtime.state = "capturing".to_string();
+            runtime
+                .lifecycle
+                .mark_running(None, resolved.resolved_target);
+            drop(runtime);
+            harness
+        }
+
+        fn stopped() -> Self {
+            Self::stopped_with_outcomes(VecDeque::new())
+        }
+
+        fn stopped_with_outcomes(
+            outcomes: VecDeque<std::result::Result<ActiveCapture, CaptureAttemptError>>,
+        ) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let config_path = temp.path().join("lamb.toml");
+            fs::write(
+                &config_path,
+                toml::to_string(&test_legacy_fake_config()).unwrap(),
+            )
+            .unwrap();
+            let bootstrap = bootstrap_config(&config_path).unwrap();
+            let prepared = prepare_bootstrap_config(&bootstrap);
+            let ctx = build_idle_context(bootstrap, prepared).unwrap();
+            {
+                let mut runtime = ctx.runtime.lock().unwrap();
+                runtime.state = "stopped".to_string();
+                runtime.lifecycle.mark_stopped(None);
+            }
+            Self {
+                _temp: temp,
+                config_path,
+                ctx,
+                starter: ScriptedLegacyCaptureStarter {
+                    outcomes: Mutex::new(outcomes),
+                },
+                resources: Arc::new(AttemptResourceCounters::default()),
+            }
+        }
+
+        fn reload_with_text(&self, text: &str) -> ControlResponse {
+            let replacement = self.config_path.with_extension("replacement");
+            fs::write(&replacement, text).unwrap();
+            fs::rename(replacement, &self.config_path).unwrap();
+            reload_daemon_config_with_recovery(
+                &self.ctx,
+                None,
+                &self.starter,
+                &SuccessfulLegacyRecovery,
+            )
+        }
+
+        fn start_capture(&self) -> ControlResponse {
+            start_capture_transaction_with_recovery(
+                &self.ctx,
+                None,
+                false,
+                &self.starter,
+                &SuccessfulLegacyRecovery,
+            )
+        }
+
+        fn stop_capture(&self) -> ControlResponse {
+            stop_capture_transaction(&self.ctx)
+        }
+
+        fn snapshot(&self) -> SupervisorSnapshot {
+            let runtime = self.ctx.runtime.lock().unwrap();
+            let mut snapshot = SupervisorSnapshot {
+                prepared_fingerprint: toml::to_string(
+                    runtime
+                        .prepared_legacy
+                        .as_ref()
+                        .expect("prepared legacy config")
+                        .static_config
+                        .as_ref(),
+                )
+                .unwrap(),
+                backend_identity: runtime
+                    .capture
+                    .as_ref()
+                    .map(|backend| backend as *const CaptureBackend as usize),
+                session_identity: runtime
+                    .session
+                    .as_ref()
+                    .map(|session| Arc::as_ptr(session) as usize),
+                lifecycle: runtime.lifecycle.clone(),
+                config_family: runtime.config_family,
+                status_json: String::new(),
+            };
+            drop(runtime);
+            snapshot.status_json = serde_json::to_string(&idle_status_response(&self.ctx)).unwrap();
+            snapshot
+        }
+
+        fn lifecycle(&self) -> LifecycleState {
+            self.ctx.runtime.lock().unwrap().lifecycle.clone()
+        }
+
+        fn stop_flag(&self) -> bool {
+            self.ctx.stop.load(Ordering::Acquire)
+        }
+
+        fn live_capture_resources(&self) -> usize {
+            [
+                ProbeResource::Backend,
+                ProbeResource::Session,
+                ProbeResource::Arena,
+                ProbeResource::Workspace,
+                ProbeResource::Descriptor,
+            ]
+            .into_iter()
+            .map(|resource| self.resources.live(resource))
+            .sum()
+        }
+    }
+
+    fn assert_visible_authority_preserved_with_one_generation_advance(
+        before: &SupervisorSnapshot,
+        after: &SupervisorSnapshot,
+    ) {
+        assert_eq!(
+            after.lifecycle.generation,
+            before.lifecycle.generation.checked_add(1).unwrap()
+        );
+        let mut normalized_after = after.clone();
+        normalized_after.lifecycle.generation = before.lifecycle.generation;
+        assert_eq!(&normalized_after, before);
+    }
+
+    fn test_active_capture() -> ActiveCapture {
+        let prepared = prepare_legacy_config(test_legacy_fake_config()).unwrap();
+        start_legacy_capture(&prepared, RuntimeFaultSink::default()).unwrap()
+    }
+
+    struct CountingRetryStarter {
+        outcomes: Mutex<VecDeque<std::result::Result<ActiveCapture, CaptureAttemptError>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LegacyCaptureStarter for CountingRetryStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let outcome = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted retry capture outcome");
+            outcome.map(|mut active| {
+                active.health = Some(PipeWireHealth::unarmed_with_fault_sink(fault_sink));
+                active
+            })
+        }
+    }
+
+    struct ProbeRetryStarter {
+        calls: Arc<AtomicUsize>,
+        constructors: Arc<AtomicUsize>,
+        resources: Arc<AttemptResourceCounters>,
+        pre_resolution_missing: bool,
+    }
+
+    impl LegacyCaptureStarter for ProbeRetryStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.pre_resolution_missing {
+                return missing_target_attempt();
+            }
+            self.constructors.fetch_add(1, Ordering::SeqCst);
+            let mut active = test_active_capture_with_resources(&self.resources);
+            active.health = Some(PipeWireHealth::unarmed_with_fault_sink(fault_sink));
+            Ok(active)
+        }
+    }
+
+    struct FailFirstRetryRecovery {
+        calls: AtomicUsize,
+    }
+
+    impl LegacyStartupRecovery for FailFirstRetryRecovery {
+        fn failed_count(&self, _session: &CaptureSession) -> Result<usize> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(LambError::Capture(
+                    "injected post-construction recovery failure".to_string(),
+                ))
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
+    type RetryObservations = Arc<(Mutex<(Vec<&'static str>, usize)>, Condvar)>;
+
+    struct RetryOperationHarness {
+        _temp: tempfile::TempDir,
+        ctx: Arc<IdleDaemonContext>,
+        socket_path: PathBuf,
+        listener_thread: Option<std::thread::JoinHandle<Result<()>>>,
+        starter_calls: Arc<AtomicUsize>,
+        constructor_calls: Arc<AtomicUsize>,
+        resources: Arc<AttemptResourceCounters>,
+        observations: RetryObservations,
+        clock: Arc<DaemonManualClock>,
+    }
+
+    impl RetryOperationHarness {
+        fn new(
+            outcomes: VecDeque<std::result::Result<ActiveCapture, CaptureAttemptError>>,
+        ) -> Self {
+            Self::new_with_scheduler(outcomes)
+        }
+
+        fn new_with_scheduler(
+            outcomes: VecDeque<std::result::Result<ActiveCapture, CaptureAttemptError>>,
+        ) -> Self {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let starter = Arc::new(CountingRetryStarter {
+                outcomes: Mutex::new(outcomes),
+                calls: Arc::clone(&calls),
+            });
+            Self::build(
+                starter,
+                Arc::new(SuccessfulLegacyRecovery),
+                calls,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AttemptResourceCounters::default()),
+            )
+        }
+
+        fn with_successful_probe_attempts(_attempts: usize) -> Self {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let constructors = Arc::new(AtomicUsize::new(0));
+            let resources = Arc::new(AttemptResourceCounters::default());
+            let starter = Arc::new(ProbeRetryStarter {
+                calls: Arc::clone(&calls),
+                constructors: Arc::clone(&constructors),
+                resources: Arc::clone(&resources),
+                pre_resolution_missing: false,
+            });
+            Self::build(
+                starter,
+                Arc::new(SuccessfulLegacyRecovery),
+                calls,
+                constructors,
+                resources,
+            )
+        }
+
+        fn with_pre_resolution_missing_target() -> Self {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let constructors = Arc::new(AtomicUsize::new(0));
+            let resources = Arc::new(AttemptResourceCounters::default());
+            let starter = Arc::new(ProbeRetryStarter {
+                calls: Arc::clone(&calls),
+                constructors: Arc::clone(&constructors),
+                resources: Arc::clone(&resources),
+                pre_resolution_missing: true,
+            });
+            Self::build(
+                starter,
+                Arc::new(SuccessfulLegacyRecovery),
+                calls,
+                constructors,
+                resources,
+            )
+        }
+
+        fn with_post_construction_recovery_failure() -> Self {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let constructors = Arc::new(AtomicUsize::new(0));
+            let resources = Arc::new(AttemptResourceCounters::default());
+            let starter = Arc::new(ProbeRetryStarter {
+                calls: Arc::clone(&calls),
+                constructors: Arc::clone(&constructors),
+                resources: Arc::clone(&resources),
+                pre_resolution_missing: false,
+            });
+            Self::build(
+                starter,
+                Arc::new(FailFirstRetryRecovery {
+                    calls: AtomicUsize::new(0),
+                }),
+                calls,
+                constructors,
+                resources,
+            )
+        }
+
+        fn build(
+            starter: Arc<dyn LegacyCaptureStarter>,
+            recovery: Arc<dyn LegacyStartupRecovery>,
+            starter_calls: Arc<AtomicUsize>,
+            constructor_calls: Arc<AtomicUsize>,
+            resources: Arc<AttemptResourceCounters>,
+        ) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let config_path = temp.path().join("lamb.toml");
+            let socket_path = temp.path().join("control.sock");
+            let output_path = temp.path().join("output");
+            fs::create_dir(&output_path).unwrap();
+            let socket_toml = toml::Value::String(socket_path.to_string_lossy().into_owned());
+            let output_toml = toml::Value::String(output_path.to_string_lossy().into_owned());
+            fs::write(
+                &config_path,
+                format!(
+                    r#"configVersion = 1
+user = "test"
+backend = "fake"
+channels = 2
+channelMap = ["left", "right"]
+seconds = 5
+sampleRate = 48000
+sampleFormat = "F32LE"
+dontRemix = true
+outputDir = {output_toml}
+maxActiveSnapshots = 1
+allowQueuedRecall = false
+controlSocketPath = {socket_toml}
+controlPermissions = "0600"
+
+[memory]
+headroom = 1.2
+
+[export]
+mode = "per-channel"
+format = "wav"
+splitWhenOverBytes = 1073741824
+"#
+                ),
+            )
+            .unwrap();
+            let bootstrap = bootstrap_config(&config_path).unwrap();
+            let prepared = prepare_bootstrap_config(&bootstrap);
+            let clock = Arc::new(DaemonManualClock::default());
+            let ctx = build_idle_context_with_dependencies(
+                bootstrap,
+                prepared,
+                starter.as_ref(),
+                recovery.as_ref(),
+                clock.clone(),
+            )
+            .unwrap();
+            {
+                let mut runtime = ctx.runtime.lock().unwrap();
+                runtime.state = "stopped".to_string();
+                runtime.lifecycle.mark_stopped(None);
+                assert_eq!(runtime.lifecycle.begin_operation().unwrap(), 1);
+            }
+            let socket = ControlSocketOwner::bind(socket_path.clone()).unwrap();
+            let observations = Arc::new((Mutex::new((Vec::new(), 0)), Condvar::new()));
+            let before_observations = Arc::clone(&observations);
+            let after_observations = Arc::clone(&observations);
+            let listener_ctx = Arc::clone(&ctx);
+            let listener_thread = std::thread::spawn(move || {
+                run_idle_listener_with_dependencies(
+                    listener_ctx,
+                    socket,
+                    starter,
+                    recovery,
+                    || {},
+                    move |job| {
+                        let label = match job {
+                            OperationJob::Internal(ScheduledOperation::Retry { .. }) => "retry",
+                            OperationJob::Internal(ScheduledOperation::RuntimeFault { .. }) => {
+                                "runtime-fault"
+                            }
+                            OperationJob::Client {
+                                request: ControlRequest::StartCapture { .. },
+                                ..
+                            } => "start-capture",
+                            OperationJob::Client {
+                                request: ControlRequest::StopCapture,
+                                ..
+                            } => "stop-capture",
+                            OperationJob::Client { .. } => "client",
+                        };
+                        before_observations.0.lock().unwrap().0.push(label);
+                    },
+                    move || {
+                        let mut state = after_observations.0.lock().unwrap();
+                        state.1 += 1;
+                        after_observations.1.notify_all();
+                    },
+                )
+            });
+            let harness = Self {
+                _temp: temp,
+                ctx,
+                socket_path,
+                listener_thread: Some(listener_thread),
+                starter_calls,
+                constructor_calls,
+                resources,
+                observations,
+                clock,
+            };
+            assert!(harness.status_via_socket().ok);
+            harness.assert_listener_live();
+            {
+                let mut state = harness.observations.0.lock().unwrap();
+                state.0.clear();
+                state.1 = 0;
+            }
+            harness
+        }
+
+        fn enqueue_internal(&self, operation: ScheduledOperation) {
+            match operation {
+                ScheduledOperation::Retry { generation } => {
+                    self.ctx
+                        .scheduler
+                        .schedule_retry(generation, self.clock_now());
+                }
+                ScheduledOperation::RuntimeFault {
+                    generation,
+                    attempt_id,
+                    fault,
+                } => self
+                    .ctx
+                    .scheduler
+                    .notify_fault(generation, attempt_id, fault),
+            }
+            self.scheduler_barrier();
+        }
+
+        fn enqueue_request(&self, request: ControlRequest) {
+            let response = self.request(request);
+            assert!(response.ok, "{}", response.message);
+        }
+
+        fn request(&self, request: ControlRequest) -> ControlResponse {
+            crate::control::send_request(&self.socket_path, &request).unwrap()
+        }
+
+        fn status_via_socket(&self) -> ControlResponse {
+            self.request(ControlRequest::Status)
+        }
+
+        fn wait_for_operations(&self, count: usize) {
+            let mut state = self.observations.0.lock().unwrap();
+            let deadline = std::time::Instant::now() + ROUTE_TEST_TIMEOUT;
+            while state.1 < count {
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .expect("timed out waiting for retry operation");
+                let (next, timeout) = self.observations.1.wait_timeout(state, remaining).unwrap();
+                assert!(
+                    !timeout.timed_out(),
+                    "timed out waiting for retry operation"
+                );
+                state = next;
+            }
+        }
+
+        fn completed_operations(&self) -> usize {
+            self.observations.0.lock().unwrap().1
+        }
+
+        fn observed_order(&self) -> Vec<&'static str> {
+            self.observations.0.lock().unwrap().0.clone()
+        }
+
+        fn stop_capture(&self) {
+            let before = self.completed_operations();
+            let response = self.request(ControlRequest::StopCapture);
+            assert!(response.ok, "{}", response.message);
+            self.wait_for_operations(before + 1);
+            let mut state = self.observations.0.lock().unwrap();
+            state.0.clear();
+            state.1 = 0;
+        }
+
+        fn starter_call_count(&self) -> usize {
+            self.starter_calls.load(Ordering::SeqCst)
+        }
+
+        fn constructor_count(&self) -> usize {
+            self.constructor_calls.load(Ordering::SeqCst)
+        }
+
+        fn pid(&self) -> u32 {
+            std::process::id()
+        }
+
+        fn socket_identity(&self) -> (u64, u64) {
+            let metadata = fs::symlink_metadata(&self.socket_path).unwrap();
+            (metadata.dev(), metadata.ino())
+        }
+
+        fn assert_listener_live(&self) {
+            assert!(self.socket_path.exists());
+            assert!(UnixStream::connect(&self.socket_path).is_ok());
+            assert!(!self.listener_thread.as_ref().unwrap().is_finished());
+        }
+
+        fn attempt_count(&self) -> usize {
+            self.starter_call_count()
+        }
+
+        fn resource_counts(&self) -> [usize; 5] {
+            std::array::from_fn(|index| self.resources.live[index].load(Ordering::SeqCst))
+        }
+
+        fn lifecycle(&self) -> LifecycleState {
+            self.ctx.runtime.lock().unwrap().lifecycle.clone()
+        }
+
+        fn attempt_initial_start(&self) {
+            let before = self.completed_operations();
+            let response = self.request(ControlRequest::StartCapture {
+                profile: None,
+                activate: false,
+            });
+            assert!(
+                response.ok || response.status.is_some(),
+                "start response must preserve control-plane status: {}",
+                response.message
+            );
+            self.wait_for_operations(before + 1);
+            let mut state = self.observations.0.lock().unwrap();
+            state.0.clear();
+            state.1 = 0;
+        }
+
+        fn now_millis(&self) -> u64 {
+            self.clock.now_millis.load(Ordering::SeqCst)
+        }
+
+        fn clock_now(&self) -> RetryInstant {
+            self.clock.now()
+        }
+
+        fn advance_to_next_retry(&self) {
+            let due = self
+                .lifecycle()
+                .next_retry_at
+                .expect("transient lifecycle has a retry deadline");
+            self.clock
+                .now_millis
+                .store(due.as_millis(), Ordering::SeqCst);
+            self.scheduler_barrier();
+        }
+
+        fn scheduler_barrier(&self) {
+            self.ctx.scheduler.wake_for_test();
+        }
+
+        fn scheduler_thread_start_count(&self) -> u64 {
+            self.ctx.scheduler.thread_start_count_for_test()
+        }
+
+        fn scheduler_timed_wait_count(&self) -> u64 {
+            self.ctx.scheduler.timed_wait_count_for_test()
+        }
+
+        fn disconnect_published_pipewire_through_callback(&self) -> bool {
+            let health = self
+                .ctx
+                .runtime
+                .lock()
+                .unwrap()
+                .capture_health
+                .clone()
+                .expect("published capture has PipeWire health");
+            crate::capture_pipewire::observe_stream_unconnected_for_test(&health)
+        }
+    }
+
+    impl Drop for RetryOperationHarness {
+        fn drop(&mut self) {
+            if !self.ctx.stop.load(Ordering::Acquire) {
+                let response =
+                    crate::control::send_request(&self.socket_path, &ControlRequest::Stop)
+                        .expect("production listener accepts Stop during harness shutdown");
+                assert!(response.ok, "{}", response.message);
+            }
+            if let Some(listener) = self.listener_thread.take() {
+                listener.join().unwrap().unwrap();
+            }
+            assert!(!self.socket_path.exists());
+            assert_eq!(self.resource_counts(), [0; 5]);
+        }
+    }
+
+    #[test]
+    fn retry_and_client_capture_commands_share_fifo_order() {
+        let harness = RetryOperationHarness::new(VecDeque::from([
+            Ok(test_active_capture()),
+            Ok(test_active_capture()),
+        ]));
+        harness.enqueue_internal(ScheduledOperation::Retry { generation: 1 });
+        harness.enqueue_request(ControlRequest::StartCapture {
+            profile: None,
+            activate: false,
+        });
+        harness.wait_for_operations(2);
+        assert_eq!(harness.observed_order(), vec!["retry", "start-capture"]);
+    }
+
+    #[test]
+    fn stale_retry_is_noop_after_stop_capture() {
+        let harness = RetryOperationHarness::new(VecDeque::new());
+        harness.stop_capture();
+        let calls_before = harness.starter_call_count();
+        harness.enqueue_internal(ScheduledOperation::Retry { generation: 1 });
+        harness.scheduler_barrier();
+        assert_eq!(harness.starter_call_count(), calls_before);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Stopped);
+    }
+
+    #[test]
+    fn integrated_scheduler_and_worker_reject_stale_fault_notification_and_publication() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::new());
+        let old_generation = harness.lifecycle().generation;
+        let attempt_id = CaptureAttemptId::from_raw_for_test(1);
+        let sink = harness.ctx.scheduler.fault_sink(old_generation, attempt_id);
+        harness.stop_capture();
+
+        sink.notify(RuntimeCaptureFault::BackendFault(
+            "stale notification".to_string(),
+        ));
+        harness.ctx.scheduler.wake_for_test();
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+
+        harness.enqueue_internal(ScheduledOperation::RuntimeFault {
+            generation: old_generation,
+            attempt_id,
+            fault: RuntimeCaptureFault::BackendFault("stale publication".to_string()),
+        });
+        harness.scheduler_barrier();
+        let lifecycle = harness.lifecycle();
+        assert_eq!(lifecycle.capture_state, CaptureState::Stopped);
+        assert_eq!(lifecycle.error_class, None);
+        assert_eq!(lifecycle.retry_policy, RetryPolicy::None);
+    }
+
+    #[test]
+    fn pipewire_resolution_errors_map_without_rendered_string_classification() {
+        let cases = [
+            (
+                TargetResolutionError::TargetMissing("missing target".to_string()),
+                ErrorClass::Transient,
+                CaptureState::WaitingForDevice,
+            ),
+            (
+                TargetResolutionError::PortMissing("missing port".to_string()),
+                ErrorClass::Transient,
+                CaptureState::WaitingForDevice,
+            ),
+            (
+                TargetResolutionError::BackendUnavailable("daemon absent".to_string()),
+                ErrorClass::Transient,
+                CaptureState::Faulted,
+            ),
+            (
+                TargetResolutionError::TargetChanged("startup race".to_string()),
+                ErrorClass::Transient,
+                CaptureState::WaitingForDevice,
+            ),
+            (
+                TargetResolutionError::InvalidSelector("bad selector".to_string()),
+                ErrorClass::Permanent,
+                CaptureState::Faulted,
+            ),
+        ];
+
+        for (error, class, capture_state) in cases {
+            let classified = classify_pipewire_resolution_error(error);
+            assert_eq!(classified.class, class);
+            assert_eq!(classified.capture_state, capture_state);
+        }
+    }
+
+    #[test]
+    fn legacy_second_handshake_resolution_variants_reach_supervisor_as_waiting_transient() {
+        for startup_error in [
+            TargetResolutionError::TargetMissing("vanished target".to_string()),
+            TargetResolutionError::PortMissing("vanished port".to_string()),
+            TargetResolutionError::TargetChanged("changed identity".to_string()),
+        ] {
+            let harness = SupervisorHarness::stopped();
+            let prepared = prepare_legacy_config(test_legacy_pipewire_config()).unwrap();
+            let Err(attempt_error) = start_legacy_capture_with_pipewire_start(
+                &prepared,
+                RuntimeFaultSink::default(),
+                |_| Ok(test_resolved_target(1, 48_000)),
+                move |_, _, _, _| Err(PipeWireStartupError::Resolution(startup_error)),
+            ) else {
+                panic!("typed second-resolution failure unexpectedly started capture");
+            };
+
+            publish_capture_attempt_error(&harness.ctx, attempt_error);
+
+            let lifecycle = harness.lifecycle();
+            assert_eq!(lifecycle.capture_state, CaptureState::WaitingForDevice);
+            assert_eq!(lifecycle.error_class, Some(ErrorClass::Transient));
+            assert_eq!(lifecycle.retry_policy, RetryPolicy::BoundedBackoff);
+        }
+
+        let harness = SupervisorHarness::stopped();
+        let prepared = prepare_legacy_config(test_legacy_pipewire_config()).unwrap();
+        let Err(attempt_error) = start_legacy_capture_with_pipewire_start(
+            &prepared,
+            RuntimeFaultSink::default(),
+            |_| Ok(test_resolved_target(1, 48_000)),
+            |_, _, _, _| {
+                Err(PipeWireStartupError::Capture(LambError::Capture(
+                    "stream open failed".to_string(),
+                )))
+            },
+        ) else {
+            panic!("generic PipeWire startup failure unexpectedly started capture");
+        };
+        publish_capture_attempt_error(&harness.ctx, attempt_error);
+        let lifecycle = harness.lifecycle();
+        assert_eq!(lifecycle.capture_state, CaptureState::Faulted);
+        assert_eq!(lifecycle.error_class, Some(ErrorClass::Transient));
+        assert_eq!(lifecycle.retry_policy, RetryPolicy::BoundedBackoff);
+    }
+
+    #[test]
+    fn pipewire_disconnect_enqueues_recovery_without_status_request() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::new());
+        let resources = Arc::new(AttemptResourceCounters::default());
+        {
+            let mut runtime = harness.ctx.runtime.lock().unwrap();
+            let mut active = test_active_capture_with_resources(&resources);
+            runtime.capture = active.backend.take();
+            runtime.session = active.session.take();
+            runtime.resolved_capture = Some(active.resolved.clone());
+            runtime.state = "capturing".to_string();
+            runtime
+                .lifecycle
+                .mark_running(None, active.resolved.resolved_target.clone());
+        }
+        let generation = harness.lifecycle().generation;
+        let attempt_id = CaptureAttemptId::from_raw_for_test(2);
+        let health = PipeWireHealth::with_fault_sink(
+            harness.ctx.scheduler.fault_sink(generation, attempt_id),
+        );
+        harness.ctx.runtime.lock().unwrap().capture_health = Some(health.clone());
+
+        assert!(health.record_fatal(RuntimeCaptureFault::DeviceDisconnected(
+            "selected PipeWire device disconnected".to_string(),
+        )));
+        harness.ctx.scheduler.wake_for_test();
+        harness.wait_for_operations(1);
+
+        let lifecycle = harness.lifecycle();
+        assert_eq!(lifecycle.generation, generation);
+        assert_eq!(lifecycle.capture_state, CaptureState::WaitingForDevice);
+        assert_eq!(lifecycle.error_class, Some(ErrorClass::Transient));
+        assert_eq!(lifecycle.retry_attempt, 1);
+        assert_eq!(
+            lifecycle.next_retry_at,
+            Some(RetryInstant::from_millis(1_000))
+        );
+        assert_eq!(harness.starter_call_count(), 0);
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.live(ProbeResource::Session), 0);
+        let runtime = harness.ctx.runtime.lock().unwrap();
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        assert!(runtime.resolved_capture.is_none());
+    }
+
+    #[test]
+    fn old_generation_pipewire_fault_is_ignored() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::new());
+        let old_generation = harness.lifecycle().generation;
+        let health = PipeWireHealth::with_fault_sink(
+            harness
+                .ctx
+                .scheduler
+                .fault_sink(old_generation, CaptureAttemptId::from_raw_for_test(3)),
+        );
+        harness.stop_capture();
+
+        assert!(health.record_fatal(RuntimeCaptureFault::BackendFault(
+            "old backend failed".to_string(),
+        )));
+        harness.ctx.scheduler.wake_for_test();
+
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+        let lifecycle = harness.lifecycle();
+        assert_eq!(lifecycle.capture_state, CaptureState::Stopped);
+        assert_eq!(lifecycle.error_class, None);
+        assert_eq!(lifecycle.retry_attempt, 0);
+    }
+
+    #[test]
+    fn duplicate_pipewire_fault_does_not_double_advance_backoff() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::new());
+        {
+            let mut runtime = harness.ctx.runtime.lock().unwrap();
+            let mut active = test_active_capture();
+            runtime.capture = active.backend.take();
+            runtime.session = active.session.take();
+            runtime.resolved_capture = Some(active.resolved.clone());
+            runtime.state = "capturing".to_string();
+            runtime
+                .lifecycle
+                .mark_running(None, active.resolved.resolved_target.clone());
+        }
+        let generation = harness.lifecycle().generation;
+        let attempt_id = CaptureAttemptId::from_raw_for_test(4);
+        let health = PipeWireHealth::with_fault_sink(
+            harness.ctx.scheduler.fault_sink(generation, attempt_id),
+        );
+        harness.ctx.runtime.lock().unwrap().capture_health = Some(health.clone());
+
+        assert!(health.record_fatal(RuntimeCaptureFault::BackendFault("first fault".to_string(),)));
+        assert!(!health.record_fatal(RuntimeCaptureFault::BackendFault(
+            "duplicate fault".to_string(),
+        )));
+        harness.ctx.scheduler.wake_for_test();
+        harness.wait_for_operations(1);
+
+        let lifecycle = harness.lifecycle();
+        assert_eq!(lifecycle.capture_state, CaptureState::Faulted);
+        assert_eq!(lifecycle.retry_attempt, 1);
+        assert_eq!(
+            lifecycle.next_retry_at,
+            Some(RetryInstant::from_millis(1_000))
+        );
+    }
+
+    #[test]
+    fn same_generation_fault_from_different_attempt_cannot_detach_active_capture() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::new());
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let generation = harness.lifecycle().generation;
+        let stale_attempt = CaptureAttemptId::from_raw_for_test(40);
+        let active_attempt = CaptureAttemptId::from_raw_for_test(41);
+        let health = PipeWireHealth::with_fault_sink(
+            harness.ctx.scheduler.fault_sink(generation, active_attempt),
+        );
+        {
+            let mut runtime = harness.ctx.runtime.lock().unwrap();
+            let mut active = test_active_capture_with_resources(&resources);
+            runtime.capture = active.backend.take();
+            runtime.session = active.session.take();
+            runtime.capture_health = Some(health);
+            runtime.resolved_capture = Some(active.resolved.clone());
+            runtime.state = "capturing".to_string();
+            runtime
+                .lifecycle
+                .mark_running(None, active.resolved.resolved_target.clone());
+        }
+
+        publish_runtime_fault(
+            &harness.ctx,
+            generation,
+            stale_attempt,
+            RuntimeCaptureFault::BackendFault("stale attempt".to_string()),
+        );
+        assert_eq!(resources.live(ProbeResource::Backend), 1);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Running);
+
+        publish_runtime_fault(
+            &harness.ctx,
+            generation,
+            active_attempt,
+            RuntimeCaptureFault::BackendFault("active attempt".to_string()),
+        );
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(harness.lifecycle().retry_attempt, 1);
+    }
+
+    #[test]
+    fn duplicate_already_admitted_fault_jobs_advance_backoff_once() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::new());
+        let generation = harness.lifecycle().generation;
+        let attempt_id = CaptureAttemptId::from_raw_for_test(42);
+        let health = PipeWireHealth::with_fault_sink(
+            harness.ctx.scheduler.fault_sink(generation, attempt_id),
+        );
+        {
+            let mut runtime = harness.ctx.runtime.lock().unwrap();
+            let mut active = test_active_capture();
+            runtime.capture = active.backend.take();
+            runtime.session = active.session.take();
+            runtime.capture_health = Some(health);
+            runtime.resolved_capture = Some(active.resolved.clone());
+            runtime.state = "capturing".to_string();
+            runtime
+                .lifecycle
+                .mark_running(None, active.resolved.resolved_target.clone());
+        }
+        let fault = RuntimeCaptureFault::BackendFault("duplicate admitted fault".to_string());
+
+        publish_runtime_fault(&harness.ctx, generation, attempt_id, fault.clone());
+        publish_runtime_fault(&harness.ctx, generation, attempt_id, fault);
+
+        assert_eq!(harness.lifecycle().retry_attempt, 1);
+    }
+
+    #[test]
+    fn scheduler_lane_worker_fifo_enforces_attempt_identity_and_duplicate_noop() {
+        let harness = SupervisorHarness::running();
+        let generation = harness.lifecycle().generation;
+        let matching_attempt = CaptureAttemptId::from_raw_for_test(43);
+        let mismatched_attempt = CaptureAttemptId::from_raw_for_test(44);
+        let health = PipeWireHealth::unarmed_with_fault_sink(
+            harness
+                .ctx
+                .scheduler
+                .fault_sink(generation, matching_attempt),
+        );
+        health.arm();
+        harness.ctx.runtime.lock().unwrap().capture_health = Some(health);
+
+        let lane = Arc::new(OperationLane::new(4).unwrap());
+        let admitted = Arc::new((Mutex::new(0_usize), Condvar::new()));
+        let scheduler =
+            spawn_retry_scheduler(harness.ctx.scheduler.clone(), harness.ctx.clock.clone(), {
+                let lane = Arc::clone(&lane);
+                let admitted = Arc::clone(&admitted);
+                move |operation| {
+                    lane.try_enqueue(OperationJob::Internal(operation))
+                        .map_err(|(error, _)| error)?;
+                    let mut count = admitted.0.lock().unwrap();
+                    *count += 1;
+                    admitted.1.notify_all();
+                    Ok(())
+                }
+            })
+            .unwrap();
+        let admit = |attempt_id, message: &str, expected_count| {
+            harness.ctx.scheduler.notify_fault(
+                generation,
+                attempt_id,
+                RuntimeCaptureFault::BackendFault(message.to_string()),
+            );
+            let mut count = admitted.0.lock().unwrap();
+            while *count < expected_count {
+                count = admitted.1.wait(count).unwrap();
+            }
+        };
+        admit(mismatched_attempt, "mismatched", 1);
+        admit(matching_attempt, "matching", 2);
+        admit(matching_attempt, "duplicate matching", 3);
+
+        let observed = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let starter = Arc::new(PanickingLegacyStarter {
+            calls: AtomicUsize::new(0),
+        });
+        let worker = spawn_operation_worker(
+            Arc::clone(&lane),
+            DEFAULT_WORKER_STACK_BYTES as usize,
+            {
+                let ctx = Arc::clone(&harness.ctx);
+                let starter = Arc::clone(&starter);
+                let resources = Arc::clone(&harness.resources);
+                let observed = Arc::clone(&observed);
+                move |job| {
+                    execute_operation_job_with_recovery(
+                        &ctx,
+                        job,
+                        starter.as_ref(),
+                        &SuccessfulLegacyRecovery,
+                    );
+                    let lifecycle = ctx.runtime.lock().unwrap().lifecycle.clone();
+                    observed.0.lock().unwrap().push((
+                        lifecycle.capture_state,
+                        lifecycle.retry_attempt,
+                        resources.live(ProbeResource::Backend),
+                    ));
+                    observed.1.notify_all();
+                }
+            },
+            |_| {},
+        );
+        let mut states = observed.0.lock().unwrap();
+        while states.len() < 3 {
+            states = observed.1.wait(states).unwrap();
+        }
+        assert_eq!(states[0], (CaptureState::Running, 0, 1));
+        assert_eq!(states[1], (CaptureState::Faulted, 1, 0));
+        assert_eq!(states[2], (CaptureState::Faulted, 1, 0));
+        drop(states);
+
+        harness.ctx.scheduler.stop();
+        scheduler.join().unwrap();
+        lane.close();
+        worker.join().unwrap();
+    }
+
+    struct CapturingFaultSinkStarter {
+        active: Mutex<Option<ActiveCapture>>,
+        sink: Mutex<Option<RuntimeFaultSink>>,
+    }
+
+    struct UnarmedFaultLegacyStarter {
+        health: Arc<Mutex<Option<PipeWireHealth>>>,
+    }
+
+    impl LegacyCaptureStarter for UnarmedFaultLegacyStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            let health = PipeWireHealth::unarmed_with_fault_sink(fault_sink);
+            health.record_fatal(RuntimeCaptureFault::BackendFault(
+                "fault recorded before publication".to_string(),
+            ));
+            *self.health.lock().unwrap() = Some(health.clone());
+            let mut active = test_active_capture();
+            active.health = Some(health);
+            Ok(active)
+        }
+    }
+
+    #[test]
+    fn configured_initial_legacy_publication_invalidates_then_replays_unarmed_fault() {
+        let harness = RetryOperationHarness::new(VecDeque::new());
+        let health = Arc::new(Mutex::new(None));
+        let starter = UnarmedFaultLegacyStarter {
+            health: Arc::clone(&health),
+        };
+
+        let _ = attempt_configured_start_with_recovery(
+            &harness.ctx,
+            &starter,
+            &SuccessfulLegacyRecovery,
+        );
+
+        harness.wait_for_operations(1);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Faulted);
+        assert_eq!(harness.lifecycle().retry_attempt, 1);
+
+        let published_health = health.lock().unwrap().clone().unwrap();
+        let pending_before_repeat = harness.ctx.scheduler.pending_operation_for_test();
+        published_health.arm();
+        let generation = harness.lifecycle().generation;
+        let attempt_id = published_health.attempt_id().unwrap();
+        published_health.rebind_and_arm(harness.ctx.scheduler.fault_sink(generation, attempt_id));
+        assert_eq!(
+            harness.ctx.scheduler.pending_operation_for_test(),
+            pending_before_repeat
+        );
+    }
+
+    #[test]
+    fn legacy_command_publication_invalidates_then_replays_unarmed_fault() {
+        let harness = RetryOperationHarness::new(VecDeque::new());
+        let health = Arc::new(Mutex::new(None));
+        let starter = UnarmedFaultLegacyStarter {
+            health: Arc::clone(&health),
+        };
+
+        let response = start_capture_transaction_with_recovery(
+            &harness.ctx,
+            None,
+            false,
+            &starter,
+            &SuccessfulLegacyRecovery,
+        );
+
+        assert!(response.ok, "{}", response.message);
+        assert!(health.lock().unwrap().is_some());
+
+        harness.wait_for_operations(1);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Faulted);
+        assert_eq!(harness.lifecycle().retry_attempt, 1);
+    }
+
+    impl LegacyCaptureStarter for CapturingFaultSinkStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            *self.sink.lock().unwrap() = Some(fault_sink);
+            Ok(self.active.lock().unwrap().take().unwrap())
+        }
+    }
+
+    #[test]
+    fn legacy_start_receives_current_generation_fault_sink() {
+        let harness = SupervisorHarness::stopped();
+        let starter = CapturingFaultSinkStarter {
+            active: Mutex::new(Some(test_active_capture())),
+            sink: Mutex::new(None),
+        };
+
+        let response = start_capture_transaction_with_recovery(
+            &harness.ctx,
+            None,
+            false,
+            &starter,
+            &SuccessfulLegacyRecovery,
+        );
+        assert!(response.ok, "{}", response.message);
+        let generation = harness.lifecycle().generation;
+        let sink = starter.sink.lock().unwrap().take().unwrap();
+        let attempt_id = sink.attempt_id();
+        sink.notify(RuntimeCaptureFault::BackendFault(
+            "generation-bound fault".to_string(),
+        ));
+
+        assert_eq!(
+            harness.ctx.scheduler.pending_operation_for_test(),
+            Some(ScheduledOperation::RuntimeFault {
+                generation,
+                attempt_id,
+                fault: RuntimeCaptureFault::BackendFault("generation-bound fault".to_string()),
+            })
+        );
+    }
+
+    fn missing_target_attempt() -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+        Err(CaptureAttemptError {
+            class: ErrorClass::Transient,
+            capture_state: CaptureState::WaitingForDevice,
+            message: "selected PipeWire target is missing".to_string(),
+        })
+    }
+
+    #[test]
+    fn missing_target_enters_waiting_for_device() {
+        let harness =
+            RetryOperationHarness::new_with_scheduler(VecDeque::from([missing_target_attempt()]));
+        harness.attempt_initial_start();
+
+        let lifecycle = harness.lifecycle();
+        assert_eq!(lifecycle.daemon_state, DaemonState::Degraded);
+        assert_eq!(lifecycle.capture_state, CaptureState::WaitingForDevice);
+        assert_eq!(lifecycle.error_class, Some(ErrorClass::Transient));
+        assert_eq!(lifecycle.retry_policy, RetryPolicy::BoundedBackoff);
+        assert_eq!(lifecycle.retry_attempt, 1);
+        assert_eq!(
+            lifecycle.next_retry_at,
+            Some(
+                harness
+                    .clock_now()
+                    .checked_add(Duration::from_secs(1))
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn transient_deadlines_follow_one_two_five_ten_thirty_sixty() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::from([
+            missing_target_attempt(),
+            missing_target_attempt(),
+            missing_target_attempt(),
+            missing_target_attempt(),
+            missing_target_attempt(),
+            missing_target_attempt(),
+            Ok(test_active_capture()),
+        ]));
+        harness.attempt_initial_start();
+        let pid = harness.pid();
+        let socket = harness.socket_identity();
+
+        for (index, expected_seconds) in [1_u64, 2, 5, 10, 30, 60].into_iter().enumerate() {
+            let lifecycle = harness.lifecycle();
+            assert_eq!(lifecycle.retry_attempt, (index + 1) as u32);
+            assert_eq!(
+                lifecycle.next_retry_at,
+                Some(
+                    harness
+                        .clock_now()
+                        .checked_add(Duration::from_secs(expected_seconds))
+                        .unwrap()
+                )
+            );
+            assert_eq!(harness.resource_counts(), [0; 5]);
+            harness.advance_to_next_retry();
+            harness.wait_for_operations(index + 1);
+            assert_eq!(harness.pid(), pid);
+            assert_eq!(harness.socket_identity(), socket);
+            assert!(harness.status_via_socket().ok);
+            harness.assert_listener_live();
+            assert_eq!(harness.resource_counts(), [0; 5]);
+        }
+        assert_eq!(harness.attempt_count(), 7);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Running);
+        assert_eq!(harness.pid(), pid);
+        assert_eq!(harness.socket_identity(), socket);
+        assert!(harness.status_via_socket().ok);
+        harness.assert_listener_live();
+        assert_eq!(harness.resource_counts(), [0; 5]);
+    }
+
+    #[test]
+    fn transient_retries_keep_process_and_socket_identity() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::from([
+            missing_target_attempt(),
+            missing_target_attempt(),
+            Ok(test_active_capture()),
+        ]));
+        let pid = harness.pid();
+        let socket = harness.socket_identity();
+        harness.attempt_initial_start();
+        harness.assert_listener_live();
+
+        for completed in 1..=2 {
+            harness.advance_to_next_retry();
+            harness.wait_for_operations(completed);
+            assert_eq!(harness.pid(), pid);
+            assert_eq!(harness.socket_identity(), socket);
+            harness.assert_listener_live();
+            assert!(harness.status_via_socket().ok);
+        }
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Running);
+    }
+
+    #[test]
+    fn failed_attempts_release_all_resource_counters() {
+        let harness = RetryOperationHarness::with_post_construction_recovery_failure();
+        harness.attempt_initial_start();
+        assert_eq!(harness.resource_counts(), [0; 5]);
+        harness.advance_to_next_retry();
+        harness.wait_for_operations(1);
+        assert_eq!(harness.resource_counts(), [1; 5]);
+        harness.stop_capture();
+        assert_eq!(harness.resource_counts(), [0; 5]);
+    }
+
+    #[test]
+    fn missing_target_pre_resolution_constructs_no_attempt_resources() {
+        let harness = RetryOperationHarness::with_pre_resolution_missing_target();
+        harness.attempt_initial_start();
+
+        assert_eq!(harness.constructor_count(), 0);
+        assert_eq!(harness.resource_counts(), [0; 5]);
+        assert_eq!(
+            harness.lifecycle().capture_state,
+            CaptureState::WaitingForDevice
+        );
+    }
+
+    #[test]
+    fn successful_retry_resets_attempt_and_deadline() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::from([
+            missing_target_attempt(),
+            Ok(test_active_capture()),
+        ]));
+        harness.attempt_initial_start();
+        harness.advance_to_next_retry();
+        harness.wait_for_operations(1);
+
+        let lifecycle = harness.lifecycle();
+        assert_eq!(lifecycle.daemon_state, DaemonState::Ready);
+        assert_eq!(lifecycle.capture_state, CaptureState::Running);
+        assert_eq!(lifecycle.error_class, None);
+        assert_eq!(lifecycle.last_error, None);
+        assert_eq!(lifecycle.retry_policy, RetryPolicy::None);
+        assert_eq!(lifecycle.retry_attempt, 0);
+        assert_eq!(lifecycle.next_retry_at, None);
+    }
+
+    #[test]
+    fn runtime_disconnect_retries_without_status_poll() {
+        let harness = RetryOperationHarness::with_successful_probe_attempts(2);
+        harness.attempt_initial_start();
+        assert_eq!(harness.resource_counts(), [1; 5]);
+
+        assert!(harness.disconnect_published_pipewire_through_callback());
+        harness.wait_for_operations(1);
+        assert_eq!(
+            harness.lifecycle().capture_state,
+            CaptureState::WaitingForDevice
+        );
+        assert_eq!(harness.resource_counts(), [0; 5]);
+
+        harness.advance_to_next_retry();
+        harness.wait_for_operations(2);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Running);
+        assert_eq!(harness.attempt_count(), 2);
+    }
+
+    #[test]
+    fn healthy_capture_has_no_scheduler_wakeups_or_extra_attempts() {
+        let harness = RetryOperationHarness::with_successful_probe_attempts(1);
+        harness.attempt_initial_start();
+        let pid = harness.pid();
+        let socket = harness.socket_identity();
+        let attempts = harness.attempt_count();
+        let timed_waits = harness.scheduler_timed_wait_count();
+        let thread_starts = harness.scheduler_thread_start_count();
+        let resources = harness.resource_counts();
+
+        harness.clock.now_millis.fetch_add(
+            Duration::from_secs(600).as_millis() as u64,
+            Ordering::SeqCst,
+        );
+        harness.scheduler_barrier();
+
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Running);
+        assert_eq!(harness.attempt_count(), attempts);
+        assert_eq!(harness.scheduler_timed_wait_count(), timed_waits);
+        assert_eq!(harness.scheduler_thread_start_count(), thread_starts);
+        assert_eq!(harness.resource_counts(), resources);
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+        assert_eq!(harness.pid(), pid);
+        assert_eq!(harness.socket_identity(), socket);
+        harness.assert_listener_live();
+        assert!(harness.status_via_socket().ok);
+    }
+
+    #[test]
+    fn production_scheduler_executes_exact_capped_backoff_once_per_failed_attempt() {
+        let transient = || {
+            Err(CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "device unavailable".to_string(),
+            })
+        };
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::from([
+            transient(),
+            transient(),
+            transient(),
+            transient(),
+            transient(),
+            transient(),
+            transient(),
+            transient(),
+        ]));
+
+        harness.attempt_initial_start();
+        let expected = [1_u64, 2, 5, 10, 30, 60, 60, 60];
+        for (index, seconds) in expected.into_iter().enumerate() {
+            let lifecycle = harness.lifecycle();
+            assert_eq!(lifecycle.retry_attempt, u32::try_from(index + 1).unwrap());
+            assert_eq!(
+                lifecycle.next_retry_at.unwrap().as_millis() - harness.now_millis(),
+                seconds * 1_000
+            );
+            if index + 1 < expected.len() {
+                harness.advance_to_next_retry();
+                harness.wait_for_operations(index + 1);
+            }
+        }
+        assert_eq!(harness.starter_call_count(), expected.len());
+        assert_eq!(harness.scheduler_thread_start_count(), 1);
+    }
+
+    #[test]
+    fn production_scheduler_success_cancels_and_resets_retry_state() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::from([
+            Err(CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "device unavailable".to_string(),
+            }),
+            Ok(test_active_capture()),
+        ]));
+        harness.attempt_initial_start();
+        harness.advance_to_next_retry();
+        harness.wait_for_operations(1);
+
+        let lifecycle = harness.lifecycle();
+        assert_eq!(lifecycle.capture_state, CaptureState::Running);
+        assert_eq!(lifecycle.error_class, None);
+        assert_eq!(lifecycle.retry_attempt, 0);
+        assert_eq!(lifecycle.next_retry_at, None);
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+    }
+
+    #[test]
+    fn production_scheduler_permanent_reclassification_cancels_retry() {
+        let harness = RetryOperationHarness::new_with_scheduler(VecDeque::from([
+            Err(CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "device unavailable".to_string(),
+            }),
+            Err(CaptureAttemptError {
+                class: ErrorClass::Permanent,
+                capture_state: CaptureState::Faulted,
+                message: "profile invalid".to_string(),
+            }),
+        ]));
+        harness.attempt_initial_start();
+        harness.advance_to_next_retry();
+        harness.wait_for_operations(1);
+
+        let lifecycle = harness.lifecycle();
+        assert_eq!(lifecycle.capture_state, CaptureState::Faulted);
+        assert_eq!(lifecycle.error_class, Some(ErrorClass::Permanent));
+        assert_eq!(lifecycle.retry_policy, RetryPolicy::Manual);
+        assert_eq!(lifecycle.retry_attempt, 0);
+        assert_eq!(lifecycle.next_retry_at, None);
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+    }
+
+    #[test]
+    fn production_lane_full_retry_is_retained_admitted_once_and_stop_discards_it() {
+        fn filler() -> OperationJob {
+            OperationJob::Internal(ScheduledOperation::RuntimeFault {
+                generation: 1,
+                attempt_id: CaptureAttemptId::from_raw_for_test(5),
+                fault: RuntimeCaptureFault::BackendFault("filler".to_string()),
+            })
+        }
+
+        let clock = Arc::new(DaemonManualClock::default());
+        let handle = RetrySchedulerHandle::new();
+        let lane = Arc::new(OperationLane::new(1).unwrap());
+        lane.try_enqueue(filler()).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker = spawn_retry_scheduler(handle.clone(), clock.clone(), {
+            let lane = Arc::clone(&lane);
+            let attempts = Arc::clone(&attempts);
+            move |operation| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                lane.try_enqueue(OperationJob::Internal(operation))
+                    .map_err(|(error, _)| error)
+            }
+        })
+        .unwrap();
+        handle.schedule_retry(1, RetryInstant::from_millis(1_000));
+        clock.now_millis.store(1_000, Ordering::SeqCst);
+        handle.wake_for_test();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            handle.pending_operation_for_test(),
+            Some(ScheduledOperation::Retry { generation: 1 })
+        );
+
+        handle.notify_lane_available();
+        handle.wake_for_test();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let _occupied = lane.pop().unwrap();
+        handle.notify_lane_available();
+        handle.wake_for_test();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(matches!(
+            lane.pop(),
+            Some(OperationJob::Internal(ScheduledOperation::Retry {
+                generation: 1
+            }))
+        ));
+        handle.wake_for_test();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(handle.pending_operation_for_test(), None);
+        handle.stop();
+        worker.join().unwrap();
+
+        let stopped_clock = Arc::new(DaemonManualClock::default());
+        let stopped_handle = RetrySchedulerHandle::new();
+        let stopped_lane = Arc::new(OperationLane::new(1).unwrap());
+        stopped_lane.try_enqueue(filler()).unwrap();
+        let stopped_attempts = Arc::new(AtomicUsize::new(0));
+        let stopped_worker =
+            spawn_retry_scheduler(stopped_handle.clone(), stopped_clock.clone(), {
+                let lane = Arc::clone(&stopped_lane);
+                let attempts = Arc::clone(&stopped_attempts);
+                move |operation| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    lane.try_enqueue(OperationJob::Internal(operation))
+                        .map_err(|(error, _)| error)
+                }
+            })
+            .unwrap();
+        stopped_handle.schedule_retry(2, RetryInstant::from_millis(1_000));
+        stopped_clock.now_millis.store(1_000, Ordering::SeqCst);
+        stopped_handle.wake_for_test();
+        assert_eq!(stopped_attempts.load(Ordering::SeqCst), 1);
+        stopped_handle.stop();
+        let _occupied = stopped_lane.pop().unwrap();
+        stopped_handle.notify_lane_available();
+        stopped_worker.join().unwrap();
+        assert_eq!(stopped_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(stopped_handle.pending_operation_for_test(), None);
+    }
+
+    fn test_active_capture_with_resources(
+        counters: &Arc<AttemptResourceCounters>,
+    ) -> ActiveCapture {
+        let mut session = test_session();
+        session.attempt_resource_probes = vec![
+            Box::new(counters.lease(ProbeResource::Session)),
+            Box::new(counters.lease(ProbeResource::Arena)),
+            Box::new(counters.lease(ProbeResource::Workspace)),
+            Box::new(counters.lease(ProbeResource::Descriptor)),
+        ];
+        ActiveCapture {
+            backend: Some(CaptureBackend::TestProbe(Box::new(
+                counters.lease(ProbeResource::Backend),
+            ))),
+            session: Some(Arc::new(session)),
+            health: None,
+            resolved: ResolvedCaptureState {
+                channel_count: 1,
+                sample_rate: 100,
+                resolved_target: Some("probe".to_string()),
+            },
+            backend_resource_probe: None,
+        }
+    }
+
+    fn test_app_candidate(
+        running: bool,
+        counters: Option<&Arc<AttemptResourceCounters>>,
+    ) -> AppRuntimeState {
+        let mut candidate = empty_runtime(ConfigFamily::App);
+        candidate.config.daemon.start_mode = if running { "auto" } else { "manual" }.to_string();
+        if running {
+            let counters = counters.expect("running test app candidate counters");
+            let mut session = test_session();
+            session.attempt_resource_probes = vec![
+                Box::new(counters.lease(ProbeResource::Session)),
+                Box::new(counters.lease(ProbeResource::Arena)),
+                Box::new(counters.lease(ProbeResource::Workspace)),
+                Box::new(counters.lease(ProbeResource::Descriptor)),
+            ];
+            candidate.capture = Some(CaptureBackend::TestProbe(Box::new(
+                counters.lease(ProbeResource::Backend),
+            )));
+            candidate.session = Some(Arc::new(session));
+            candidate.state = "capturing".to_string();
+            candidate
+                .lifecycle
+                .mark_running(Some("studio".to_string()), Some("test-app".to_string()));
+        } else {
+            candidate.state = "idle".to_string();
+            candidate.lifecycle.mark_stopped(Some("studio".to_string()));
+        }
+        candidate
+    }
+
+    fn production_path_app_loaded(
+        ctx: &IdleDaemonContext,
+        output_root: &Path,
+        start_mode: &str,
+    ) -> app_config::LoadedAppConfig {
+        let mut config = app_config::AppConfig::default();
+        config.daemon.start_mode = start_mode.to_string();
+        config.daemon.active_profile = Some("studio".to_string());
+        config.daemon.control_socket_path = ctx.control_socket_path.display().to_string();
+        config.profiles.insert(
+            "studio".to_string(),
+            app_config::ProfileConfig {
+                backend: Some("jack".to_string()),
+                client_name: Some("lamb-test".to_string()),
+                capture: app_config::CaptureConfig {
+                    ports: vec![app_config::CapturePort {
+                        source: Some("system:capture_1".to_string()),
+                        name: Some("mic".to_string()),
+                        export_mode: None,
+                    }],
+                    sources: Vec::new(),
+                },
+                buffer: app_config::BufferConfig { seconds: Some(1) },
+                export: app_config::ProfileExportConfig {
+                    output_dir: Some(output_root.to_path_buf()),
+                    mode: Some("per-channel".to_string()),
+                    format: Some("wav".to_string()),
+                    ..app_config::ProfileExportConfig::default()
+                },
+                ..app_config::ProfileConfig::default()
+            },
+        );
+        app_config::LoadedAppConfig {
+            config,
+            state: ConfigLoadState::Loaded,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn initial_app_transient_failure_schedules_and_retries_through_the_production_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("lamb.toml");
+        let socket_path = temp.path().join("control.sock");
+        let mut config = threshold_test_config(temp.path(), &[("mic", "system:capture_1")]);
+        config.daemon.start_mode = "auto".to_string();
+        config.daemon.active_profile = Some("studio".to_string());
+        config.daemon.control_socket_path = socket_path.display().to_string();
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let bootstrap = bootstrap_config(&config_path).unwrap();
+        let prepared = prepare_bootstrap_config(&bootstrap);
+        let starter = TransientAppStarter {
+            calls: AtomicUsize::new(0),
+        };
+        let clock = Arc::new(DaemonManualClock::default());
+
+        let ctx = build_idle_context_with_dependencies(
+            bootstrap,
+            prepared,
+            &starter,
+            &SuccessfulLegacyRecovery,
+            clock.clone(),
+        )
+        .unwrap();
+
+        let initial = ctx.runtime.lock().unwrap().lifecycle.clone();
+        assert_eq!(initial.daemon_state, DaemonState::Degraded);
+        assert_eq!(initial.capture_state, CaptureState::WaitingForDevice);
+        assert_eq!(initial.error_class, Some(ErrorClass::Transient));
+        assert_eq!(initial.retry_policy, RetryPolicy::BoundedBackoff);
+        assert_eq!(initial.retry_attempt, 1);
+        assert_eq!(
+            initial.next_retry_at,
+            Some(RetryInstant::from_millis(1_000))
+        );
+        assert_eq!(initial.generation, 1);
+        assert!(ctx.runtime.lock().unwrap().capture.is_none());
+        assert!(ctx.runtime.lock().unwrap().session.is_none());
+        assert_eq!(
+            ctx.scheduler.pending_operation_for_test(),
+            Some(ScheduledOperation::Retry { generation: 1 })
+        );
+
+        clock.now_millis.store(1_000, Ordering::SeqCst);
+        execute_retry_operation(&ctx, 1, &starter, &SuccessfulLegacyRecovery);
+        let retried = ctx.runtime.lock().unwrap().lifecycle.clone();
+        assert_eq!(starter.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(retried.retry_attempt, 2);
+        assert_eq!(
+            retried.next_retry_at,
+            Some(RetryInstant::from_millis(3_000))
+        );
+        assert_eq!(retried.generation, 2);
+    }
+
+    #[test]
+    fn production_scheduler_retries_app_construction_recovery_and_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("lamb.toml");
+        let socket_path = temp.path().join("control.sock");
+        let mut config = threshold_test_config(temp.path(), &[("mic", "system:capture_1")]);
+        config.daemon.start_mode = "auto".to_string();
+        config.daemon.active_profile = Some("studio".to_string());
+        config.daemon.control_socket_path = socket_path.display().to_string();
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let bootstrap = bootstrap_config(&config_path).unwrap();
+        let prepared = prepare_bootstrap_config(&bootstrap);
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let starter = Arc::new(TransientThenSuccessfulAppStarter {
+            calls: AtomicUsize::new(0),
+            resources: Arc::clone(&resources),
+        });
+        let recovery = Arc::new(CountingSuccessfulRecovery {
+            calls: AtomicUsize::new(0),
+        });
+        let clock = Arc::new(DaemonManualClock::default());
+        let ctx = build_idle_context_with_dependencies(
+            bootstrap,
+            prepared,
+            starter.as_ref(),
+            recovery.as_ref(),
+            clock.clone(),
+        )
+        .unwrap();
+        let lane = Arc::new(OperationLane::new(1).unwrap());
+        let scheduler = spawn_retry_scheduler(ctx.scheduler.clone(), clock.clone(), {
+            let lane = Arc::clone(&lane);
+            move |operation| {
+                lane.try_enqueue(OperationJob::Internal(operation))
+                    .map_err(|(error, _)| error)
+            }
+        })
+        .unwrap();
+        let completed = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = spawn_operation_worker(
+            Arc::clone(&lane),
+            DEFAULT_WORKER_STACK_BYTES as usize,
+            {
+                let ctx = Arc::clone(&ctx);
+                let starter = Arc::clone(&starter);
+                let recovery = Arc::clone(&recovery);
+                let completed = Arc::clone(&completed);
+                move |job| {
+                    ctx.scheduler.notify_lane_available();
+                    execute_operation_job_with_recovery(
+                        &ctx,
+                        job,
+                        starter.as_ref(),
+                        recovery.as_ref(),
+                    );
+                    *completed.0.lock().unwrap() = true;
+                    completed.1.notify_all();
+                }
+            },
+            |_| {},
+        );
+
+        clock.now_millis.store(1_000, Ordering::SeqCst);
+        ctx.scheduler.wake_for_test();
+        let mut done = completed.0.lock().unwrap();
+        while !*done {
+            done = completed.1.wait(done).unwrap();
+        }
+        drop(done);
+
+        let lifecycle = ctx.runtime.lock().unwrap().lifecycle.clone();
+        assert_eq!(starter.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.capture_state, CaptureState::Running);
+        assert_eq!(lifecycle.retry_attempt, 0);
+        assert_eq!(lifecycle.next_retry_at, None);
+        assert!(ctx.runtime.lock().unwrap().capture.is_some());
+        assert!(ctx.runtime.lock().unwrap().session.is_some());
+
+        ctx.scheduler.stop();
+        scheduler.join().unwrap();
+        lane.close();
+        worker.join().unwrap();
+        release_capture_for_shutdown(&ctx);
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.live(ProbeResource::Session), 0);
+    }
+
+    fn poison_runtime(ctx: &Arc<IdleDaemonContext>, message: &'static str) {
+        let poisoned = Arc::clone(ctx);
+        let _ = std::thread::spawn(move || {
+            let _runtime = poisoned.runtime.lock().unwrap();
+            panic!("{message}");
+        })
+        .join();
+        assert!(ctx.runtime.is_poisoned());
+    }
+
+    #[test]
+    fn coherent_poisoned_retry_executes_once_and_publishes_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("lamb.toml");
+        let socket_path = temp.path().join("control.sock");
+        let mut config = threshold_test_config(temp.path(), &[("mic", "system:capture_1")]);
+        config.daemon.start_mode = "auto".to_string();
+        config.daemon.active_profile = Some("studio".to_string());
+        config.daemon.control_socket_path = socket_path.display().to_string();
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let bootstrap = bootstrap_config(&config_path).unwrap();
+        let prepared = prepare_bootstrap_config(&bootstrap);
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let starter = Arc::new(TransientThenSuccessfulAppStarter {
+            calls: AtomicUsize::new(0),
+            resources: Arc::clone(&resources),
+        });
+        let recovery = Arc::new(CountingSuccessfulRecovery {
+            calls: AtomicUsize::new(0),
+        });
+        let clock = Arc::new(DaemonManualClock::default());
+        let ctx = build_idle_context_with_dependencies(
+            bootstrap,
+            prepared,
+            starter.as_ref(),
+            recovery.as_ref(),
+            clock.clone(),
+        )
+        .unwrap();
+        poison_runtime(&ctx, "coherent retry poison");
+        let lane = Arc::new(OperationLane::new(1).unwrap());
+        let scheduler = spawn_retry_scheduler(ctx.scheduler.clone(), clock.clone(), {
+            let lane = Arc::clone(&lane);
+            move |operation| {
+                lane.try_enqueue(OperationJob::Internal(operation))
+                    .map_err(|(error, _)| error)
+            }
+        })
+        .unwrap();
+        let completed = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = spawn_operation_worker(
+            Arc::clone(&lane),
+            DEFAULT_WORKER_STACK_BYTES as usize,
+            {
+                let ctx = Arc::clone(&ctx);
+                let starter = Arc::clone(&starter);
+                let recovery = Arc::clone(&recovery);
+                let completed = Arc::clone(&completed);
+                move |job| {
+                    ctx.scheduler.notify_lane_available();
+                    execute_operation_job_with_recovery(
+                        &ctx,
+                        job,
+                        starter.as_ref(),
+                        recovery.as_ref(),
+                    );
+                    *completed.0.lock().unwrap() = true;
+                    completed.1.notify_all();
+                }
+            },
+            |_| {},
+        );
+
+        clock.now_millis.store(1_000, Ordering::SeqCst);
+        ctx.scheduler.wake_for_test();
+        let mut done = completed.0.lock().unwrap();
+        while !*done {
+            done = completed.1.wait(done).unwrap();
+        }
+        drop(done);
+
+        let lifecycle = ctx.runtime.lock().unwrap().lifecycle.clone();
+        assert_eq!(starter.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.capture_state, CaptureState::Running);
+        assert_eq!(lifecycle.error_class, None);
+        assert_eq!(lifecycle.retry_attempt, 0);
+        assert_eq!(lifecycle.next_retry_at, None);
+        assert_eq!(ctx.scheduler.pending_operation_for_test(), None);
+        assert!(ctx.runtime.lock().is_ok());
+        ctx.scheduler.wake_for_test();
+        assert_eq!(starter.calls.load(Ordering::SeqCst), 2);
+
+        ctx.scheduler.stop();
+        scheduler.join().unwrap();
+        lane.close();
+        worker.join().unwrap();
+        release_capture_for_shutdown(&ctx);
+        let dropped = resources.dropped();
+        assert_eq!(
+            &dropped[..2],
+            &[ProbeResource::Backend, ProbeResource::Session]
+        );
+    }
+
+    #[test]
+    fn poisoned_retry_with_active_ownership_terminalizes_and_cleans_backend_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("lamb.toml");
+        let socket_path = temp.path().join("control.sock");
+        let mut config = threshold_test_config(temp.path(), &[("mic", "system:capture_1")]);
+        config.daemon.start_mode = "auto".to_string();
+        config.daemon.active_profile = Some("studio".to_string());
+        config.daemon.control_socket_path = socket_path.display().to_string();
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let bootstrap = bootstrap_config(&config_path).unwrap();
+        let prepared = prepare_bootstrap_config(&bootstrap);
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let starter = Arc::new(TransientThenSuccessfulAppStarter {
+            calls: AtomicUsize::new(0),
+            resources: Arc::clone(&resources),
+        });
+        let clock = Arc::new(DaemonManualClock::default());
+        let ctx = build_idle_context_with_dependencies(
+            bootstrap,
+            prepared,
+            starter.as_ref(),
+            &SuccessfulLegacyRecovery,
+            clock.clone(),
+        )
+        .unwrap();
+        let old_generation = ctx.runtime.lock().unwrap().lifecycle.generation;
+        let old_attempt_id = CaptureAttemptId::from_raw_for_test(6);
+        let old_fault_sink = ctx.scheduler.fault_sink(old_generation, old_attempt_id);
+        let poisoned = Arc::clone(&ctx);
+        let mut stale = test_active_capture_with_resources(&resources);
+        let _ = std::thread::spawn(move || {
+            let mut runtime = poisoned.runtime.lock().unwrap();
+            runtime.capture = stale.backend.take();
+            runtime.session = stale.session.take();
+            panic!("retry poison with stale ownership");
+        })
+        .join();
+        let lane = Arc::new(OperationLane::new(1).unwrap());
+        let scheduler = spawn_retry_scheduler(ctx.scheduler.clone(), clock.clone(), {
+            let lane = Arc::clone(&lane);
+            move |operation| {
+                lane.try_enqueue(OperationJob::Internal(operation))
+                    .map_err(|(error, _)| error)
+            }
+        })
+        .unwrap();
+        let completed = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker = spawn_operation_worker(
+            Arc::clone(&lane),
+            DEFAULT_WORKER_STACK_BYTES as usize,
+            {
+                let ctx = Arc::clone(&ctx);
+                let starter = Arc::clone(&starter);
+                let completed = Arc::clone(&completed);
+                move |job| {
+                    ctx.scheduler.notify_lane_available();
+                    execute_operation_job_with_recovery(
+                        &ctx,
+                        job,
+                        starter.as_ref(),
+                        &SuccessfulLegacyRecovery,
+                    );
+                    *completed.0.lock().unwrap() = true;
+                    completed.1.notify_all();
+                }
+            },
+            |_| {},
+        );
+
+        clock.now_millis.store(1_000, Ordering::SeqCst);
+        ctx.scheduler.wake_for_test();
+        let mut done = completed.0.lock().unwrap();
+        while !*done {
+            done = completed.1.wait(done).unwrap();
+        }
+        drop(done);
+
+        let runtime = ctx.runtime.lock().unwrap();
+        assert_eq!(starter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.lifecycle.generation, old_generation);
+        assert_eq!(runtime.lifecycle.error_class, Some(ErrorClass::Transient));
+        assert_eq!(runtime.lifecycle.retry_policy, RetryPolicy::BoundedBackoff);
+        assert_eq!(runtime.lifecycle.retry_attempt, 1);
+        assert!(runtime.lifecycle.next_retry_at.is_some());
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        let terminal_lifecycle = runtime.lifecycle.clone();
+        drop(runtime);
+        assert!(ctx.stop.load(Ordering::Acquire));
+        assert_eq!(
+            ctx.first_fatal.get().map(String::as_str),
+            Some("runtime state lock poison violated scheduled retry invariants")
+        );
+        assert_eq!(ctx.scheduler.pending_operation_for_test(), None);
+        let dropped = resources.dropped();
+        assert_eq!(
+            &dropped[..2],
+            &[ProbeResource::Backend, ProbeResource::Session]
+        );
+
+        old_fault_sink.notify(RuntimeCaptureFault::BackendFault(
+            "compromised sink".to_string(),
+        ));
+        ctx.scheduler.schedule_retry(
+            old_generation,
+            RetryInstant::from_millis(clock.now_millis.load(Ordering::SeqCst) + 1),
+        );
+        ctx.scheduler.notify_fault(
+            old_generation,
+            old_attempt_id,
+            RuntimeCaptureFault::DeviceDisconnected("compromised fault".to_string()),
+        );
+        execute_operation_job_with_recovery(
+            &ctx,
+            OperationJob::Internal(ScheduledOperation::Retry {
+                generation: old_generation,
+            }),
+            starter.as_ref(),
+            &SuccessfulLegacyRecovery,
+        );
+        execute_operation_job_with_recovery(
+            &ctx,
+            OperationJob::Internal(ScheduledOperation::RuntimeFault {
+                generation: old_generation,
+                attempt_id: old_attempt_id,
+                fault: RuntimeCaptureFault::BackendFault("queued old fault".to_string()),
+            }),
+            starter.as_ref(),
+            &SuccessfulLegacyRecovery,
+        );
+        ctx.scheduler.wake_for_test();
+
+        assert_eq!(ctx.scheduler.pending_operation_for_test(), None);
+        assert_eq!(ctx.runtime.lock().unwrap().lifecycle, terminal_lifecycle);
+        assert_eq!(starter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.live(ProbeResource::Session), 0);
+
+        ctx.scheduler.stop();
+        scheduler.join().unwrap();
+        lane.close();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn incoherent_poison_generation_overflow_stops_and_rejects_equal_generation_work() {
+        let harness = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let mut stale = test_active_capture_with_resources(&resources);
+        let poisoned = Arc::clone(&harness.ctx);
+        let _ = std::thread::spawn(move || {
+            let mut runtime = poisoned.runtime.lock().unwrap();
+            runtime.lifecycle.generation = u64::MAX;
+            runtime.lifecycle.mark_transient(
+                CaptureState::WaitingForDevice,
+                "overflow retry".to_string(),
+                RetryInstant::from_millis(0),
+            );
+            runtime.capture = stale.backend.take();
+            runtime.session = stale.session.take();
+            panic!("overflow retry poison with stale ownership");
+        })
+        .join();
+        harness.ctx.scheduler.invalidate(u64::MAX);
+        let old_attempt_id = CaptureAttemptId::from_raw_for_test(7);
+        let old_fault_sink = harness.ctx.scheduler.fault_sink(u64::MAX, old_attempt_id);
+
+        assert_eq!(
+            scheduled_generation_decision(&harness.ctx, u64::MAX),
+            ScheduledGenerationDecision::Terminalized
+        );
+        let runtime = harness.ctx.runtime.lock().unwrap();
+        assert_eq!(runtime.lifecycle.generation, u64::MAX);
+        assert_eq!(runtime.lifecycle.error_class, Some(ErrorClass::Transient));
+        assert_eq!(runtime.lifecycle.retry_policy, RetryPolicy::BoundedBackoff);
+        assert_eq!(runtime.lifecycle.retry_attempt, 1);
+        assert!(runtime.lifecycle.next_retry_at.is_some());
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        let terminal_lifecycle = runtime.lifecycle.clone();
+        drop(runtime);
+        assert!(harness.stop_flag());
+        assert_eq!(
+            harness.ctx.first_fatal.get().map(String::as_str),
+            Some("runtime state lock poison violated scheduled retry invariants")
+        );
+        let dropped = resources.dropped();
+        assert_eq!(
+            &dropped[..2],
+            &[ProbeResource::Backend, ProbeResource::Session]
+        );
+
+        old_fault_sink.notify(RuntimeCaptureFault::BackendFault(
+            "overflow sink".to_string(),
+        ));
+        harness
+            .ctx
+            .scheduler
+            .schedule_retry(u64::MAX, RetryInstant::from_millis(1));
+        harness.ctx.scheduler.notify_fault(
+            u64::MAX,
+            old_attempt_id,
+            RuntimeCaptureFault::DeviceDisconnected("overflow fault".to_string()),
+        );
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+
+        let starter = CountingRetryStarter {
+            outcomes: Mutex::new(VecDeque::from([Err(CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "must not run".to_string(),
+            })])),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        execute_operation_job_with_recovery(
+            &harness.ctx,
+            OperationJob::Internal(ScheduledOperation::Retry {
+                generation: u64::MAX,
+            }),
+            &starter,
+            &SuccessfulLegacyRecovery,
+        );
+        execute_operation_job_with_recovery(
+            &harness.ctx,
+            OperationJob::Internal(ScheduledOperation::RuntimeFault {
+                generation: u64::MAX,
+                attempt_id: old_attempt_id,
+                fault: RuntimeCaptureFault::BackendFault("queued overflow fault".to_string()),
+            }),
+            &starter,
+            &SuccessfulLegacyRecovery,
+        );
+
+        assert_eq!(starter.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            harness.ctx.runtime.lock().unwrap().lifecycle,
+            terminal_lifecycle
+        );
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.live(ProbeResource::Session), 0);
+    }
+
+    #[test]
+    fn publish_capture_attempt_error_recovers_poison_and_retains_retry_authority() {
+        let harness = SupervisorHarness::stopped();
+        poison_runtime(&harness.ctx, "publish capture error poison");
+
+        publish_capture_attempt_error(
+            &harness.ctx,
+            CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "retry publication".to_string(),
+            },
+        );
+
+        let lifecycle = harness.ctx.runtime.lock().unwrap().lifecycle.clone();
+        assert_eq!(lifecycle.error_class, Some(ErrorClass::Transient));
+        assert_eq!(lifecycle.retry_policy, RetryPolicy::BoundedBackoff);
+        assert_eq!(lifecycle.retry_attempt, 1);
+        assert!(lifecycle.next_retry_at.is_some());
+        assert_eq!(
+            harness.ctx.scheduler.pending_operation_for_test(),
+            lifecycle
+                .next_retry_at
+                .map(|_due| ScheduledOperation::Retry {
+                    generation: lifecycle.generation,
+                })
+        );
+        assert!(harness.ctx.runtime.lock().is_ok());
+    }
+
+    #[test]
+    fn command_attempt_failure_recovers_poison_and_retains_retry_authority() {
+        let harness = SupervisorHarness::stopped();
+        let operation =
+            begin_new_operation_generation(&harness.ctx, OperationEntry::Command).unwrap();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let mut stale = test_active_capture_with_resources(&resources);
+        let poisoned = Arc::clone(&harness.ctx);
+        let _ = std::thread::spawn(move || {
+            let mut runtime = poisoned.runtime.lock().unwrap();
+            runtime.capture = stale.backend.take();
+            runtime.session = stale.session.take();
+            panic!("command failure poison");
+        })
+        .join();
+
+        let response = command_attempt_failure_with_generation(
+            &harness.ctx,
+            operation.token,
+            Some(operation.generation),
+            CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "retry command failure".to_string(),
+            },
+            false,
+        );
+
+        assert!(!response.ok);
+        let lifecycle = harness.ctx.runtime.lock().unwrap().lifecycle.clone();
+        assert_eq!(lifecycle.generation, operation.generation);
+        assert_eq!(lifecycle.error_class, Some(ErrorClass::Transient));
+        assert_eq!(lifecycle.retry_policy, RetryPolicy::BoundedBackoff);
+        assert_eq!(lifecycle.retry_attempt, 1);
+        assert!(lifecycle.next_retry_at.is_some());
+        assert!(harness.ctx.scheduler.pending_operation_for_test().is_some());
+        assert!(harness.ctx.runtime.lock().is_ok());
+        let runtime = harness.ctx.runtime.lock().unwrap();
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        drop(runtime);
+        let dropped = resources.dropped();
+        assert_eq!(
+            &dropped[..2],
+            &[ProbeResource::Backend, ProbeResource::Session]
+        );
+    }
+
+    #[test]
+    fn permanent_capture_attempt_error_recovers_poison_without_retry_authority() {
+        let harness = SupervisorHarness::stopped();
+        poison_runtime(&harness.ctx, "permanent publication poison");
+
+        publish_capture_attempt_error(
+            &harness.ctx,
+            CaptureAttemptError {
+                class: ErrorClass::Permanent,
+                capture_state: CaptureState::Faulted,
+                message: "permanent publication".to_string(),
+            },
+        );
+
+        let lifecycle = harness.ctx.runtime.lock().unwrap().lifecycle.clone();
+        assert_eq!(lifecycle.error_class, Some(ErrorClass::Permanent));
+        assert_eq!(lifecycle.retry_policy, RetryPolicy::Manual);
+        assert_eq!(lifecycle.retry_attempt, 0);
+        assert_eq!(lifecycle.next_retry_at, None);
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+        assert!(harness.ctx.runtime.lock().is_ok());
+    }
+
+    #[test]
+    fn successful_retry_publication_recovers_poison_and_publishes_once() {
+        let harness = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let starter = Arc::new(ScriptedLegacyCaptureStarter {
+            outcomes: Mutex::new(VecDeque::from([Ok(test_active_capture_with_resources(
+                &resources,
+            ))])),
+        });
+        let (entered, release) =
+            install_final_mutation_pause(&harness.ctx, FinalMutationKind::LegacySuccess);
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_starter = Arc::clone(&starter);
+        let command = std::thread::spawn(move || {
+            reload_daemon_config_with_recovery(
+                &ctx,
+                None,
+                worker_starter.as_ref(),
+                &SuccessfulLegacyRecovery,
+            )
+        });
+        entered.wait();
+        poison_runtime(&harness.ctx, "success publication poison");
+        release.wait();
+
+        let response = command.join().unwrap();
+        assert!(response.ok);
+        let runtime = harness.ctx.runtime.lock().unwrap();
+        assert_eq!(runtime.lifecycle.capture_state, CaptureState::Running);
+        assert_eq!(runtime.lifecycle.error_class, None);
+        assert_eq!(runtime.lifecycle.retry_attempt, 0);
+        assert_eq!(runtime.lifecycle.next_retry_at, None);
+        assert!(runtime.capture.is_some());
+        assert!(runtime.session.is_some());
+        drop(runtime);
+        assert!(harness.ctx.runtime.lock().is_ok());
+        release_capture_for_shutdown(&harness.ctx);
+        let dropped = resources.dropped();
+        assert_eq!(
+            &dropped[..2],
+            &[ProbeResource::Backend, ProbeResource::Session]
+        );
+    }
+
+    fn install_final_mutation_pause(
+        ctx: &IdleDaemonContext,
+        kind: FinalMutationKind,
+    ) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *ctx.final_mutation_pause.lock().unwrap() = Some(FinalMutationPause {
+            kind,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        (entered, release)
+    }
+
+    fn spawn_observed_shutdown(
+        ctx: Arc<IdleDaemonContext>,
+    ) -> (std::sync::mpsc::Receiver<()>, std::thread::JoinHandle<()>) {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            begin_shutdown(&ctx);
+            finished_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        (finished_rx, worker)
+    }
+
+    fn stop_was_blocked_before_release(
+        ctx: &IdleDaemonContext,
+        finished: &std::sync::mpsc::Receiver<()>,
+    ) -> bool {
+        finished
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err()
+            && !ctx.stop.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn invalid_reload_while_running_preserves_active_session_and_lifecycle() {
+        let harness = SupervisorHarness::running();
+        let before = harness.snapshot();
+        let response = harness.reload_with_text("not valid toml");
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error_context.error_class,
+            Some(ErrorClass::Permanent)
+        );
+        assert_visible_authority_preserved_with_one_generation_advance(
+            &before,
+            &harness.snapshot(),
+        );
+    }
+
+    #[test]
+    fn running_reload_start_failure_preserves_complete_authority() {
+        let harness = SupervisorHarness::running();
+        harness
+            .starter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push_back(Err(CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "replacement unavailable".to_string(),
+            }));
+        let before = harness.snapshot();
+        let response =
+            harness.reload_with_text(&toml::to_string(&test_legacy_fake_config()).unwrap());
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error_context.error_class,
+            Some(ErrorClass::Transient)
+        );
+        assert_visible_authority_preserved_with_one_generation_advance(
+            &before,
+            &harness.snapshot(),
+        );
+    }
+
+    #[test]
+    fn running_reload_recovery_failure_preserves_complete_authority() {
+        let harness = SupervisorHarness::running();
+        harness
+            .starter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push_back(Ok(test_active_capture()));
+        let before = harness.snapshot();
+        let response = reload_daemon_config_with_recovery(
+            &harness.ctx,
+            None,
+            &harness.starter,
+            &ScriptedLegacyRecovery(Err(LambError::Control(
+                "replacement recovery failed".to_string(),
+            ))),
+        );
+
+        assert!(!response.ok);
+        assert_visible_authority_preserved_with_one_generation_advance(
+            &before,
+            &harness.snapshot(),
+        );
+    }
+
+    #[test]
+    fn direct_stop_invalidates_reload_before_disk_preparation() {
+        let harness = SupervisorHarness::running();
+        harness
+            .starter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push_back(Ok(test_active_capture()));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let outcome = harness
+            .starter
+            .outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let scripted = ScriptedLegacyCaptureStarter {
+                outcomes: Mutex::new(VecDeque::from([outcome])),
+            };
+            reload_daemon_config_with_recovery_and_entry_hook(
+                &ctx,
+                None,
+                &scripted,
+                &SuccessfulLegacyRecovery,
+                || {
+                    worker_entered.wait();
+                    worker_release.wait();
+                },
+            )
+        });
+
+        entered.wait();
+        begin_shutdown(&harness.ctx);
+        release.wait();
+        let response = worker.join().unwrap();
+
+        assert!(!response.ok);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+    }
+
+    #[test]
+    fn invalid_reload_while_stopped_enters_permanent_fault() {
+        let harness = SupervisorHarness::stopped();
+        let response = harness.reload_with_text("not valid toml");
+        assert!(!response.ok);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Degraded);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Faulted);
+        assert_eq!(harness.lifecycle().retry_policy, RetryPolicy::Manual);
+    }
+
+    #[test]
+    fn changed_socket_reload_preserves_running_authority_and_faults_stopped() {
+        let mut changed = test_legacy_fake_config();
+        changed.control_socket_path = PathBuf::from("/tmp/a-different-lamb.sock");
+        let text = toml::to_string(&changed).unwrap();
+
+        let running = SupervisorHarness::running();
+        let before = running.snapshot();
+        let running_response = running.reload_with_text(&text);
+        assert!(!running_response.ok);
+        assert_eq!(
+            running_response.error_context.error_class,
+            Some(ErrorClass::Permanent)
+        );
+        assert_visible_authority_preserved_with_one_generation_advance(
+            &before,
+            &running.snapshot(),
+        );
+
+        let stopped = SupervisorHarness::stopped();
+        let stopped_response = stopped.reload_with_text(&text);
+        assert!(!stopped_response.ok);
+        assert_eq!(stopped.lifecycle().daemon_state, DaemonState::Degraded);
+        assert_eq!(stopped.lifecycle().retry_policy, RetryPolicy::Manual);
+    }
+
+    #[test]
+    fn same_socket_allows_app_to_legacy_and_legacy_to_app_switches() {
+        let harness = SupervisorHarness::running();
+        let mut app = app_config::AppConfig::default();
+        app.daemon.control_socket_path = harness.ctx.control_socket_path.display().to_string();
+        let to_app = harness.reload_with_text(&toml::to_string(&app).unwrap());
+        assert!(to_app.ok, "{}", to_app.message);
+        {
+            let runtime = harness.ctx.runtime.lock().unwrap();
+            assert_eq!(runtime.config_family, ConfigFamily::App);
+            assert_eq!(runtime.lifecycle.capture_state, CaptureState::Stopped);
+        }
+
+        harness
+            .starter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push_back(Ok(test_active_capture()));
+        let to_legacy =
+            harness.reload_with_text(&toml::to_string(&test_legacy_fake_config()).unwrap());
+        assert!(to_legacy.ok, "{}", to_legacy.message);
+        let runtime = harness.ctx.runtime.lock().unwrap();
+        assert_eq!(runtime.config_family, ConfigFamily::Legacy);
+        assert_eq!(runtime.lifecycle.capture_state, CaptureState::Running);
+    }
+
+    #[test]
+    fn app_manual_and_auto_reload_publish_expected_lifecycle() {
+        let manual = SupervisorHarness::stopped();
+        let manual_token = begin_command_operation(&manual.ctx).unwrap();
+        let manual_response = install_prepared_then_follow_start_mode(
+            &manual.ctx,
+            manual_token,
+            PreparedBootstrap::TestAppCandidate {
+                candidate: test_app_candidate(false, None),
+                entered: None,
+                release: None,
+            },
+            &manual.starter,
+            &SuccessfulLegacyRecovery,
+            false,
+            false,
+            false,
+        );
+        assert!(manual_response.ok);
+        assert_eq!(manual.lifecycle().daemon_state, DaemonState::Ready);
+        assert_eq!(manual.lifecycle().capture_state, CaptureState::Stopped);
+
+        let auto = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let auto_token = begin_command_operation(&auto.ctx).unwrap();
+        let auto_response = install_prepared_then_follow_start_mode(
+            &auto.ctx,
+            auto_token,
+            PreparedBootstrap::TestAppCandidate {
+                candidate: test_app_candidate(true, Some(&resources)),
+                entered: None,
+                release: None,
+            },
+            &auto.starter,
+            &SuccessfulLegacyRecovery,
+            false,
+            false,
+            false,
+        );
+        assert!(auto_response.ok);
+        assert_eq!(auto.lifecycle().daemon_state, DaemonState::Ready);
+        assert_eq!(auto.lifecycle().capture_state, CaptureState::Running);
+    }
+
+    #[test]
+    fn production_path_app_auto_candidate_prepares_recovers_and_publishes_running() {
+        let harness = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let starter = ProductionPathAppStarter {
+            resources: Arc::clone(&resources),
+        };
+        let loaded = production_path_app_loaded(
+            &harness.ctx,
+            &harness._temp.path().join("app-output"),
+            "auto",
+        );
+        let token = begin_command_operation(&harness.ctx).unwrap();
+
+        let response = install_prepared_then_follow_start_mode(
+            &harness.ctx,
+            token,
+            PreparedBootstrap::App(loaded),
+            &starter,
+            &SuccessfulLegacyRecovery,
+            false,
+            false,
+            false,
+        );
+
+        assert!(response.ok, "{}", response.message);
+        let runtime = harness.ctx.runtime.lock().unwrap();
+        assert_eq!(runtime.config_family, ConfigFamily::App);
+        assert_eq!(runtime.lifecycle.daemon_state, DaemonState::Ready);
+        assert_eq!(runtime.lifecycle.capture_state, CaptureState::Running);
+        assert!(runtime.capture.is_some());
+        assert!(runtime.session.is_some());
+        assert!(runtime.session.as_ref().unwrap().policy.lock().is_ok());
+        drop(runtime);
+        assert_eq!(resources.live(ProbeResource::Backend), 1);
+        release_capture_for_shutdown(&harness.ctx);
+    }
+
+    #[test]
+    fn app_command_publication_invalidates_then_replays_unarmed_fault() {
+        struct UnarmedFaultAppStarter {
+            resources: Arc<AttemptResourceCounters>,
+            health: Arc<Mutex<Option<PipeWireHealth>>>,
+        }
+
+        impl LegacyCaptureStarter for UnarmedFaultAppStarter {
+            fn start(
+                &self,
+                _prepared: &PreparedLegacyConfig,
+                _fault_sink: RuntimeFaultSink,
+            ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+                unreachable!("app starter does not start legacy capture")
+            }
+
+            fn prepare_app(
+                &self,
+                profile: &profile::ResolvedProfile,
+                params: CaptureRuntimeParams,
+                fault_sink: RuntimeFaultSink,
+            ) -> std::result::Result<Option<PreparedAppCapture>, CaptureAttemptError> {
+                let health = PipeWireHealth::unarmed_with_fault_sink(fault_sink);
+                health.record_fatal(RuntimeCaptureFault::BackendFault(
+                    "app fault recorded before publication".to_string(),
+                ));
+                *self.health.lock().unwrap() = Some(health.clone());
+                let (runtime, _ingress) =
+                    CaptureRuntime::build(params, 100, u32::try_from(profile.ports.len()).unwrap())
+                        .map_err(classify_legacy_attempt_error)?;
+                Ok(Some(PreparedAppCapture {
+                    backend: CaptureBackend::TestAppProbe {
+                        resource: Box::new(self.resources.lease(ProbeResource::Backend)),
+                        sample_rate: 100,
+                    },
+                    runtime,
+                    health: Some(health),
+                    resolved_live_inputs: jack_live_identities(profile)
+                        .map_err(classify_legacy_attempt_error)?,
+                    session_resource_probes: vec![],
+                }))
+            }
+        }
+
+        let harness = RetryOperationHarness::new(VecDeque::new());
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let health = Arc::new(Mutex::new(None));
+        let starter = UnarmedFaultAppStarter {
+            resources,
+            health: Arc::clone(&health),
+        };
+        let loaded = production_path_app_loaded(
+            &harness.ctx,
+            &harness._temp.path().join("app-replay-output"),
+            "auto",
+        );
+        let token = begin_command_operation(&harness.ctx).unwrap();
+
+        let response = install_prepared_then_follow_start_mode(
+            &harness.ctx,
+            token,
+            PreparedBootstrap::App(loaded),
+            &starter,
+            &SuccessfulLegacyRecovery,
+            false,
+            false,
+            false,
+        );
+
+        assert!(response.ok, "{}", response.message);
+        assert!(health.lock().unwrap().is_some());
+
+        harness.wait_for_operations(1);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Faulted);
+        assert_eq!(harness.lifecycle().retry_attempt, 1);
+    }
+
+    #[test]
+    fn production_path_app_recovery_failure_rejects_before_publication_backend_first() {
+        let harness = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let starter = ProductionPathAppStarter {
+            resources: Arc::clone(&resources),
+        };
+        let loaded = production_path_app_loaded(
+            &harness.ctx,
+            &harness._temp.path().join("app-output"),
+            "auto",
+        );
+        let token = begin_command_operation(&harness.ctx).unwrap();
+
+        let response = install_prepared_then_follow_start_mode(
+            &harness.ctx,
+            token,
+            PreparedBootstrap::App(loaded),
+            &starter,
+            &NonzeroAppRecovery,
+            false,
+            false,
+            false,
+        );
+
+        assert!(!response.ok);
+        assert!(response.message.contains("app startup recovery failed"));
+        let runtime = harness.ctx.runtime.lock().unwrap();
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        drop(runtime);
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.live(ProbeResource::Session), 0);
+        assert_eq!(resources.dropped()[0], ProbeResource::Backend);
+        assert_eq!(resources.dropped()[1], ProbeResource::Session);
+    }
+
+    #[test]
+    fn stale_app_candidate_after_direct_stop_does_not_deadlock_or_publish() {
+        let harness = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let token = begin_command_operation(&harness.ctx).unwrap();
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let candidate = test_app_candidate(true, Some(&resources));
+        let worker = std::thread::spawn(move || {
+            install_prepared_then_follow_start_mode(
+                &ctx,
+                token,
+                PreparedBootstrap::TestAppCandidate {
+                    candidate,
+                    entered: Some(worker_entered),
+                    release: Some(worker_release),
+                },
+                &ScriptedLegacyCaptureStarter {
+                    outcomes: Mutex::new(VecDeque::new()),
+                },
+                &SuccessfulLegacyRecovery,
+                false,
+                false,
+                false,
+            )
+        });
+
+        entered.wait();
+        begin_shutdown(&harness.ctx);
+        release.wait();
+        let response = worker.join().unwrap();
+
+        assert!(!response.ok);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+        assert_eq!(
+            resources.dropped(),
+            vec![
+                ProbeResource::Backend,
+                ProbeResource::Session,
+                ProbeResource::Arena,
+                ProbeResource::Workspace,
+                ProbeResource::Descriptor,
+            ]
+        );
+        assert!(harness.ctx.runtime.lock().unwrap().session.is_none());
+    }
+
+    #[test]
+    fn direct_stop_after_start_persistence_keeps_durable_selection_but_not_runtime_candidate() {
+        let harness = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let persisted = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let hook_persisted = Arc::clone(&persisted);
+        let hook_release = Arc::clone(&release);
+        *AFTER_START_CONFIG_PERSIST_HOOK.lock().unwrap() = Some(Arc::new(move || {
+            hook_persisted.wait();
+            hook_release.wait();
+        }));
+        let mut candidate = test_app_candidate(true, Some(&resources));
+        candidate.config.daemon.active_profile = Some("studio".to_string());
+        candidate.config.daemon.control_socket_path =
+            harness.ctx.control_socket_path.display().to_string();
+        let token = begin_command_operation(&harness.ctx).unwrap();
+        let ctx = Arc::clone(&harness.ctx);
+        let worker = std::thread::spawn(move || {
+            install_prepared_then_follow_start_mode(
+                &ctx,
+                token,
+                PreparedBootstrap::TestAppCandidate {
+                    candidate,
+                    entered: None,
+                    release: None,
+                },
+                &ScriptedLegacyCaptureStarter {
+                    outcomes: Mutex::new(VecDeque::new()),
+                },
+                &SuccessfulLegacyRecovery,
+                true,
+                true,
+                true,
+            )
+        });
+
+        persisted.wait();
+        begin_shutdown(&harness.ctx);
+        release.wait();
+        let response = worker.join().unwrap();
+
+        assert!(!response.ok);
+        let loaded = app_config::load_optional_config(&harness.config_path).unwrap();
+        assert_eq!(
+            loaded.config.daemon.active_profile.as_deref(),
+            Some("studio")
+        );
+        let runtime = harness.ctx.runtime.lock().unwrap();
+        assert!(runtime.session.is_none());
+        assert_eq!(runtime.lifecycle.daemon_state, DaemonState::Stopping);
+        drop(runtime);
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.live(ProbeResource::Session), 0);
+    }
+
+    #[test]
+    fn admitted_active_profile_save_linearizes_before_direct_stop() {
+        let harness = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let (entered, release) =
+            install_final_mutation_pause(&harness.ctx, FinalMutationKind::PersistenceAdmission);
+        let mut candidate = test_app_candidate(true, Some(&resources));
+        candidate.config.daemon.active_profile = Some("studio".to_string());
+        candidate.config.daemon.control_socket_path =
+            harness.ctx.control_socket_path.display().to_string();
+        let token = begin_command_operation(&harness.ctx).unwrap();
+        let ctx = Arc::clone(&harness.ctx);
+        let command = std::thread::spawn(move || {
+            install_prepared_then_follow_start_mode(
+                &ctx,
+                token,
+                PreparedBootstrap::TestAppCandidate {
+                    candidate,
+                    entered: None,
+                    release: None,
+                },
+                &ScriptedLegacyCaptureStarter {
+                    outcomes: Mutex::new(VecDeque::new()),
+                },
+                &SuccessfulLegacyRecovery,
+                true,
+                true,
+                true,
+            )
+        });
+
+        entered.wait();
+        let (stop_finished, stop_worker) = spawn_observed_shutdown(Arc::clone(&harness.ctx));
+        let blocked = stop_was_blocked_before_release(&harness.ctx, &stop_finished);
+        release.wait();
+        let _response = command.join().unwrap();
+        if blocked {
+            stop_finished.recv().unwrap();
+        }
+        stop_worker.join().unwrap();
+
+        assert!(blocked, "Stop must wait for admitted atomic config save");
+        let loaded = app_config::load_optional_config(&harness.config_path).unwrap();
+        assert_eq!(
+            loaded.config.daemon.active_profile.as_deref(),
+            Some("studio")
+        );
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+        release_capture_for_shutdown(&harness.ctx);
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+    }
+
+    #[test]
+    fn direct_stop_before_active_profile_save_admission_leaves_disk_unchanged() {
+        let harness = SupervisorHarness::stopped();
+        let before = fs::read(&harness.config_path).unwrap();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let candidate_entered = Arc::new(std::sync::Barrier::new(2));
+        let candidate_release = Arc::new(std::sync::Barrier::new(2));
+        let mut candidate = test_app_candidate(true, Some(&resources));
+        candidate.config.daemon.active_profile = Some("studio".to_string());
+        candidate.config.daemon.control_socket_path =
+            harness.ctx.control_socket_path.display().to_string();
+        let token = begin_command_operation(&harness.ctx).unwrap();
+        let ctx = Arc::clone(&harness.ctx);
+        let entered = Arc::clone(&candidate_entered);
+        let release = Arc::clone(&candidate_release);
+        let command = std::thread::spawn(move || {
+            install_prepared_then_follow_start_mode(
+                &ctx,
+                token,
+                PreparedBootstrap::TestAppCandidate {
+                    candidate,
+                    entered: Some(entered),
+                    release: Some(release),
+                },
+                &ScriptedLegacyCaptureStarter {
+                    outcomes: Mutex::new(VecDeque::new()),
+                },
+                &SuccessfulLegacyRecovery,
+                true,
+                true,
+                true,
+            )
+        });
+
+        candidate_entered.wait();
+        begin_shutdown(&harness.ctx);
+        candidate_release.wait();
+        let response = command.join().unwrap();
+
+        assert!(!response.ok);
+        assert_eq!(fs::read(&harness.config_path).unwrap(), before);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+    }
+
+    #[test]
+    fn blocked_backend_stop_acknowledges_then_joins_and_cleans_socket_after_release() {
+        let harness = SupervisorHarness::stopped();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let starter = Arc::new(BlockingLegacyCaptureStarter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            active: Mutex::new(Some(test_active_capture_with_resources(&resources))),
+        });
+        let socket_path = harness._temp.path().join("blocked-stop.sock");
+        let mut socket = ControlSocketOwner::bind(socket_path.clone()).unwrap();
+        let lane = Arc::new(OperationLane::new(2).unwrap());
+        let worker_ctx = Arc::clone(&harness.ctx);
+        let worker_starter = Arc::clone(&starter);
+        let worker = spawn_operation_worker(
+            Arc::clone(&lane),
+            DEFAULT_WORKER_STACK_BYTES as usize,
+            move |job: OperationJob| {
+                let OperationJob::Client { request, stream } = job else {
+                    return;
+                };
+                let response = match request {
+                    ControlRequest::Reload => reload_daemon_config_with_recovery(
+                        &worker_ctx,
+                        None,
+                        worker_starter.as_ref(),
+                        &SuccessfulLegacyRecovery,
+                    ),
+                    _ => unreachable!(),
+                };
+                let _ = write_response(stream, &response);
+            },
+            |job: OperationJob| {
+                if let OperationJob::Client { stream, .. } = job {
+                    drop(stream);
+                }
+            },
+        );
+        let reload_peer = route_test_request(&harness.ctx, &lane, ControlRequest::Reload);
+        entered.wait();
+
+        let stop_started = std::time::Instant::now();
+        let stop = read_test_response(route_test_request(
+            &harness.ctx,
+            &lane,
+            ControlRequest::Stop,
+        ));
+        assert!(stop.ok);
+        assert!(stop_started.elapsed() < ROUTE_TEST_TIMEOUT);
+        assert!(socket_path.exists());
+        release.wait();
+
+        let reload = read_test_response(reload_peer);
+        assert!(!reload.ok);
+        lane.close();
+        join_worker_bounded(worker);
+        release_capture_for_shutdown(&harness.ctx);
+        socket.cleanup().unwrap();
+        assert!(!socket_path.exists());
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.live(ProbeResource::Session), 0);
+        assert_eq!(resources.dropped()[0], ProbeResource::Backend);
+        assert_eq!(resources.dropped()[1], ProbeResource::Session);
+    }
+
+    #[test]
+    fn direct_stop_route_wakes_scheduler_without_closing_operation_lane() {
+        let harness = SupervisorHarness::running();
+        let lane = OperationLane::new(1).unwrap();
+        let generation = harness.lifecycle().generation;
+
+        let response = read_test_response(route_test_request(
+            &harness.ctx,
+            &lane,
+            ControlRequest::Stop,
+        ));
+
+        assert!(response.ok);
+        assert!(!lane.is_closed());
+        assert_eq!(harness.lifecycle().generation, generation + 1);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+        lane.close();
+        release_capture_for_shutdown(&harness.ctx);
+    }
+
+    #[test]
+    fn stop_cancels_occupied_and_queued_mutations_before_scheduler_first_teardown() {
+        let temp = tempfile::tempdir().unwrap();
+        let export_root = temp.path().join("exports");
+        let mut config = threshold_test_config(temp.path(), &[("mic", "system:capture_1")]);
+        config.daemon.active_profile = Some("studio".to_string());
+        let profile = profile::resolve_active_profile(&config).unwrap().unwrap();
+        let mut context = test_app_context_with_policy(
+            temp.path(),
+            test_policy(export_root.clone()),
+            &[0.5, -0.25],
+        );
+        profile::save_config(&context.config_path, &config).unwrap();
+        {
+            let runtime = context.runtime.get_mut().unwrap();
+            runtime.config = config;
+            runtime.active_profile = Some(profile);
+            let session = Arc::get_mut(runtime.session.as_mut().unwrap()).unwrap();
+            session.profile_name = "studio".to_string();
+            runtime
+                .lifecycle
+                .mark_running(Some("studio".to_string()), Some("studio".to_string()));
+        }
+        let session = context.runtime.get_mut().unwrap().session.clone().unwrap();
+        let capture_before = session
+            .arena
+            .status(std::time::Duration::from_secs(1))
+            .unwrap();
+        let ctx = Arc::new(context);
+        let config_before = fs::read(&ctx.config_path).unwrap();
+        let runtime_config_before = ctx.runtime.lock().unwrap().config.clone();
+        let socket_path = temp.path().join("shutdown-drain.sock");
+        let socket = ControlSocketOwner::bind(socket_path.clone()).unwrap();
+        let lane = Arc::new(OperationLane::new(4).unwrap());
+        let scheduler = spawn_retry_scheduler(ctx.scheduler.clone(), Arc::clone(&ctx.clock), {
+            let lane = Arc::clone(&lane);
+            move |operation| {
+                lane.try_enqueue(OperationJob::Internal(operation))
+                    .map_err(|(error, _)| error)
+            }
+        })
+        .unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let worker = spawn_operation_worker(
+            Arc::clone(&lane),
+            DEFAULT_WORKER_STACK_BYTES as usize,
+            {
+                let ctx = Arc::clone(&ctx);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let first = AtomicBool::new(true);
+                move |job| {
+                    ctx.scheduler.notify_lane_available();
+                    if first.swap(false, Ordering::SeqCst) {
+                        entered.wait();
+                        release.wait();
+                    }
+                    execute_operation_job_with_recovery(
+                        &ctx,
+                        job,
+                        &RealLegacyCaptureStarter,
+                        &RealLegacyStartupRecovery,
+                    );
+                }
+            },
+            {
+                let ctx = Arc::clone(&ctx);
+                move |job| cancel_operation_job(&ctx, job)
+            },
+        );
+
+        let recall = route_test_request(&ctx, &lane, ControlRequest::Recall);
+        entered.wait();
+        let clear = route_test_request(&ctx, &lane, ControlRequest::Clear);
+        let threshold = route_test_request(
+            &ctx,
+            &lane,
+            ControlRequest::Threshold {
+                request: ThresholdRequest::Set {
+                    profile: "studio".to_string(),
+                    channel: "mic".to_string(),
+                    dbfs: -18.0,
+                },
+            },
+        );
+        assert!(handle_idle_request(&ctx, ControlRequest::Stop).ok);
+
+        let order = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let finish_order = Arc::clone(&order);
+        let finish_ctx = Arc::clone(&ctx);
+        let finish_lane = Arc::clone(&lane);
+        let finish = std::thread::spawn(move || {
+            finish_idle_listener_with_probe(
+                finish_ctx,
+                socket,
+                finish_lane,
+                scheduler,
+                worker,
+                move |step| {
+                    finish_order.0.lock().unwrap().push(step);
+                    finish_order.1.notify_all();
+                },
+            )
+        });
+        let mut observed = order.0.lock().unwrap();
+        while !observed.contains(&"lane-closed") {
+            observed = order.1.wait(observed).unwrap();
+        }
+        drop(observed);
+        release.wait();
+        finish.join().unwrap().unwrap();
+
+        for response in [
+            read_test_response(recall),
+            read_test_response(clear),
+            read_test_response(threshold),
+        ] {
+            assert!(!response.ok);
+            assert_eq!(response.message, "shutting down");
+        }
+        assert_eq!(fs::read(&ctx.config_path).unwrap(), config_before);
+        assert_eq!(ctx.runtime.lock().unwrap().config, runtime_config_before);
+        let capture_after = session
+            .arena
+            .status(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            capture_after.retained_frames,
+            capture_before.retained_frames
+        );
+        assert_eq!(
+            capture_after.active_absolute_range,
+            capture_before.active_absolute_range
+        );
+        assert_eq!(fs::read_dir(&export_root).unwrap().count(), 0);
+        assert_eq!(
+            *order.0.lock().unwrap(),
+            vec![
+                "scheduler-joined",
+                "lane-closed",
+                "worker-joined",
+                "capture-released",
+                "socket-cleaned",
+            ]
+        );
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn scheduler_panic_still_cancels_clients_releases_capture_and_cleans_socket_in_order() {
+        let harness = SupervisorHarness::running();
+        let socket_path = harness._temp.path().join("scheduler-panic.sock");
+        let socket = ControlSocketOwner::bind(socket_path.clone()).unwrap();
+        let lane = Arc::new(OperationLane::new(2).unwrap());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let worker = spawn_operation_worker(
+            Arc::clone(&lane),
+            DEFAULT_WORKER_STACK_BYTES as usize,
+            {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                move |_job: OperationJob| {
+                    entered.wait();
+                    release.wait();
+                }
+            },
+            {
+                let ctx = Arc::clone(&harness.ctx);
+                move |job| cancel_operation_job(&ctx, job)
+            },
+        );
+        lane.try_enqueue(OperationJob::Internal(ScheduledOperation::Retry {
+            generation: 0,
+        }))
+        .unwrap();
+        entered.wait();
+        let (stream, peer) = UnixStream::pair().unwrap();
+        lane.try_enqueue(OperationJob::Client {
+            request: ControlRequest::Reload,
+            stream,
+        })
+        .unwrap();
+        let scheduler = std::thread::spawn(|| panic!("injected scheduler panic"));
+        let order = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let finish_order = Arc::clone(&order);
+        let finish_ctx = Arc::clone(&harness.ctx);
+        let finish_lane = Arc::clone(&lane);
+        let finish = std::thread::spawn(move || {
+            finish_idle_listener_with_probe(
+                finish_ctx,
+                socket,
+                finish_lane,
+                scheduler,
+                worker,
+                move |step| {
+                    finish_order.0.lock().unwrap().push(step);
+                    finish_order.1.notify_all();
+                },
+            )
+        });
+        let mut observed = order.0.lock().unwrap();
+        while !observed.contains(&"lane-closed") {
+            observed = order.1.wait(observed).unwrap();
+        }
+        drop(observed);
+        release.wait();
+        let error = finish.join().unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("retry scheduler panicked"));
+        assert_eq!(read_test_response(peer).message, "shutting down");
+        assert_eq!(
+            *order.0.lock().unwrap(),
+            vec![
+                "scheduler-joined",
+                "lane-closed",
+                "worker-joined",
+                "capture-released",
+                "socket-cleaned",
+            ]
+        );
+        assert!(!socket_path.exists());
+        assert_eq!(harness.live_capture_resources(), 0);
+        assert_eq!(harness.resources.dropped()[0], ProbeResource::Backend);
+        assert_eq!(harness.resources.dropped()[1], ProbeResource::Session);
+    }
+
+    #[test]
+    fn operation_worker_panic_still_cancels_queued_client_and_cleans_resources() {
+        let harness = SupervisorHarness::running();
+        let socket_path = harness._temp.path().join("worker-panic.sock");
+        let socket = ControlSocketOwner::bind(socket_path.clone()).unwrap();
+        let lane = Arc::new(OperationLane::new(1).unwrap());
+        let (stream, peer) = UnixStream::pair().unwrap();
+        lane.try_enqueue(OperationJob::Client {
+            request: ControlRequest::Reload,
+            stream,
+        })
+        .unwrap();
+        let scheduler = spawn_retry_scheduler(
+            harness.ctx.scheduler.clone(),
+            Arc::clone(&harness.ctx.clock),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let worker = std::thread::spawn(|| panic!("injected operation worker panic"));
+
+        let error = finish_idle_listener_with_probe(
+            Arc::clone(&harness.ctx),
+            socket,
+            Arc::clone(&lane),
+            scheduler,
+            worker,
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("operation worker panicked"));
+        assert_eq!(read_test_response(peer).message, "shutting down");
+        assert!(!socket_path.exists());
+        assert_eq!(harness.live_capture_resources(), 0);
+        assert_eq!(harness.resources.dropped()[0], ProbeResource::Backend);
+        assert_eq!(harness.resources.dropped()[1], ProbeResource::Session);
+    }
+
+    #[test]
+    fn explicit_start_while_running_is_noop_without_reading_disk() {
+        let harness = SupervisorHarness::running();
+        let before = harness.snapshot();
+        fs::write(&harness.config_path, "not valid toml").unwrap();
+
+        let response = harness.start_capture();
+
+        assert!(response.ok);
+        assert_eq!(response.message, "capture already running");
+        assert_visible_authority_preserved_with_one_generation_advance(
+            &before,
+            &harness.snapshot(),
+        );
+    }
+
+    #[test]
+    fn running_start_advances_generation_at_entry_and_rejects_old_fault_and_retry() {
+        let harness = SupervisorHarness::running();
+        let old_generation = harness.lifecycle().generation;
+        let old_attempt_id = CaptureAttemptId::from_raw_for_test(8);
+        let old_sink = harness
+            .ctx
+            .scheduler
+            .fault_sink(old_generation, old_attempt_id);
+        let health = PipeWireHealth::with_fault_sink(old_sink.clone());
+        harness.ctx.runtime.lock().unwrap().capture_health = Some(health.clone());
+        let before = harness.snapshot();
+        let (entered, release) =
+            install_final_mutation_pause(&harness.ctx, FinalMutationKind::RunningStartNoop);
+        let ctx = Arc::clone(&harness.ctx);
+        let worker = std::thread::spawn(move || {
+            start_capture_transaction_with_recovery(
+                &ctx,
+                None,
+                false,
+                &PanickingLegacyStarter {
+                    calls: AtomicUsize::new(0),
+                },
+                &SuccessfulLegacyRecovery,
+            )
+        });
+        entered.wait();
+        assert_eq!(harness.lifecycle().generation, old_generation + 1);
+        release.wait();
+        assert!(worker.join().unwrap().ok);
+
+        old_sink.notify(RuntimeCaptureFault::BackendFault("old sink".to_string()));
+        publish_runtime_fault(
+            &harness.ctx,
+            old_generation,
+            old_attempt_id,
+            RuntimeCaptureFault::BackendFault("old publication".to_string()),
+        );
+        let stale_starter = PanickingLegacyStarter {
+            calls: AtomicUsize::new(0),
+        };
+        execute_retry_operation(
+            &harness.ctx,
+            old_generation,
+            &stale_starter,
+            &SuccessfulLegacyRecovery,
+        );
+        assert_eq!(stale_starter.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+        assert_visible_authority_preserved_with_one_generation_advance(
+            &before,
+            &harness.snapshot(),
+        );
+        assert!(health.record_fatal(RuntimeCaptureFault::BackendFault(
+            "fault after no-op start".to_string()
+        )));
+        assert_eq!(
+            harness.ctx.scheduler.pending_operation_for_test(),
+            Some(ScheduledOperation::RuntimeFault {
+                generation: old_generation + 1,
+                attempt_id: old_attempt_id,
+                fault: RuntimeCaptureFault::BackendFault("fault after no-op start".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn preserve_running_reload_advances_at_entry_and_rejects_old_fault_and_retry() {
+        let harness = SupervisorHarness::running();
+        let old_generation = harness.lifecycle().generation;
+        let old_attempt_id = CaptureAttemptId::from_raw_for_test(9);
+        let old_sink = harness
+            .ctx
+            .scheduler
+            .fault_sink(old_generation, old_attempt_id);
+        let health = PipeWireHealth::with_fault_sink(old_sink.clone());
+        harness.ctx.runtime.lock().unwrap().capture_health = Some(health.clone());
+        let before = harness.snapshot();
+        fs::write(&harness.config_path, "not valid toml").unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let worker = std::thread::spawn(move || {
+            reload_daemon_config_with_recovery_and_entry_hook(
+                &ctx,
+                None,
+                &PanickingLegacyStarter {
+                    calls: AtomicUsize::new(0),
+                },
+                &SuccessfulLegacyRecovery,
+                || {
+                    worker_entered.wait();
+                    worker_release.wait();
+                },
+            )
+        });
+        entered.wait();
+        assert_eq!(harness.lifecycle().generation, old_generation + 1);
+        release.wait();
+        assert!(!worker.join().unwrap().ok);
+
+        old_sink.notify(RuntimeCaptureFault::DeviceDisconnected(
+            "old sink".to_string(),
+        ));
+        let stale_starter = PanickingLegacyStarter {
+            calls: AtomicUsize::new(0),
+        };
+        execute_retry_operation(
+            &harness.ctx,
+            old_generation,
+            &stale_starter,
+            &SuccessfulLegacyRecovery,
+        );
+        assert_eq!(stale_starter.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+        assert_visible_authority_preserved_with_one_generation_advance(
+            &before,
+            &harness.snapshot(),
+        );
+        assert!(health.record_fatal(RuntimeCaptureFault::DeviceDisconnected(
+            "fault after failed reload".to_string()
+        )));
+        assert_eq!(
+            harness.ctx.scheduler.pending_operation_for_test(),
+            Some(ScheduledOperation::RuntimeFault {
+                generation: old_generation + 1,
+                attempt_id: old_attempt_id,
+                fault: RuntimeCaptureFault::DeviceDisconnected(
+                    "fault after failed reload".to_string()
+                ),
+            })
+        );
+    }
+
+    #[test]
+    fn failed_running_reload_startup_callback_preserves_old_capture_and_queues_no_fault() {
+        struct CallbackThenFailStarter;
+
+        impl LegacyCaptureStarter for CallbackThenFailStarter {
+            fn start(
+                &self,
+                _prepared: &PreparedLegacyConfig,
+                fault_sink: RuntimeFaultSink,
+            ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+                let health = PipeWireHealth::unarmed_with_fault_sink(fault_sink);
+                assert!(health.record_fatal(RuntimeCaptureFault::BackendFault(
+                    "candidate callback fault".to_string(),
+                )));
+                Err(CaptureAttemptError {
+                    class: ErrorClass::Transient,
+                    capture_state: CaptureState::Faulted,
+                    message: "candidate startup failed".to_string(),
+                })
+            }
+        }
+
+        let harness = SupervisorHarness::running();
+        let before = harness.snapshot();
+
+        let response = reload_daemon_config_with_recovery(
+            &harness.ctx,
+            None,
+            &CallbackThenFailStarter,
+            &SuccessfulLegacyRecovery,
+        );
+
+        assert!(!response.ok);
+        assert_visible_authority_preserved_with_one_generation_advance(
+            &before,
+            &harness.snapshot(),
+        );
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+    }
+
+    #[test]
+    fn stop_capture_advances_at_entry_and_rejects_old_fault_and_retry() {
+        let harness = SupervisorHarness::running();
+        let old_generation = harness.lifecycle().generation;
+        let old_attempt_id = CaptureAttemptId::from_raw_for_test(10);
+        let old_sink = harness
+            .ctx
+            .scheduler
+            .fault_sink(old_generation, old_attempt_id);
+        let (entered, release) =
+            install_final_mutation_pause(&harness.ctx, FinalMutationKind::StopCapture);
+        let ctx = Arc::clone(&harness.ctx);
+        let worker = std::thread::spawn(move || stop_capture_transaction(&ctx));
+        entered.wait();
+        assert_eq!(harness.lifecycle().generation, old_generation + 1);
+        release.wait();
+        assert!(worker.join().unwrap().ok);
+
+        old_sink.notify(RuntimeCaptureFault::BackendFault("old sink".to_string()));
+        publish_runtime_fault(
+            &harness.ctx,
+            old_generation,
+            old_attempt_id,
+            RuntimeCaptureFault::BackendFault("old publication".to_string()),
+        );
+        let stale_starter = PanickingLegacyStarter {
+            calls: AtomicUsize::new(0),
+        };
+        execute_retry_operation(
+            &harness.ctx,
+            old_generation,
+            &stale_starter,
+            &SuccessfulLegacyRecovery,
+        );
+        assert_eq!(stale_starter.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Stopped);
+    }
+
+    #[test]
+    fn legacy_final_commit_linearizes_before_direct_stop() {
+        let harness = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let starter = Arc::new(ScriptedLegacyCaptureStarter {
+            outcomes: Mutex::new(VecDeque::from([Ok(test_active_capture_with_resources(
+                &resources,
+            ))])),
+        });
+        let (entered, release) =
+            install_final_mutation_pause(&harness.ctx, FinalMutationKind::LegacySuccess);
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_starter = Arc::clone(&starter);
+        let command = std::thread::spawn(move || {
+            reload_daemon_config_with_recovery(
+                &ctx,
+                None,
+                worker_starter.as_ref(),
+                &SuccessfulLegacyRecovery,
+            )
+        });
+        entered.wait();
+        let (stop_finished, stop_worker) = spawn_observed_shutdown(Arc::clone(&harness.ctx));
+        let blocked = stop_was_blocked_before_release(&harness.ctx, &stop_finished);
+        release.wait();
+        let response = command.join().unwrap();
+        if blocked {
+            stop_finished.recv().unwrap();
+        }
+        stop_worker.join().unwrap();
+
+        assert!(
+            blocked,
+            "Stop must not publish authority inside a command commit gate"
+        );
+        assert!(response.ok);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+        release_capture_for_shutdown(&harness.ctx);
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.dropped()[0], ProbeResource::Backend);
+    }
+
+    #[test]
+    fn app_final_commit_linearizes_before_direct_stop() {
+        let harness = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let token = begin_command_operation(&harness.ctx).unwrap();
+        let (entered, release) =
+            install_final_mutation_pause(&harness.ctx, FinalMutationKind::AppSuccess);
+        let ctx = Arc::clone(&harness.ctx);
+        let candidate = test_app_candidate(true, Some(&resources));
+        let command = std::thread::spawn(move || {
+            install_prepared_then_follow_start_mode(
+                &ctx,
+                token,
+                PreparedBootstrap::TestAppCandidate {
+                    candidate,
+                    entered: None,
+                    release: None,
+                },
+                &ScriptedLegacyCaptureStarter {
+                    outcomes: Mutex::new(VecDeque::new()),
+                },
+                &SuccessfulLegacyRecovery,
+                false,
+                false,
+                false,
+            )
+        });
+        entered.wait();
+        let (stop_finished, stop_worker) = spawn_observed_shutdown(Arc::clone(&harness.ctx));
+        let blocked = stop_was_blocked_before_release(&harness.ctx, &stop_finished);
+        release.wait();
+        let response = command.join().unwrap();
+        if blocked {
+            stop_finished.recv().unwrap();
+        }
+        stop_worker.join().unwrap();
+
+        assert!(blocked, "Stop must wait for app final publication");
+        assert!(response.ok);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+        release_capture_for_shutdown(&harness.ctx);
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.dropped()[0], ProbeResource::Backend);
+    }
+
+    #[test]
+    fn failure_publication_linearizes_before_direct_stop() {
+        let harness = SupervisorHarness::stopped();
+        let starter = Arc::new(ScriptedLegacyCaptureStarter {
+            outcomes: Mutex::new(VecDeque::from([Err(CaptureAttemptError {
+                class: ErrorClass::Permanent,
+                capture_state: CaptureState::Faulted,
+                message: "candidate failed".to_string(),
+            })])),
+        });
+        let (entered, release) =
+            install_final_mutation_pause(&harness.ctx, FinalMutationKind::Failure);
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_starter = Arc::clone(&starter);
+        let command = std::thread::spawn(move || {
+            start_capture_transaction_with_recovery(
+                &ctx,
+                None,
+                false,
+                worker_starter.as_ref(),
+                &SuccessfulLegacyRecovery,
+            )
+        });
+        entered.wait();
+        let (stop_finished, stop_worker) = spawn_observed_shutdown(Arc::clone(&harness.ctx));
+        let blocked = stop_was_blocked_before_release(&harness.ctx, &stop_finished);
+        release.wait();
+        let response = command.join().unwrap();
+        if blocked {
+            stop_finished.recv().unwrap();
+        }
+        stop_worker.join().unwrap();
+
+        assert!(blocked, "Stop must wait for failure publication");
+        assert!(!response.ok);
+        assert_eq!(response.message, "candidate failed");
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+    }
+
+    #[test]
+    fn stop_capture_publication_linearizes_before_direct_stop() {
+        let harness = SupervisorHarness::running();
+        let (entered, release) =
+            install_final_mutation_pause(&harness.ctx, FinalMutationKind::StopCapture);
+        let ctx = Arc::clone(&harness.ctx);
+        let command = std::thread::spawn(move || stop_capture_transaction(&ctx));
+        entered.wait();
+        let (stop_finished, stop_worker) = spawn_observed_shutdown(Arc::clone(&harness.ctx));
+        let blocked = stop_was_blocked_before_release(&harness.ctx, &stop_finished);
+        release.wait();
+        let response = command.join().unwrap();
+        if blocked {
+            stop_finished.recv().unwrap();
+        }
+        stop_worker.join().unwrap();
+
+        assert!(blocked, "Stop must wait for StopCapture publication");
+        assert!(response.ok);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+        assert_eq!(harness.live_capture_resources(), 0);
+    }
+
+    #[test]
+    fn running_start_noop_snapshot_linearizes_before_direct_stop() {
+        let harness = SupervisorHarness::running();
+        let before = harness.snapshot();
+        let (entered, release) =
+            install_final_mutation_pause(&harness.ctx, FinalMutationKind::RunningStartNoop);
+        let ctx = Arc::clone(&harness.ctx);
+        let command = std::thread::spawn(move || {
+            start_capture_transaction_with_recovery(
+                &ctx,
+                None,
+                false,
+                &ScriptedLegacyCaptureStarter {
+                    outcomes: Mutex::new(VecDeque::new()),
+                },
+                &SuccessfulLegacyRecovery,
+            )
+        });
+        entered.wait();
+        let (stop_finished, stop_worker) = spawn_observed_shutdown(Arc::clone(&harness.ctx));
+        let blocked = stop_was_blocked_before_release(&harness.ctx, &stop_finished);
+        release.wait();
+        let response = command.join().unwrap();
+        if blocked {
+            stop_finished.recv().unwrap();
+        }
+        stop_worker.join().unwrap();
+
+        assert!(blocked, "Stop must wait for the running Start snapshot");
+        assert!(response.ok);
+        assert_eq!(response.message, "capture already running");
+        assert_eq!(
+            response.status.unwrap().lifecycle.daemon_state,
+            DaemonState::Ready
+        );
+        assert_eq!(before.session_identity, harness.snapshot().session_identity);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+        release_capture_for_shutdown(&harness.ctx);
+    }
+
+    #[test]
+    fn poisoned_runtime_direct_stop_returns_coherent_stopping_status_and_clears_poison() {
+        let harness = SupervisorHarness::running();
+        let ctx = Arc::clone(&harness.ctx);
+        let _ = std::thread::spawn(move || {
+            let _guard = ctx.runtime.lock().unwrap();
+            panic!("poison runtime for direct Stop");
+        })
+        .join();
+
+        let response = handle_idle_request(&harness.ctx, ControlRequest::Stop);
+
+        assert!(response.ok);
+        let status = response.status.unwrap();
+        assert_eq!(status.lifecycle.daemon_state, DaemonState::Stopping);
+        assert_eq!(status.lifecycle.capture_state, CaptureState::Running);
+        assert!(harness.ctx.runtime.lock().is_ok());
+        release_capture_for_shutdown(&harness.ctx);
+    }
+
+    #[test]
+    fn stop_capture_releases_capture_without_stopping_daemon() {
+        let harness = SupervisorHarness::running();
+        harness.stop_capture();
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Stopped);
+        assert!(!harness.stop_flag());
+        assert_eq!(harness.live_capture_resources(), 0);
+    }
+
+    #[test]
+    fn corrected_legacy_reload_starts_capture() {
+        let harness =
+            SupervisorHarness::stopped_with_outcomes(VecDeque::from([Ok(test_active_capture())]));
+        let valid_text = toml::to_string(&test_legacy_fake_config()).unwrap();
+        let response = harness.reload_with_text(&valid_text);
+        assert!(response.ok);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Ready);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Running);
+    }
+
+    #[test]
+    fn explicit_start_permanent_error_is_structured_and_not_terminal() {
+        let harness =
+            SupervisorHarness::stopped_with_outcomes(VecDeque::from([Err(CaptureAttemptError {
+                class: ErrorClass::Permanent,
+                capture_state: CaptureState::Faulted,
+                message: "invalid profile".to_string(),
+            })]));
+        let response = harness.start_capture();
+        assert!(!response.ok);
+        assert_eq!(
+            response.error_context.error_class,
+            Some(ErrorClass::Permanent)
+        );
+        assert_eq!(harness.lifecycle().retry_policy, RetryPolicy::Manual);
+        let status = response.status.unwrap();
+        assert_eq!(status.lifecycle.daemon_state, DaemonState::Degraded);
+        assert_eq!(status.lifecycle.capture_state, CaptureState::Faulted);
+        assert_eq!(status.lifecycle.retry_policy, RetryPolicy::Manual);
+        assert_eq!(
+            status.lifecycle.last_error.as_deref(),
+            Some("invalid profile")
+        );
+        assert!(!harness.stop_flag());
+    }
+
+    #[test]
+    fn explicit_start_transient_error_is_structured_and_not_terminal() {
+        let harness =
+            SupervisorHarness::stopped_with_outcomes(VecDeque::from([Err(CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "target missing".to_string(),
+            })]));
+        let response = harness.start_capture();
+        assert!(!response.ok);
+        assert_eq!(
+            response.error_context.error_class,
+            Some(ErrorClass::Transient)
+        );
+        assert_eq!(
+            harness.lifecycle().capture_state,
+            CaptureState::WaitingForDevice
+        );
+        let status = response.status.unwrap();
+        assert_eq!(status.lifecycle.daemon_state, DaemonState::Degraded);
+        assert_eq!(
+            status.lifecycle.capture_state,
+            CaptureState::WaitingForDevice
+        );
+        assert_eq!(status.lifecycle.retry_policy, RetryPolicy::BoundedBackoff);
+        assert_eq!(status.lifecycle.retry_attempt, 1);
+        assert!(status.lifecycle.next_retry_at.is_some());
+        assert_eq!(
+            status.lifecycle.last_error.as_deref(),
+            Some("target missing")
+        );
+        assert!(!harness.stop_flag());
+    }
+
+    #[test]
+    fn operator_generation_overflow_is_fatal_without_retry_or_other_mutation() {
+        let harness = SupervisorHarness::stopped();
+        {
+            let mut runtime = harness.ctx.runtime.lock().unwrap();
+            runtime.lifecycle.generation = u64::MAX;
+        }
+        let before = harness.snapshot();
+
+        let response = harness.start_capture();
+
+        assert!(!response.ok);
+        assert_eq!(response.error_context.error_class, Some(ErrorClass::Fatal));
+        assert_eq!(harness.snapshot(), before);
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+    }
+
+    #[test]
+    fn fatal_capture_attempt_state_application_rejects_without_mutation() {
+        let harness = SupervisorHarness::stopped();
+        let before = harness.snapshot();
+
+        let rejected = {
+            let mut runtime = harness.ctx.runtime.lock().unwrap();
+            apply_capture_attempt_error_to_state(
+                &mut runtime,
+                CaptureAttemptError {
+                    class: ErrorClass::Fatal,
+                    capture_state: CaptureState::Faulted,
+                    message: "fatal state application".to_string(),
+                },
+                harness.ctx.clock.now(),
+            )
+        };
+
+        assert_eq!(
+            rejected,
+            Err(CaptureAttemptError {
+                class: ErrorClass::Fatal,
+                capture_state: CaptureState::Faulted,
+                message: "fatal state application".to_string(),
+            })
+        );
+        assert_eq!(harness.snapshot(), before);
+        assert!(!harness.stop_flag());
+    }
+
+    #[test]
+    fn publish_generation_overflow_cleans_poisoned_resources_then_signals_fatal() {
+        let harness = SupervisorHarness::stopped();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let mut stale = test_active_capture_with_resources(&resources);
+        let poisoned = Arc::clone(&harness.ctx);
+        let _ = std::thread::spawn(move || {
+            let mut runtime = poisoned.runtime.lock().unwrap();
+            runtime.lifecycle.generation = u64::MAX;
+            runtime.capture = stale.backend.take();
+            runtime.session = stale.session.take();
+            panic!("publish overflow poison");
+        })
+        .join();
+
+        publish_capture_attempt_error(
+            &harness.ctx,
+            CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "candidate unavailable".to_string(),
+            },
+        );
+
+        let runtime = harness.ctx.runtime.lock().unwrap();
+        assert_eq!(runtime.lifecycle.generation, u64::MAX);
+        assert_eq!(runtime.lifecycle.error_class, None);
+        assert_ne!(runtime.lifecycle.retry_policy, RetryPolicy::Manual);
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        drop(runtime);
+        assert!(harness.stop_flag());
+        assert!(harness.ctx.scheduler.is_stopped());
+        assert!(harness
+            .ctx
+            .first_fatal
+            .get()
+            .unwrap()
+            .contains("generation overflow"));
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.live(ProbeResource::Session), 0);
+        assert_eq!(
+            &resources.dropped()[..2],
+            &[ProbeResource::Backend, ProbeResource::Session]
+        );
+    }
+
+    #[test]
+    fn recovered_poison_generation_overflow_returns_fatal_and_retains_first_cause() {
+        let harness = SupervisorHarness::stopped();
+        let token = begin_command_operation(&harness.ctx).unwrap();
+        harness
+            .ctx
+            .first_fatal
+            .set("earlier fatal cause".to_string())
+            .unwrap();
+        let resources = Arc::new(AttemptResourceCounters::default());
+        let mut stale = test_active_capture_with_resources(&resources);
+        let poisoned = Arc::clone(&harness.ctx);
+        let _ = std::thread::spawn(move || {
+            let mut runtime = poisoned.runtime.lock().unwrap();
+            runtime.lifecycle.generation = u64::MAX;
+            runtime.capture = stale.backend.take();
+            runtime.session = stale.session.take();
+            panic!("command overflow poison");
+        })
+        .join();
+
+        let response = command_attempt_failure(
+            &harness.ctx,
+            token,
+            CaptureAttemptError {
+                class: ErrorClass::Transient,
+                capture_state: CaptureState::WaitingForDevice,
+                message: "candidate unavailable".to_string(),
+            },
+            false,
+        );
+
+        assert!(!response.ok);
+        assert_eq!(response.error_context.error_class, Some(ErrorClass::Fatal));
+        assert!(response.message.contains("generation overflow"));
+        assert_eq!(
+            harness.ctx.first_fatal.get().map(String::as_str),
+            Some("earlier fatal cause")
+        );
+        assert!(harness.stop_flag());
+        assert_eq!(resources.live(ProbeResource::Backend), 0);
+        assert_eq!(resources.live(ProbeResource::Session), 0);
+        let runtime = harness.ctx.runtime.lock().unwrap();
+        assert_eq!(runtime.lifecycle.error_class, None);
+        assert_ne!(runtime.lifecycle.retry_policy, RetryPolicy::Manual);
+    }
+
+    #[test]
+    fn stale_fatal_attempt_is_superseded_without_signalling() {
+        let harness = SupervisorHarness::stopped();
+        let stale_token = begin_command_operation(&harness.ctx).unwrap();
+        let _current_token = begin_command_operation(&harness.ctx).unwrap();
+
+        let response = command_attempt_failure(
+            &harness.ctx,
+            stale_token,
+            CaptureAttemptError {
+                class: ErrorClass::Fatal,
+                capture_state: CaptureState::Faulted,
+                message: "stale fatal".to_string(),
+            },
+            false,
+        );
+
+        assert_eq!(
+            response.error_context.error_class,
+            Some(ErrorClass::Transient)
+        );
+        assert!(!harness.stop_flag());
+        assert!(harness.ctx.first_fatal.get().is_none());
+    }
+
+    #[test]
+    fn real_listener_fatal_start_exits_without_external_wake_and_cleans_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("lamb.toml");
+        let socket_path = temp.path().join("control.sock");
+        let mut config = test_legacy_fake_config();
+        config.control_socket_path = socket_path.clone();
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let bootstrap = bootstrap_config(&config_path).unwrap();
+        let prepared = prepare_bootstrap_config(&bootstrap);
+        let ctx = build_idle_context(bootstrap, prepared).unwrap();
+        {
+            let mut runtime = ctx.runtime.lock().unwrap();
+            runtime.state = "stopped".to_string();
+            runtime.lifecycle.mark_stopped(None);
+        }
+        let socket = ControlSocketOwner::bind(socket_path.clone()).unwrap();
+        let starter: Arc<dyn LegacyCaptureStarter> = Arc::new(ScriptedLegacyCaptureStarter {
+            outcomes: Mutex::new(VecDeque::from([Err(CaptureAttemptError {
+                class: ErrorClass::Fatal,
+                capture_state: CaptureState::Faulted,
+                message: "scripted fatal capture start".to_string(),
+            })])),
+        });
+        let recovery: Arc<dyn LegacyStartupRecovery> = Arc::new(SuccessfulLegacyRecovery);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let listener_ctx = Arc::clone(&ctx);
+        let listener = std::thread::spawn(move || {
+            let result = run_idle_listener_with_dependencies(
+                listener_ctx,
+                socket,
+                starter,
+                recovery,
+                || {},
+                |_| {},
+                || {},
+            );
+            finished_tx.send(result).unwrap();
+        });
+
+        let response_result = (|| -> Result<ControlResponse> {
+            let mut stream = UnixStream::connect(&socket_path)
+                .map_err(|source| io_error(&socket_path, source))?;
+            stream
+                .set_read_timeout(Some(ROUTE_TEST_TIMEOUT))
+                .map_err(|source| io_error(&socket_path, source))?;
+            let request = serde_json::to_string(&ControlRequest::StartCapture {
+                profile: None,
+                activate: false,
+            })
+            .map_err(|error| LambError::Control(error.to_string()))?;
+            writeln!(stream, "{request}").map_err(|source| io_error(&socket_path, source))?;
+            let mut response = String::new();
+            BufReader::new(stream)
+                .read_line(&mut response)
+                .map_err(|source| io_error(&socket_path, source))?;
+            serde_json::from_str(&response)
+                .map_err(|error| LambError::Control(format!("invalid response: {error}")))
+        })();
+        let response = match response_result {
+            Ok(response) => response,
+            Err(error) => {
+                signal_fatal(&ctx, format!("fatal listener test watchdog: {error}"));
+                let _ = finished_rx.recv_timeout(ROUTE_TEST_TIMEOUT);
+                let _ = listener.join();
+                panic!("fatal StartCapture response was not delivered: {error}");
+            }
+        };
+        assert!(!response.ok);
+        assert_eq!(response.error_context.error_class, Some(ErrorClass::Fatal));
+        assert_eq!(response.message, "scripted fatal capture start");
+
+        let result = match finished_rx.recv_timeout(ROUTE_TEST_TIMEOUT) {
+            Ok(result) => result,
+            Err(error) => {
+                signal_fatal(&ctx, format!("fatal listener exit watchdog: {error}"));
+                let result = finished_rx
+                    .recv_timeout(ROUTE_TEST_TIMEOUT)
+                    .expect("listener did not exit after watchdog");
+                listener.join().unwrap();
+                panic!("listener required watchdog to exit: {result:?}");
+            }
+        };
+        listener.join().unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.process_exit_code(), 1);
+        assert_ne!(error.process_exit_code(), 78);
+        assert!(error.to_string().contains("scripted fatal capture start"));
+        assert!(!socket_path.exists());
+        assert_eq!(ctx.scheduler.pending_operation_for_test(), None);
+        let runtime = ctx.runtime.lock().unwrap();
+        assert_eq!(runtime.lifecycle.error_class, None);
+        assert_ne!(runtime.lifecycle.retry_policy, RetryPolicy::Manual);
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        assert!(runtime.capture_health.is_none());
+        assert!(runtime.resolved_capture.is_none());
+    }
+
+    #[test]
+    fn fatal_signal_is_observed_with_silent_already_accepted_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("lamb.toml");
+        let socket_path = temp.path().join("control.sock");
+        let mut config = test_legacy_fake_config();
+        config.control_socket_path = socket_path.clone();
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let bootstrap = bootstrap_config(&config_path).unwrap();
+        let prepared = prepare_bootstrap_config(&bootstrap);
+        let ctx = build_idle_context(bootstrap, prepared).unwrap();
+        let socket = ControlSocketOwner::bind(socket_path.clone()).unwrap();
+        let accepted = Arc::new(std::sync::Barrier::new(2));
+        let release_read = Arc::new(std::sync::Barrier::new(2));
+        let first_accept = Arc::new(AtomicBool::new(true));
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let listener_ctx = Arc::clone(&ctx);
+        let listener_accepted = Arc::clone(&accepted);
+        let listener_release = Arc::clone(&release_read);
+        let listener_first_accept = Arc::clone(&first_accept);
+        let listener = std::thread::spawn(move || {
+            let result = run_idle_listener_with_dependencies(
+                listener_ctx,
+                socket,
+                Arc::new(ScriptedLegacyCaptureStarter {
+                    outcomes: Mutex::new(VecDeque::new()),
+                }),
+                Arc::new(SuccessfulLegacyRecovery),
+                move || {
+                    if listener_first_accept.swap(false, Ordering::SeqCst) {
+                        listener_accepted.wait();
+                        listener_release.wait();
+                    }
+                },
+                |_| {},
+                || {},
+            );
+            finished_tx.send(result).unwrap();
+        });
+
+        let mut silent_client = Some(UnixStream::connect(&socket_path).unwrap());
+        accepted.wait();
+        let started = std::time::Instant::now();
+        signal_fatal(&ctx, "silent client fatal".to_string());
+        release_read.wait();
+        let result = match finished_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(result) => result,
+            Err(error) => {
+                drop(silent_client.take());
+                let _ = finished_rx.recv_timeout(ROUTE_TEST_TIMEOUT);
+                let _ = listener.join();
+                panic!("listener exceeded bounded silent-client shutdown: {error}");
+            }
+        };
+        let elapsed = started.elapsed();
+        listener.join().unwrap();
+
+        assert!(silent_client.is_some(), "silent client stayed connected");
+        let error = result.unwrap_err();
+        assert_eq!(error.process_exit_code(), 1);
+        assert!(error.to_string().contains("silent client fatal"));
+        assert!(elapsed < Duration::from_secs(3), "elapsed: {elapsed:?}");
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn internal_retry_fatal_install_response_signals_shutdown() {
+        let harness = SupervisorHarness::stopped();
+        let generation = harness.lifecycle().generation;
+        let starter = ScriptedLegacyCaptureStarter {
+            outcomes: Mutex::new(VecDeque::from([Err(CaptureAttemptError {
+                class: ErrorClass::Fatal,
+                capture_state: CaptureState::Faulted,
+                message: "fatal retry install".to_string(),
+            })])),
+        };
+
+        execute_retry_operation(
+            &harness.ctx,
+            generation,
+            &starter,
+            &SuccessfulLegacyRecovery,
+        );
+
+        assert!(harness.stop_flag());
+        assert_eq!(
+            harness.ctx.first_fatal.get().map(String::as_str),
+            Some("fatal retry install")
+        );
+        assert!(harness.ctx.scheduler.is_stopped());
+        assert_eq!(harness.ctx.scheduler.pending_operation_for_test(), None);
+        let lifecycle = harness.lifecycle();
+        assert_eq!(lifecycle.error_class, None);
+        assert_ne!(lifecycle.retry_policy, RetryPolicy::Manual);
+    }
+
+    #[test]
+    fn stop_generation_prevents_stale_reload_completion_from_publishing() {
+        let harness = SupervisorHarness::running();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let starter = Arc::new(BlockingLegacyCaptureStarter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            active: Mutex::new(Some(test_active_capture())),
+        });
+        let config_path = harness.config_path.clone();
+        let replacement = config_path.with_extension("replacement");
+        fs::write(
+            &replacement,
+            toml::to_string(&test_legacy_fake_config()).unwrap(),
+        )
+        .unwrap();
+        fs::rename(replacement, config_path).unwrap();
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_starter = Arc::clone(&starter);
+        let reload = std::thread::spawn(move || {
+            reload_daemon_config_with_recovery(
+                &ctx,
+                None,
+                worker_starter.as_ref(),
+                &SuccessfulLegacyRecovery,
+            )
+        });
+
+        entered.wait();
+        let stopped = harness.stop_capture();
+        assert!(stopped.ok);
+        release.wait();
+        let stale = reload.join().unwrap();
+
+        assert!(!stale.ok);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Stopped);
+        assert!(harness.ctx.runtime.lock().unwrap().session.is_none());
+    }
+
+    #[test]
+    fn stale_start_after_stop_capture_does_not_publish() {
+        let harness = SupervisorHarness::stopped();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let starter = Arc::new(BlockingLegacyCaptureStarter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            active: Mutex::new(Some(test_active_capture())),
+        });
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_starter = Arc::clone(&starter);
+        let worker = std::thread::spawn(move || {
+            start_capture_transaction_with_recovery(
+                &ctx,
+                None,
+                false,
+                worker_starter.as_ref(),
+                &SuccessfulLegacyRecovery,
+            )
+        });
+        entered.wait();
+        assert!(harness.stop_capture().ok);
+        release.wait();
+
+        assert!(!worker.join().unwrap().ok);
+        assert_eq!(harness.lifecycle().capture_state, CaptureState::Stopped);
+    }
+
+    #[test]
+    fn stale_start_after_reload_does_not_replace_new_authority() {
+        let harness = SupervisorHarness::stopped();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let starter = Arc::new(BlockingLegacyCaptureStarter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            active: Mutex::new(Some(test_active_capture())),
+        });
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_starter = Arc::clone(&starter);
+        let worker = std::thread::spawn(move || {
+            start_capture_transaction_with_recovery(
+                &ctx,
+                None,
+                false,
+                worker_starter.as_ref(),
+                &SuccessfulLegacyRecovery,
+            )
+        });
+        entered.wait();
+        harness
+            .starter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push_back(Ok(test_active_capture()));
+        let replacement =
+            harness.reload_with_text(&toml::to_string(&test_legacy_fake_config()).unwrap());
+        assert!(replacement.ok);
+        let replacement_session = harness.snapshot().session_identity;
+        release.wait();
+
+        assert!(!worker.join().unwrap().ok);
+        assert_eq!(harness.snapshot().session_identity, replacement_session);
+    }
+
+    #[test]
+    fn stale_start_after_direct_stop_does_not_publish() {
+        let harness = SupervisorHarness::stopped();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let starter = Arc::new(BlockingLegacyCaptureStarter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            active: Mutex::new(Some(test_active_capture())),
+        });
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_starter = Arc::clone(&starter);
+        let worker = std::thread::spawn(move || {
+            start_capture_transaction_with_recovery(
+                &ctx,
+                None,
+                false,
+                worker_starter.as_ref(),
+                &SuccessfulLegacyRecovery,
+            )
+        });
+        entered.wait();
+        begin_shutdown(&harness.ctx);
+        release.wait();
+
+        assert!(!worker.join().unwrap().ok);
+        assert_eq!(harness.lifecycle().daemon_state, DaemonState::Stopping);
+        assert!(harness.ctx.runtime.lock().unwrap().session.is_none());
+    }
+
+    #[test]
+    fn stale_reload_after_newer_reload_does_not_replace_new_authority() {
+        let harness = SupervisorHarness::running();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let starter = Arc::new(BlockingLegacyCaptureStarter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            active: Mutex::new(Some(test_active_capture())),
+        });
+        let ctx = Arc::clone(&harness.ctx);
+        let worker_starter = Arc::clone(&starter);
+        let worker = std::thread::spawn(move || {
+            reload_daemon_config_with_recovery(
+                &ctx,
+                None,
+                worker_starter.as_ref(),
+                &SuccessfulLegacyRecovery,
+            )
+        });
+        entered.wait();
+        harness
+            .starter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push_back(Ok(test_active_capture()));
+        assert!(
+            harness
+                .reload_with_text(&toml::to_string(&test_legacy_fake_config()).unwrap())
+                .ok
+        );
+        let replacement_session = harness.snapshot().session_identity;
+        release.wait();
+
+        assert!(!worker.join().unwrap().ok);
+        assert_eq!(harness.snapshot().session_identity, replacement_session);
+    }
+
+    #[test]
+    fn failed_capture_attempt_publishes_no_active_resources() {
+        let prepared = prepare_legacy_config(test_legacy_pipewire_config()).unwrap();
+        let counters = Arc::new(AttemptResourceCounters::default());
+        let attempt_counters = Arc::clone(&counters);
+        let result: Result<()> = start_legacy_capture_with(
+            &prepared,
+            |_| Ok(test_resolved_target(4, 44_100)),
+            move |_, _| {
+                let _backend = attempt_counters.lease(ProbeResource::Backend);
+                let _session = attempt_counters.lease(ProbeResource::Session);
+                let _arena = attempt_counters.lease(ProbeResource::Arena);
+                let _workspace = attempt_counters.lease(ProbeResource::Workspace);
+                let _descriptor = attempt_counters.lease(ProbeResource::Descriptor);
+                Err(LambError::Capture("injected attempt failure".to_string()))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(counters.live(ProbeResource::Backend), 0);
+        assert_eq!(counters.live(ProbeResource::Session), 0);
+        assert_eq!(counters.live(ProbeResource::Arena), 0);
+        assert_eq!(counters.live(ProbeResource::Workspace), 0);
+        assert_eq!(counters.live(ProbeResource::Descriptor), 0);
+    }
+
+    #[test]
+    fn late_listener_setup_failure_drops_real_attempt_before_worker_publication() {
+        let prepared = prepare_legacy_config(test_legacy_fake_config()).unwrap();
+        let counters = Arc::new(AttemptResourceCounters::default());
+        let worker_published = Arc::new(AtomicBool::new(false));
+        let published = Arc::clone(&worker_published);
+        let mut active = start_legacy_capture(&prepared, RuntimeFaultSink::default()).unwrap();
+        active.backend_resource_probe = Some(Box::new(counters.lease(ProbeResource::Backend)));
+        let session = Arc::get_mut(active.session.as_mut().unwrap()).unwrap();
+        session.attempt_resource_probes = vec![
+            Box::new(counters.lease(ProbeResource::Session)),
+            Box::new(counters.lease(ProbeResource::Arena)),
+            Box::new(counters.lease(ProbeResource::Workspace)),
+            Box::new(counters.lease(ProbeResource::Descriptor)),
+        ];
+
+        let result = finish_legacy_capture_startup_with(
+            active,
+            &prepared,
+            (),
+            |_| {
+                Err(LambError::Control(
+                    "injected final listener setup failure".to_string(),
+                ))
+            },
+            move |_, _| {
+                published.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        let error = result.unwrap_err();
+        assert!(matches!(&error, LambError::Control(_)));
+        assert_eq!(error.process_exit_code(), 1);
+        assert!(!worker_published.load(Ordering::SeqCst));
+        assert_eq!(counters.live(ProbeResource::Backend), 0);
+        assert_eq!(counters.live(ProbeResource::Session), 0);
+        assert_eq!(counters.live(ProbeResource::Arena), 0);
+        assert_eq!(counters.live(ProbeResource::Workspace), 0);
+        assert_eq!(counters.live(ProbeResource::Descriptor), 0);
+        let dropped = counters.dropped();
+        assert_eq!(dropped.len(), 5);
+        assert_eq!(dropped.first(), Some(&ProbeResource::Backend));
+    }
+
+    #[test]
+    fn legacy_attempt_passes_resolved_runtime_dimensions_to_builder() {
+        let state = start_legacy_capture_with(
+            &prepare_legacy_config(test_legacy_pipewire_config()).unwrap(),
+            |_| Ok(test_resolved_target(4, 44_100)),
+            |_, resolved| Ok(resolved.state),
+        )
+        .unwrap();
+        assert_eq!(state.channel_count, 4);
+        assert_eq!(state.sample_rate, 44_100);
+    }
+
+    fn test_legacy_fake_config() -> LambConfig {
+        config::parse_config_text(
+            Path::new("fake.toml"),
+            r#"
+configVersion = 1
+user = "test"
+backend = "fake"
+channels = 2
+channelMap = ["left", "right"]
+seconds = 5
+sampleRate = 48000
+sampleFormat = "F32LE"
+dontRemix = true
+outputDir = "/tmp/lamb-test-out"
+maxActiveSnapshots = 1
+allowQueuedRecall = false
+controlSocketPath = "/tmp/lamb-test.sock"
+controlPermissions = "0600"
+
+[memory]
+headroom = 1.2
+
+[export]
+mode = "per-channel"
+format = "wav"
+splitWhenOverBytes = 1073741824
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_pipewire_preparation_accepts_capture_ports_without_channels() {
+        let cfg = test_legacy_pipewire_config();
+        let before = cfg.clone();
+        let prepared = prepare_legacy_config(cfg).unwrap();
+
+        assert_eq!(prepared.static_config.as_ref(), &before);
+        assert_eq!(prepared.static_config.channels, None);
+        assert_eq!(
+            prepared.session_export_policy.activity.channels.len(),
+            before.capture_ports.len()
+        );
+    }
+
+    #[test]
+    fn legacy_preparation_rejects_explicit_channels_with_capture_ports() {
+        let mut cfg = test_legacy_pipewire_config();
+        cfg.channels = Some(4);
+        let error = prepare_legacy_config(cfg).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("channels conflicts with capturePorts"));
+    }
+
+    #[test]
+    fn legacy_policy_error_occurs_during_preparation() {
+        let mut cfg = test_legacy_fake_config();
+        cfg.output_dir = std::path::PathBuf::from("/tmp/root/../escape");
+        assert!(prepare_legacy_config(cfg).is_err());
+    }
+
+    #[test]
+    fn app_context_records_post_bind_initialization_error_instead_of_returning_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = app_config::AppConfig::default();
+        config.daemon.active_profile = Some("missing-profile".to_string());
+        let bootstrap = BootstrapConfig {
+            config_path: temp.path().join("lamb.toml"),
+            text: None,
+            family: ConfigFamily::App,
+            control_socket_path: temp.path().join("control.sock"),
+        };
+        let prepared = PreparedBootstrap::App(app_config::LoadedAppConfig {
+            config,
+            state: ConfigLoadState::Loaded,
+            error: None,
+        });
+
+        let ctx = build_idle_context(bootstrap, prepared)
+            .expect("post-bind app initialization faults must remain inspectable");
+        let runtime = ctx.runtime.lock().unwrap();
+        assert_eq!(runtime.state, "faulted");
+        assert_eq!(runtime.lifecycle.daemon_state, DaemonState::Degraded);
+        assert_eq!(runtime.lifecycle.capture_state, CaptureState::Faulted);
+        assert_eq!(runtime.lifecycle.error_class, Some(ErrorClass::Permanent));
+        assert_eq!(runtime.lifecycle.retry_policy, RetryPolicy::Manual);
+        assert_eq!(runtime.lifecycle.retry_attempt, 0);
+        assert_eq!(runtime.lifecycle.next_retry_at, None);
+        assert!(runtime
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("missing-profile"));
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        drop(runtime);
+        assert_eq!(ctx.scheduler.pending_operation_for_test(), None);
+    }
+
+    struct PanickingLegacyStarter {
+        calls: AtomicUsize,
+    }
+
+    impl LegacyCaptureStarter for PanickingLegacyStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            _fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("permanent prepared fault must not invoke legacy starter");
+        }
+    }
+
+    #[test]
+    fn permanent_prepared_fault_never_invokes_legacy_starter() {
+        let temp = tempfile::tempdir().unwrap();
+        let bootstrap = BootstrapConfig {
+            config_path: temp.path().join("lamb.toml"),
+            text: None,
+            family: ConfigFamily::Legacy,
+            control_socket_path: temp.path().join("control.sock"),
+        };
+        let ctx = build_idle_context(
+            bootstrap,
+            PreparedBootstrap::Faulted {
+                family: ConfigFamily::Legacy,
+                fallback_app_config: app_config::AppConfig::default(),
+                message: "schema fault".to_string(),
+            },
+        )
+        .unwrap();
+        let starter = PanickingLegacyStarter {
+            calls: AtomicUsize::new(0),
+        };
+
+        let _ = attempt_configured_start(&ctx, &starter);
+
+        assert_eq!(starter.calls.load(Ordering::SeqCst), 0);
+        let runtime = ctx.runtime.lock().unwrap();
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        assert_eq!(runtime.lifecycle.error_class, Some(ErrorClass::Permanent));
+    }
+
+    struct SingleActiveStarter {
+        active: Mutex<Option<ActiveCapture>>,
+    }
+
+    impl LegacyCaptureStarter for SingleActiveStarter {
+        fn start(
+            &self,
+            _prepared: &PreparedLegacyConfig,
+            _fault_sink: RuntimeFaultSink,
+        ) -> std::result::Result<ActiveCapture, CaptureAttemptError> {
+            Ok(self.active.lock().unwrap().take().unwrap())
+        }
+    }
+
+    struct FailingLegacyRecovery {
+        calls: AtomicUsize,
+    }
+
+    impl LegacyStartupRecovery for FailingLegacyRecovery {
+        fn failed_count(&self, _session: &CaptureSession) -> Result<usize> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(LambError::Control(
+                "injected startup recovery failure".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_failure_cleans_attempt_before_degraded_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let prepared = prepare_legacy_config(test_legacy_fake_config()).unwrap();
+        let counters = Arc::new(AttemptResourceCounters::default());
+        let mut active = start_legacy_capture(&prepared, RuntimeFaultSink::default()).unwrap();
+        active.backend_resource_probe = Some(Box::new(counters.lease(ProbeResource::Backend)));
+        Arc::get_mut(active.session.as_mut().unwrap())
+            .unwrap()
+            .attempt_resource_probes = vec![Box::new(counters.lease(ProbeResource::Session))];
+        let starter = SingleActiveStarter {
+            active: Mutex::new(Some(active)),
+        };
+        let recovery = FailingLegacyRecovery {
+            calls: AtomicUsize::new(0),
+        };
+        let ctx = build_idle_context(
+            BootstrapConfig {
+                config_path: temp.path().join("lamb.toml"),
+                text: None,
+                family: ConfigFamily::Legacy,
+                control_socket_path: temp.path().join("control.sock"),
+            },
+            PreparedBootstrap::Legacy(prepared),
+        )
+        .unwrap();
+
+        let _ = attempt_configured_start_with_recovery(&ctx, &starter, &recovery);
+
+        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.live(ProbeResource::Backend), 0);
+        assert_eq!(counters.live(ProbeResource::Session), 0);
+        assert_eq!(
+            counters.dropped(),
+            vec![ProbeResource::Backend, ProbeResource::Session]
+        );
+        let runtime = ctx.runtime.lock().unwrap();
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        assert_eq!(runtime.lifecycle.daemon_state, DaemonState::Degraded);
+        assert!(runtime
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("startup recovery failure"));
+    }
+
+    struct OrderedDropProbe {
+        name: &'static str,
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for OrderedDropProbe {
+        fn drop(&mut self) {
+            self.order.lock().unwrap().push(self.name);
+        }
+    }
+
+    #[test]
+    fn stopped_ownership_drops_backend_before_final_session() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let backend = OrderedDropProbe {
+            name: "backend",
+            order: Arc::clone(&order),
+        };
+        let session = OrderedDropProbe {
+            name: "session",
+            order: Arc::clone(&order),
+        };
+
+        drop_capture_then_session(Some(backend), Some(session));
+
+        assert_eq!(*order.lock().unwrap(), vec!["backend", "session"]);
+    }
+
+    #[test]
+    fn private_app_post_backend_failure_drops_backend_before_session_and_retains_nothing() {
+        let counters = Arc::new(AttemptResourceCounters::default());
+        let backend = CaptureBackend::TestProbe(Box::new(counters.lease(ProbeResource::Backend)));
+        let mut session = test_session();
+        session.attempt_resource_probes = vec![Box::new(counters.lease(ProbeResource::Session))];
+        let mut attempt = PrivateAppCaptureAttempt::for_test(backend, Arc::new(session));
+
+        let result = attempt.run_post_backend_step(|_| {
+            Err(LambError::Control(
+                "injected post-backend policy failure".to_string(),
+            ))
+        });
+        assert!(result.is_err());
+        drop(attempt);
+
+        assert_eq!(counters.live(ProbeResource::Backend), 0);
+        assert_eq!(counters.live(ProbeResource::Session), 0);
+        assert_eq!(
+            counters.dropped(),
+            vec![ProbeResource::Backend, ProbeResource::Session]
+        );
+    }
 
     fn listener_test_request(socket: &Path, request: &ControlRequest) -> UnixStream {
         let mut stream = UnixStream::connect(socket).unwrap();
@@ -2953,7 +10555,7 @@ mod tests {
         rejected_request: ControlRequest,
     ) {
         let socket_path = root.join("control.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let socket = ControlSocketOwner::bind(socket_path.clone()).unwrap();
         let (server_done_tx, server_done_rx) = mpsc::sync_channel(1);
         let (operation_entered_tx, operation_entered_rx) = mpsc::sync_channel(1);
         let (operation_release_tx, operation_release_rx) = mpsc::sync_channel(1);
@@ -2966,7 +10568,7 @@ mod tests {
                 server_socket_path,
                 server_diagnostic,
                 server_calibration_root,
-                listener,
+                socket,
                 move |request| {
                     if matches!(
                         request,
@@ -3030,7 +10632,7 @@ mod tests {
         operation_release_tx.send(()).unwrap();
         let active = read_test_response(active);
         assert!(!active.ok);
-        assert_eq!(active.message, diagnostic);
+        assert_eq!(active.message, "shutting down");
         for stream in queued {
             let cancelled = read_test_response(stream);
             assert!(!cancelled.ok);
@@ -3081,7 +10683,7 @@ mod tests {
 
     fn route_test_request(
         ctx: &IdleDaemonContext,
-        lane: &OperationLane<(ControlRequest, UnixStream)>,
+        lane: &OperationLane<OperationJob>,
         request: ControlRequest,
     ) -> UnixStream {
         let (stream, mut peer) = UnixStream::pair().unwrap();
@@ -3145,6 +10747,10 @@ mod tests {
             calibration_root: root.join("calibration"),
             runtime: Mutex::new(AppRuntimeState {
                 config,
+                config_family: ConfigFamily::App,
+                prepared_legacy: None,
+                resolved_capture: None,
+                lifecycle: LifecycleState::ready_stopped(None),
                 state: if session.is_some() {
                     "capturing".to_string()
                 } else {
@@ -3158,7 +10764,14 @@ mod tests {
                 session,
                 test_capture_attached,
             }),
+            clock: Arc::new(SystemRetryClock::default()),
+            scheduler: RetrySchedulerHandle::new(),
+            operation_authority: Mutex::new(()),
+            operation_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            final_mutation_pause: Mutex::new(None),
             stop: AtomicBool::new(false),
+            first_fatal: std::sync::OnceLock::new(),
         }
     }
 
@@ -3857,26 +11470,6 @@ mod tests {
         // Corrupt metadata is classified as stale rather than blocking startup.
         fs::write(prepared.metadata_path(), b"{").unwrap();
         assert_fail_open(&config, &resolved, &session, fixed_now);
-
-        // Both external-backend production construction paths invoke this exact
-        // validated installer. This source assertion avoids starting JACK/PipeWire.
-        let source = include_str!("daemon.rs");
-        let explicit = &source[source.find("fn start_app_capture(").unwrap()
-            ..source.find("fn stop_app_capture(").unwrap()];
-        let automatic = &source[source.find("fn reload_app_config_inner(").unwrap()
-            ..source.find("fn iso8601_compact_label(").unwrap()];
-        assert_eq!(
-            explicit
-                .matches("install_effective_session_activity_policy(")
-                .count(),
-            1
-        );
-        assert_eq!(
-            automatic
-                .matches("install_effective_session_activity_policy(")
-                .count(),
-            1
-        );
     }
 
     #[test]
@@ -5024,7 +12617,7 @@ mod tests {
     }
 
     #[test]
-    fn admitted_stop_capture_cancels_calibration_before_occupied_lane_runs_it() {
+    fn stop_capture_cancels_calibration_only_when_lane_handler_runs() {
         use std::sync::{mpsc, Barrier};
 
         let profile = profile::ResolvedProfile {
@@ -5070,6 +12663,10 @@ mod tests {
             calibration_root: PathBuf::from("/tmp/lamb-test-calibration"),
             runtime: Mutex::new(AppRuntimeState {
                 config: app_config::AppConfig::default(),
+                config_family: ConfigFamily::App,
+                prepared_legacy: None,
+                resolved_capture: None,
+                lifecycle: LifecycleState::ready_stopped(None),
                 state: "capturing".to_string(),
                 last_error: None,
                 config_load_error: None,
@@ -5079,7 +12676,14 @@ mod tests {
                 session: Some(session),
                 test_capture_attached: true,
             }),
+            clock: Arc::new(SystemRetryClock::default()),
+            scheduler: RetrySchedulerHandle::new(),
+            operation_authority: Mutex::new(()),
+            operation_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            final_mutation_pause: Mutex::new(None),
             stop: AtomicBool::new(false),
+            first_fatal: std::sync::OnceLock::new(),
         });
 
         let admitted = Arc::new(Barrier::new(2));
@@ -5117,7 +12721,10 @@ mod tests {
         let worker = spawn_operation_worker(
             Arc::clone(&lane),
             64 * 1024,
-            move |(request, stream): (ControlRequest, UnixStream)| {
+            move |job: OperationJob| {
+                let OperationJob::Client { request, stream } = job else {
+                    return;
+                };
                 if worker_jobs.fetch_add(1, Ordering::AcqRel) == 0 {
                     entered.wait();
                     release.wait();
@@ -5127,11 +12734,14 @@ mod tests {
                     finished.wait();
                 }
             },
-            |_job: (ControlRequest, UnixStream)| {},
+            |_job: OperationJob| {},
         );
         let (occupied_stream, _occupied_peer) = UnixStream::pair().unwrap();
-        lane.try_enqueue((ControlRequest::Reload, occupied_stream))
-            .unwrap();
+        lane.try_enqueue(OperationJob::Client {
+            request: ControlRequest::Reload,
+            stream: occupied_stream,
+        })
+        .unwrap();
         worker_entered.wait();
 
         let (route_stream, mut route_peer) = UnixStream::pair().unwrap();
@@ -5157,8 +12767,8 @@ mod tests {
         }
         calibration.join().unwrap();
         assert!(
-            cancelled_before_worker_release,
-            "StopCapture admission must cancel before its queued handler runs"
+            !cancelled_before_worker_release,
+            "StopCapture admission must not mutate capture before its queued handler runs"
         );
     }
 
@@ -5226,6 +12836,10 @@ mod tests {
                 calibration_root: PathBuf::from("/tmp/lamb-test-calibration"),
                 runtime: Mutex::new(AppRuntimeState {
                     config,
+                    config_family: ConfigFamily::App,
+                    prepared_legacy: None,
+                    resolved_capture: None,
+                    lifecycle: LifecycleState::ready_stopped(None),
                     state: "capturing".to_string(),
                     last_error: None,
                     config_load_error: None,
@@ -5235,7 +12849,14 @@ mod tests {
                     session: Some(session),
                     test_capture_attached: true,
                 }),
+                clock: Arc::new(SystemRetryClock::default()),
+                scheduler: RetrySchedulerHandle::new(),
+                operation_authority: Mutex::new(()),
+                operation_epoch: AtomicU64::new(0),
+                #[cfg(test)]
+                final_mutation_pause: Mutex::new(None),
                 stop: AtomicBool::new(false),
+                first_fatal: std::sync::OnceLock::new(),
             }),
             ingress,
         )
@@ -6036,21 +13657,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_stop_publishes_and_closes_lane_before_lock_dependent_cancellation_callback() {
-        let stop = AtomicBool::new(false);
-        let lane = OperationLane::<()>::new(1).unwrap();
-        let callback_observed_ordering = std::cell::Cell::new(false);
-
-        publish_stop_and_close_before(&stop, &lane, || {
-            callback_observed_ordering.set(stop.load(Ordering::Acquire) && lane.is_closed());
-        });
-
-        assert!(callback_observed_ordering.get());
-        assert!(stop.load(Ordering::Acquire));
-        assert!(lane.is_closed());
-    }
-
-    #[test]
     fn direct_stop_during_prepared_generation_aborts_before_config_commit() {
         use std::sync::Barrier;
 
@@ -6340,7 +13946,10 @@ mod tests {
         let worker = spawn_operation_worker(
             Arc::clone(&lane),
             64 * 1024,
-            move |(request, stream): (ControlRequest, UnixStream)| {
+            move |job: OperationJob| {
+                let OperationJob::Client { request, stream } = job else {
+                    return;
+                };
                 if matches!(
                     request,
                     ControlRequest::Threshold {
@@ -6357,13 +13966,14 @@ mod tests {
                         ok: true,
                         message: "processed by operation worker".to_string(),
                         status: None,
+                        error_context: crate::control::ControlErrorContext::default(),
                         persistence_outcome: None,
                         threshold_report: None,
                     },
                 )
                 .unwrap();
             },
-            |_job: (ControlRequest, UnixStream)| {},
+            |_job: OperationJob| {},
         );
 
         let expected = [
@@ -6434,11 +14044,14 @@ mod tests {
         let worker = spawn_operation_worker(
             Arc::clone(&lane),
             64 * 1024,
-            move |(_request, _stream): (ControlRequest, UnixStream)| {
+            move |job: OperationJob| {
+                let OperationJob::Client { .. } = job else {
+                    return;
+                };
                 entered_tx.send(()).unwrap();
                 release_rx.recv_timeout(ROUTE_TEST_TIMEOUT).unwrap();
             },
-            |_job: (ControlRequest, UnixStream)| {},
+            |_job: OperationJob| {},
         );
 
         let calibrate = ControlRequest::Threshold {
@@ -6490,16 +14103,45 @@ mod tests {
         join_worker_bounded(worker);
     }
 
+    fn test_legacy_idle_context(
+        capture_health: Option<PipeWireHealth>,
+        stopped: bool,
+    ) -> IdleDaemonContext {
+        let mut lifecycle = LifecycleState::ready_stopped(None);
+        lifecycle.mark_running(None, None);
+        IdleDaemonContext {
+            config_path: PathBuf::from("/tmp/lamb-test-config.toml"),
+            control_socket_path: PathBuf::from("/tmp/lamb-test-control.sock"),
+            calibration_root: PathBuf::from("/tmp/lamb-test-calibration"),
+            runtime: Mutex::new(AppRuntimeState {
+                config: app_config::AppConfig::default(),
+                config_family: ConfigFamily::Legacy,
+                prepared_legacy: None,
+                resolved_capture: None,
+                lifecycle,
+                state: "capturing".to_string(),
+                last_error: None,
+                config_load_error: None,
+                active_profile: None,
+                capture: None,
+                capture_health,
+                session: Some(Arc::new(test_session())),
+                test_capture_attached: false,
+            }),
+            clock: Arc::new(SystemRetryClock::default()),
+            scheduler: RetrySchedulerHandle::new(),
+            operation_authority: Mutex::new(()),
+            operation_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            final_mutation_pause: Mutex::new(None),
+            stop: AtomicBool::new(stopped),
+            first_fatal: std::sync::OnceLock::new(),
+        }
+    }
+
     #[test]
     fn every_legacy_threshold_operation_returns_the_exact_unsupported_response() {
-        let ctx = DaemonContext {
-            cfg: test_legacy_config(),
-            session: test_session(),
-            resolved_target: None,
-            stop: AtomicBool::new(false),
-            last_error: Mutex::new(None),
-            capture_health: None,
-        };
+        let ctx = test_legacy_idle_context(None, false);
         let requests = [
             ThresholdRequest::Calibrate {
                 profile: "studio".to_string(),
@@ -6520,7 +14162,7 @@ mod tests {
             },
         ];
         for request in requests {
-            let response = handle_request(&ctx, ControlRequest::Threshold { request });
+            let response = handle_idle_request(&ctx, ControlRequest::Threshold { request });
             assert!(!response.ok);
             assert_eq!(
                 response.message,
@@ -6584,20 +14226,17 @@ mod tests {
         let health = crate::capture_pipewire::PipeWireHealth::default();
         assert!(health.record_fatal("PipeWire core/proxy error: server disconnected"));
 
-        let legacy = DaemonContext {
-            cfg: test_legacy_config(),
-            session: test_session(),
-            resolved_target: None,
-            stop: AtomicBool::new(false),
-            last_error: Mutex::new(None),
-            capture_health: Some(health.clone()),
-        };
+        let legacy = test_legacy_idle_context(Some(health.clone()), false);
         let profile = IdleDaemonContext {
             config_path: PathBuf::from("/tmp/lamb-test-config.toml"),
             control_socket_path: PathBuf::from("/tmp/lamb-test-control.sock"),
             calibration_root: PathBuf::from("/tmp/lamb-test-calibration"),
             runtime: Mutex::new(AppRuntimeState {
                 config: app_config::AppConfig::default(),
+                config_family: ConfigFamily::App,
+                prepared_legacy: None,
+                resolved_capture: None,
+                lifecycle: LifecycleState::ready_stopped(None),
                 state: "capturing".to_string(),
                 last_error: None,
                 config_load_error: None,
@@ -6607,10 +14246,20 @@ mod tests {
                 session: None,
                 test_capture_attached: false,
             }),
+            clock: Arc::new(SystemRetryClock::default()),
+            scheduler: RetrySchedulerHandle::new(),
+            operation_authority: Mutex::new(()),
+            operation_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            final_mutation_pause: Mutex::new(None),
             stop: AtomicBool::new(false),
+            first_fatal: std::sync::OnceLock::new(),
         };
 
-        for status in [status_response(&legacy), idle_status_response(&profile)] {
+        for status in [
+            idle_status_response(&legacy),
+            idle_status_response(&profile),
+        ] {
             assert_eq!(status.state, "faulted");
             assert_eq!(
                 status.last_error.as_deref(),
@@ -6620,18 +14269,46 @@ mod tests {
     }
 
     #[test]
+    fn status_releases_runtime_lock_and_uses_one_stop_snapshot_before_arena_status() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut session = test_session();
+        session.status_hook = Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }));
+        let ctx = test_legacy_idle_context(None, false);
+        ctx.runtime.lock().unwrap().session = Some(Arc::new(session));
+        let ctx = Arc::new(ctx);
+        let status_ctx = Arc::clone(&ctx);
+        let status_thread = std::thread::spawn(move || idle_status_response(&status_ctx));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("status did not reach session status hook");
+        let runtime_lock_was_available = ctx.runtime.try_lock().is_ok();
+        ctx.stop.store(true, Ordering::Release);
+        release_tx.send(()).unwrap();
+        let status = status_thread.join().unwrap();
+
+        assert!(
+            runtime_lock_was_available,
+            "session.status must run after releasing the runtime mutex"
+        );
+        assert_eq!(
+            (status.state.as_str(), status.lifecycle.daemon_state),
+            ("capturing", DaemonState::Ready),
+            "old and additive status must use the same pre-stop snapshot"
+        );
+    }
+
+    #[test]
     fn normal_pipewire_stop_is_not_reported_as_a_fault() {
         let health = crate::capture_pipewire::PipeWireHealth::default();
-        let legacy = DaemonContext {
-            cfg: test_legacy_config(),
-            session: test_session(),
-            resolved_target: None,
-            stop: AtomicBool::new(true),
-            last_error: Mutex::new(None),
-            capture_health: Some(health),
-        };
+        let legacy = test_legacy_idle_context(Some(health), true);
 
-        let status = status_response(&legacy);
+        let status = idle_status_response(&legacy);
         assert_eq!(status.state, "stopping");
         assert_eq!(status.last_error, None);
     }
@@ -6665,38 +14342,8 @@ mod tests {
             configured_inputs: Vec::new(),
             resolved_live_inputs: Vec::new(),
             calibration_sample_frames: 0,
-        }
-    }
-
-    fn test_legacy_config() -> LambConfig {
-        LambConfig {
-            config_version: 1,
-            user: "test".to_string(),
-            target: None,
-            backend: "pipewire".to_string(),
-            channels: Some(1),
-            channel_map: None,
-            capture_ports: Vec::new(),
-            seconds: 1,
-            sample_rate: 100,
-            sample_format: "F32LE".to_string(),
-            latency: None,
-            dont_remix: true,
-            output_dir: PathBuf::from("/tmp/out"),
-            memory: config::MemoryConfig {
-                max: None,
-                headroom: 1.0,
-            },
-            max_active_snapshots: 1,
-            allow_queued_recall: false,
-            chunk_frames: Some(1),
-            control_socket_path: PathBuf::from("/tmp/lamb-test-control.sock"),
-            control_permissions: "0600".to_string(),
-            export: config::ExportConfig {
-                mode: "per-channel".to_string(),
-                format: "wav".to_string(),
-                split_when_over_bytes: 3_900_000_000,
-            },
+            attempt_resource_probes: Vec::new(),
+            status_hook: None,
         }
     }
 
@@ -6795,6 +14442,8 @@ mod tests {
             configured_inputs: Vec::new(),
             resolved_live_inputs: Vec::new(),
             calibration_sample_frames: 0,
+            attempt_resource_probes: Vec::new(),
+            status_hook: None,
         });
         IdleDaemonContext {
             config_path: root.join("lamb.toml"),
@@ -6802,6 +14451,10 @@ mod tests {
             calibration_root: root.join("calibration"),
             runtime: Mutex::new(AppRuntimeState {
                 config: app_config::AppConfig::default(),
+                config_family: ConfigFamily::App,
+                prepared_legacy: None,
+                resolved_capture: None,
+                lifecycle: LifecycleState::ready_stopped(None),
                 state: "capturing".to_string(),
                 last_error: None,
                 config_load_error: None,
@@ -6811,7 +14464,14 @@ mod tests {
                 session: Some(session),
                 test_capture_attached: true,
             }),
+            clock: Arc::new(SystemRetryClock::default()),
+            scheduler: RetrySchedulerHandle::new(),
+            operation_authority: Mutex::new(()),
+            operation_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            final_mutation_pause: Mutex::new(None),
             stop: AtomicBool::new(false),
+            first_fatal: std::sync::OnceLock::new(),
         }
     }
 
@@ -6867,6 +14527,8 @@ mod tests {
             configured_inputs: Vec::new(),
             resolved_live_inputs: Vec::new(),
             calibration_sample_frames: 0,
+            attempt_resource_probes: Vec::new(),
+            status_hook: None,
         });
         let ctx = IdleDaemonContext {
             config_path: PathBuf::from("/tmp/lamb-test-config.toml"),
@@ -6874,6 +14536,10 @@ mod tests {
             calibration_root: PathBuf::from("/tmp/lamb-test-calibration"),
             runtime: Mutex::new(AppRuntimeState {
                 config: app_config::AppConfig::default(),
+                config_family: ConfigFamily::App,
+                prepared_legacy: None,
+                resolved_capture: None,
+                lifecycle: LifecycleState::ready_stopped(None),
                 state: "capturing".to_string(),
                 last_error: None,
                 config_load_error: None,
@@ -6883,7 +14549,14 @@ mod tests {
                 session: Some(session),
                 test_capture_attached: true,
             }),
+            clock: Arc::new(SystemRetryClock::default()),
+            scheduler: RetrySchedulerHandle::new(),
+            operation_authority: Mutex::new(()),
+            operation_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            final_mutation_pause: Mutex::new(None),
             stop: AtomicBool::new(false),
+            first_fatal: std::sync::OnceLock::new(),
         };
 
         let status = idle_status_response(&ctx);
@@ -6909,6 +14582,57 @@ mod tests {
 
         assert!(!response.ok);
         assert_eq!(response.message, "runtime state lock poisoned");
+    }
+
+    #[test]
+    fn poisoned_stop_capture_releases_ownership_backend_first_before_reporting_success() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut session = test_session();
+        session.attempt_resource_probes = vec![Box::new(OrderedDropProbe {
+            name: "session",
+            order: Arc::clone(&order),
+        })];
+        let ctx = test_legacy_idle_context(None, false);
+        {
+            let mut runtime = ctx.runtime.lock().unwrap();
+            runtime.config_family = ConfigFamily::App;
+            runtime.state = "capturing".to_string();
+            runtime.capture = Some(CaptureBackend::TestProbe(Box::new(OrderedDropProbe {
+                name: "backend",
+                order: Arc::clone(&order),
+            })));
+            runtime.session = Some(Arc::new(session));
+            runtime.test_capture_attached = true;
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _runtime = ctx.runtime.lock().unwrap();
+            panic!("poison runtime lock with active capture");
+        }));
+
+        let response = handle_idle_request(&ctx, ControlRequest::StopCapture);
+
+        assert!(response.ok, "stop response must reflect completed teardown");
+        assert_eq!(response.message, "capture stopped");
+        let status = response
+            .status
+            .expect("successful stop must include status");
+        assert_eq!(status.state, "unconfigured");
+        assert_eq!(status.lifecycle.daemon_state, DaemonState::Ready);
+        assert_eq!(status.lifecycle.capture_state, CaptureState::Stopped);
+        assert_eq!(status.lifecycle.error_class, None);
+        assert_eq!(status.lifecycle.retry_policy, RetryPolicy::None);
+        assert_eq!(status.lifecycle.retry_attempt, 0);
+        assert_eq!(status.lifecycle.next_retry_at, None);
+        assert_eq!(status.last_error, None);
+        let runtime = ctx
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(runtime.capture.is_none());
+        assert!(runtime.session.is_none());
+        assert!(!runtime.test_capture_attached);
+        drop(runtime);
+        assert_eq!(*order.lock().unwrap(), vec!["backend", "session"]);
     }
 
     #[test]
@@ -7119,6 +14843,10 @@ mod tests {
             calibration_root: PathBuf::from("/tmp/lamb-test-calibration"),
             runtime: Mutex::new(AppRuntimeState {
                 config: app_config::AppConfig::default(),
+                config_family: ConfigFamily::App,
+                prepared_legacy: None,
+                resolved_capture: None,
+                lifecycle: LifecycleState::ready_stopped(None),
                 state: "idle".to_string(),
                 last_error: None,
                 config_load_error: None,
@@ -7128,7 +14856,14 @@ mod tests {
                 session: None,
                 test_capture_attached: false,
             }),
+            clock: Arc::new(SystemRetryClock::default()),
+            scheduler: RetrySchedulerHandle::new(),
+            operation_authority: Mutex::new(()),
+            operation_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            final_mutation_pause: Mutex::new(None),
             stop: AtomicBool::new(false),
+            first_fatal: std::sync::OnceLock::new(),
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _runtime = ctx.runtime.lock().unwrap();
@@ -7157,5 +14892,24 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(1));
         let b = iso8601_compact_label();
         assert!(b > a, "timestamps must be monotonic: {a} then {b}");
+    }
+
+    #[test]
+    fn staging_path_overflow_is_rejected_before_existing_final_path_is_touched() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut parent = temp.path().to_path_buf();
+        while parent.as_os_str().as_bytes().len() < 100 {
+            parent.push("a");
+        }
+        fs::create_dir_all(&parent).unwrap();
+        let final_path = parent.join("x");
+        let final_socket = UnixDatagram::bind(&final_path).unwrap();
+        let identity = SocketIdentity::from_metadata(&fs::symlink_metadata(&final_path).unwrap());
+
+        let error = ControlSocketOwner::bind(final_path.clone()).unwrap_err();
+
+        assert!(error.to_string().contains("sun_path"), "{error}");
+        assert!(identity.matches(&fs::symlink_metadata(&final_path).unwrap()));
+        drop(final_socket);
     }
 }

@@ -10,6 +10,7 @@ pub mod config;
 pub mod control;
 pub mod control_server;
 pub mod daemon;
+pub(crate) mod daemon_lifecycle;
 pub mod dump;
 pub mod error;
 pub mod export_policy;

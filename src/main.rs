@@ -141,7 +141,7 @@ fn main() {
 
     if let Err(err) = result {
         eprintln!("lamb: {err}");
-        std::process::exit(1);
+        std::process::exit(err.process_exit_code());
     }
 }
 

@@ -43,6 +43,7 @@ fn response(ok: bool, message: &str, report: Option<ThresholdReport>) -> Control
         ok,
         message: message.to_string(),
         status: None,
+        error_context: lamb::control::ControlErrorContext::default(),
         persistence_outcome: None,
         threshold_report: report,
     }

@@ -292,9 +292,13 @@ pub fn load_config_file(path: &Path) -> Result<LambConfig> {
     load_config_text(path, &text)
 }
 
+pub fn parse_config_text(path: &Path, text: &str) -> Result<LambConfig> {
+    toml::from_str(text)
+        .map_err(|err| LambError::Config(format!("failed to parse {}: {err}", path.display())))
+}
+
 pub fn load_config_text(path: &Path, text: &str) -> Result<LambConfig> {
-    let cfg: LambConfig = toml::from_str(text)
-        .map_err(|err| LambError::Config(format!("failed to parse {}: {err}", path.display())))?;
+    let cfg = parse_config_text(path, text)?;
     cfg.validate_static()?;
     Ok(cfg)
 }

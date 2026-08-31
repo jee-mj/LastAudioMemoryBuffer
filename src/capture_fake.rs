@@ -37,10 +37,45 @@ impl FakeCapture {
         })
     }
 
-    pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+    fn stop_inner(&mut self) {
+        self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+
+    pub fn stop(mut self) {
+        self.stop_inner();
+    }
+}
+
+impl Drop for FakeCapture {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_stops_and_joins_fake_capture_worker() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_exited = Arc::clone(&exited);
+        let handle = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            worker_exited.store(true, Ordering::Release);
+        });
+        let capture = FakeCapture {
+            stop,
+            handle: Some(handle),
+        };
+        drop(capture);
+        assert!(exited.load(Ordering::Acquire));
     }
 }

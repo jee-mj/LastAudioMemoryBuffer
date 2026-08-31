@@ -2723,6 +2723,7 @@ fn delivery_status() -> DaemonStatus {
         channel_count: 1,
         format: "F32LE".to_string(),
         last_error: None,
+        lifecycle: lamb::control::DaemonLifecycleStatus::default(),
     }
 }
 

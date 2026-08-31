@@ -13,12 +13,12 @@ let
     export XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$uid}"
     if [ ! -d "$XDG_RUNTIME_DIR" ]; then
       echo "lamb: XDG_RUNTIME_DIR does not exist: $XDG_RUNTIME_DIR" >&2
-      exit 1
+      exit 78
     fi
     owner="$(${pkgs.coreutils}/bin/stat -c %u "$XDG_RUNTIME_DIR")"
     if [ "$owner" != "$uid" ]; then
       echo "lamb: XDG_RUNTIME_DIR owner $owner does not match uid $uid" >&2
-      exit 1
+      exit 78
     fi
     export LD_LIBRARY_PATH=${pkgs.pipewire.jack}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
     exec ${lambPkg}/bin/lamb daemon --config ${lib.escapeShellArg configPath}
@@ -87,12 +87,15 @@ in
       after = [ "user@${toString userUid}.service" ];
       wants = [ "user@${toString userUid}.service" ];
       wantedBy = [ "multi-user.target" ];
+      startLimitIntervalSec = 60;
+      startLimitBurst = 3;
 
       serviceConfig = {
         Type = "simple";
         User = cfg.user;
         ExecStart = wrapper;
         Restart = "on-failure";
+        RestartPreventExitStatus = [ 78 ];
         RestartSec = 5;
         LimitRTPRIO = "95";
         LimitMEMLOCK = "512M";

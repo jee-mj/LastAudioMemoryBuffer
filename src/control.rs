@@ -58,15 +58,149 @@ pub enum ThresholdRequest {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DaemonState {
+    #[default]
+    Ready,
+    Degraded,
+    Stopping,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureState {
+    #[default]
+    Stopped,
+    Starting,
+    Running,
+    WaitingForDevice,
+    Faulted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ErrorClass {
+    Permanent,
+    Transient,
+    Fatal,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetryPolicy {
+    #[default]
+    None,
+    Manual,
+    BoundedBackoff,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DaemonLifecycleStatus {
+    #[serde(rename = "daemonState")]
+    pub daemon_state: DaemonState,
+    #[serde(rename = "captureState")]
+    pub capture_state: CaptureState,
+    #[serde(rename = "errorClass")]
+    pub error_class: Option<ErrorClass>,
+    #[serde(rename = "lastError")]
+    pub last_error: Option<String>,
+    #[serde(rename = "retryPolicy")]
+    pub retry_policy: RetryPolicy,
+    #[serde(rename = "retryAttempt")]
+    pub retry_attempt: u32,
+    #[serde(rename = "nextRetryAt")]
+    pub next_retry_at: Option<u64>,
+    #[serde(rename = "activeProfile")]
+    pub active_profile: Option<String>,
+    #[serde(rename = "resolvedTarget")]
+    pub resolved_target: Option<String>,
+}
+
+impl Default for DaemonLifecycleStatus {
+    fn default() -> Self {
+        Self {
+            daemon_state: DaemonState::Ready,
+            capture_state: CaptureState::Stopped,
+            error_class: None,
+            last_error: None,
+            retry_policy: RetryPolicy::None,
+            retry_attempt: 0,
+            next_retry_at: None,
+            active_profile: None,
+            resolved_target: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ControlErrorContext {
+    #[serde(
+        rename = "errorClass",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub error_class: Option<ErrorClass>,
+    #[serde(
+        rename = "daemonState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub daemon_state: Option<DaemonState>,
+    #[serde(
+        rename = "captureState",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capture_state: Option<CaptureState>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ControlResponse {
     pub ok: bool,
     pub message: String,
     pub status: Option<DaemonStatus>,
+    #[serde(flatten, default)]
+    pub error_context: ControlErrorContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistence_outcome: Option<PersistenceOutcomeResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold_report: Option<ThresholdReport>,
+}
+
+impl ControlResponse {
+    pub(crate) fn success(message: impl Into<String>, status: Option<DaemonStatus>) -> Self {
+        Self {
+            ok: true,
+            message: message.into(),
+            status,
+            error_context: ControlErrorContext::default(),
+            persistence_outcome: None,
+            threshold_report: None,
+        }
+    }
+
+    pub(crate) fn failure(
+        message: impl Into<String>,
+        status: Option<DaemonStatus>,
+        error_class: Option<ErrorClass>,
+        daemon_state: DaemonState,
+        capture_state: CaptureState,
+    ) -> Self {
+        Self {
+            ok: false,
+            message: message.into(),
+            status,
+            error_context: ControlErrorContext {
+                error_class,
+                daemon_state: Some(daemon_state),
+                capture_state: Some(capture_state),
+            },
+            persistence_outcome: None,
+            threshold_report: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -400,6 +534,8 @@ pub struct DaemonStatus {
     pub channel_count: u32,
     pub format: String,
     pub last_error: Option<String>,
+    #[serde(flatten, default)]
+    pub lifecycle: DaemonLifecycleStatus,
 }
 
 /// Streams a committed prepared-persistence response without taking ownership
@@ -1537,7 +1673,118 @@ mod tests {
             channel_count: 1,
             format: "F32LE".to_string(),
             last_error: None,
+            lifecycle: DaemonLifecycleStatus::default(),
         }
+    }
+
+    #[test]
+    fn lifecycle_status_fields_are_additive_and_always_serialized() {
+        let mut status = persistence_status();
+        status.lifecycle = DaemonLifecycleStatus {
+            capture_state: CaptureState::Running,
+            resolved_target: Some("scarlett".to_string()),
+            ..DaemonLifecycleStatus::default()
+        };
+
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["state"], "capturing");
+        assert_eq!(json["last_error"], serde_json::Value::Null);
+        assert_eq!(json["daemonState"], "ready");
+        assert_eq!(json["captureState"], "running");
+        assert_eq!(json["errorClass"], serde_json::Value::Null);
+        assert_eq!(json["retryPolicy"], "none");
+        assert_eq!(json["retryAttempt"], 0);
+        assert_eq!(json["nextRetryAt"], serde_json::Value::Null);
+        assert_eq!(json["activeProfile"], serde_json::Value::Null);
+        assert_eq!(json["resolvedTarget"], "scarlett");
+    }
+
+    #[test]
+    fn permanent_lifecycle_status_has_manual_retry_policy() {
+        let mut status = persistence_status();
+        status.lifecycle = DaemonLifecycleStatus {
+            daemon_state: DaemonState::Degraded,
+            capture_state: CaptureState::Faulted,
+            error_class: Some(ErrorClass::Permanent),
+            last_error: Some("channels conflicts with capturePorts".to_string()),
+            retry_policy: RetryPolicy::Manual,
+            ..DaemonLifecycleStatus::default()
+        };
+
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["daemonState"], "degraded");
+        assert_eq!(json["captureState"], "faulted");
+        assert_eq!(json["errorClass"], "permanent");
+        assert_eq!(json["lastError"], "channels conflicts with capturePorts");
+        assert_eq!(json["retryPolicy"], "manual");
+        assert_eq!(json["nextRetryAt"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn transient_wait_lifecycle_status_has_bounded_retry() {
+        let mut status = persistence_status();
+        status.lifecycle = DaemonLifecycleStatus {
+            daemon_state: DaemonState::Degraded,
+            capture_state: CaptureState::WaitingForDevice,
+            error_class: Some(ErrorClass::Transient),
+            last_error: Some("target missing".to_string()),
+            retry_policy: RetryPolicy::BoundedBackoff,
+            retry_attempt: 3,
+            next_retry_at: Some(1_700_000_005),
+            active_profile: Some("studio".to_string()),
+            ..DaemonLifecycleStatus::default()
+        };
+
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["captureState"], "waiting-for-device");
+        assert_eq!(json["errorClass"], "transient");
+        assert_eq!(json["retryPolicy"], "bounded-backoff");
+        assert_eq!(json["retryAttempt"], 3);
+        assert_eq!(json["nextRetryAt"], 1_700_000_005_u64);
+        assert_eq!(json["activeProfile"], "studio");
+    }
+
+    #[test]
+    fn stopping_lifecycle_status_serializes_stopping_state() {
+        let mut status = persistence_status();
+        status.lifecycle.daemon_state = DaemonState::Stopping;
+
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["daemonState"], "stopping");
+        assert_eq!(json["captureState"], "stopped");
+    }
+
+    #[test]
+    fn old_response_deserialization_defaults_new_flattened_fields() {
+        let old = r#"{"ok":true,"message":"status","status":{"state":"capturing","active_export_count":0,"pending_recall_count":0,"buffer_capacity_seconds":1.0,"retained_seconds":1.0,"dropped_frames":0,"target":null,"resolved_target":null,"sample_rate":100,"channel_count":1,"format":"F32LE","last_error":null},"persistence_outcome":null,"threshold_report":null}"#;
+
+        let response: ControlResponse = serde_json::from_str(old).unwrap();
+        assert_eq!(response.error_context, ControlErrorContext::default());
+        assert_eq!(
+            response.status.unwrap().lifecycle,
+            DaemonLifecycleStatus::default()
+        );
+    }
+
+    #[test]
+    fn structured_error_context_serializes_at_response_top_level() {
+        let response = ControlResponse {
+            ok: false,
+            message: "target missing".to_string(),
+            status: None,
+            error_context: ControlErrorContext {
+                error_class: Some(ErrorClass::Transient),
+                daemon_state: Some(DaemonState::Degraded),
+                capture_state: Some(CaptureState::WaitingForDevice),
+            },
+            persistence_outcome: None,
+            threshold_report: None,
+        };
+
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["errorClass"], "transient");
+        assert_eq!(json["daemonState"], "degraded");
+        assert_eq!(json["captureState"], "waiting-for-device");
     }
 
     #[test]
@@ -2041,6 +2288,7 @@ mod tests {
             ok: true,
             message: "written fixture".to_string(),
             status: None,
+            error_context: ControlErrorContext::default(),
             persistence_outcome: Some(outcome.clone()),
             threshold_report: None,
         };
@@ -2070,6 +2318,7 @@ mod tests {
                 ok,
                 message: message.clone(),
                 status: None,
+                error_context: ControlErrorContext::default(),
                 persistence_outcome: None,
                 threshold_report: None,
             };
