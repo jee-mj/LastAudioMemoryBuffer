@@ -108,6 +108,8 @@ pub struct BufferConfig {
 pub struct ProfileExportConfig {
     #[serde(rename = "outputDir", default, skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<PathBuf>,
+    #[serde(rename = "useSystemTemp", default)]
+    pub use_system_temp: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

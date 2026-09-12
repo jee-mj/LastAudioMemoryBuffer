@@ -141,6 +141,54 @@ fn pipewire_capture_ports_parse_and_resolve_in_order() {
     );
 }
 
+#[test]
+fn profile_system_temp_switch_defaults_false_and_propagates() {
+    let default_cfg = parsed_pipewire_profile();
+    let opted_in_text = pipewire_profile_text("")
+        .replace("format = \"wav\"", "format = \"wav\"\nuseSystemTemp = true");
+    let opted_in_cfg =
+        parse_config_text(std::path::Path::new("profile.toml"), &opted_in_text).unwrap();
+
+    let default_policy = profile::resolve_active_profile(&default_cfg)
+        .unwrap()
+        .unwrap()
+        .export_policy;
+    let opted_in_policy = profile::resolve_active_profile(&opted_in_cfg)
+        .unwrap()
+        .unwrap()
+        .export_policy;
+
+    assert_eq!(
+        default_policy.staging_root(),
+        std::path::PathBuf::from("/tmp/tmp")
+    );
+    assert_eq!(
+        opted_in_policy.staging_root(),
+        std::path::PathBuf::from("/tmp/LAMB/staging")
+    );
+}
+
+#[test]
+fn profile_system_temp_switch_serializes_and_round_trips_both_values() {
+    for enabled in [false, true] {
+        let mut cfg = parsed_pipewire_profile();
+        cfg.profiles
+            .get_mut("scarlett")
+            .unwrap()
+            .export
+            .use_system_temp = enabled;
+
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(serialized.contains(&format!("useSystemTemp = {enabled}")));
+        let round_tripped: AppConfig = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            round_tripped.profiles["scarlett"].export.use_system_temp,
+            enabled
+        );
+    }
+}
+
 // Production break: an omitted PipeWire capturePorts array must be rejected for its profile.
 #[test]
 fn pipewire_profile_rejects_omitted_capture_ports() {

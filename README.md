@@ -40,12 +40,20 @@ some channels are omitted or leading frames are cropped from every WAV.
 
 Manifest-backed file-set publication stages through the `tmp` directory beside
 the resolved `outputDir` (for example, `~/.cache/lamb/out` uses
-`~/.cache/lamb/tmp`). Atomic-directory publication instead stages in an adjacent
-hidden directory under `outputDir` before the final rename and does not require
-the sibling `tmp` directory. `recall` defaults to flat, detailed files, while
+`~/.cache/lamb/tmp`). Setting `useSystemTemp = true` in the applicable `export`
+table opts that profile (or the legacy configuration) into the fixed
+`/tmp/LAMB/staging` root instead; the default and explicit `false` retain the
+sibling directory, with no automatic fallback. Production persistence and
+startup recovery use the same resolved selection. Atomic-directory publication
+instead stages in an adjacent hidden directory under `outputDir` before the
+final rename and does not require either manifest staging root. `recall`
+defaults to flat, detailed files, while
 `dump` defaults to one atomically published timestamp directory containing
 simple per-channel files. Ring buffer retention can overwrite unhandled old
 frames; when this wrap loses old frames, the command reports the loss.
+
+The shared root uses the existing strict recovery behavior. Interrupted exports
+for different output roots may require operator attention.
 
 ## Export Activity Policy
 
@@ -251,6 +259,7 @@ headroom = 1.2
 [export]
 mode = "per-channel"
 format = "wav"
+useSystemTemp = false
 splitWhenOverBytes = 1073741824
 ```
 
@@ -278,7 +287,14 @@ seconds = 1800
 outputDir = "/home/<USERNAME>/Music/LAMB"
 mode = "per-channel"
 format = "wav"
+useSystemTemp = true
 ```
+
+In app-config mode the switch is profile-scoped. Omitting it, or writing
+`useSystemTemp = false`, selects `<resolved outputDir parent>/tmp`; writing
+`useSystemTemp = true` selects `/tmp/LAMB/staging`. A successful reload resolves
+the setting into the replacement capture session using the same behavior as the
+rest of that profile's export policy.
 
 Use the PipeWire Pro Audio profile so the device exposes independently
 linkable source ports. Each `source` is an exact PipeWire `port.name` on the

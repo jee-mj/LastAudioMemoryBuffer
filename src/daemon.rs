@@ -50,10 +50,6 @@ const PERSIST_TIMEOUT: Duration = Duration::from_secs(60);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 static NEXT_CAPTURE_ATTEMPT_ID: AtomicU64 = AtomicU64::new(0);
 
-fn persistence_staging_root(output_dir: &Path) -> PathBuf {
-    output_dir.parent().unwrap_or(output_dir).join("tmp")
-}
-
 fn allocate_capture_attempt_id() -> std::result::Result<CaptureAttemptId, CaptureAttemptError> {
     NEXT_CAPTURE_ATTEMPT_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -212,7 +208,7 @@ impl CaptureSession {
             .workspace
             .lock()
             .map_err(|_| LambError::Control("persistence workspace lock poisoned".to_string()))?;
-        let staging_root = persistence_staging_root(policy.output_dir());
+        let staging_root = policy.staging_root();
         self.coordinator.persist_policy_with_delivery(
             &self.arena,
             &mut workspace,
@@ -240,7 +236,7 @@ impl CaptureSession {
             .workspace
             .lock()
             .map_err(|_| LambError::Control("persistence workspace lock poisoned".to_string()))?;
-        let staging_root = persistence_staging_root(policy.output_dir());
+        let staging_root = policy.staging_root();
         self.coordinator.persist_policy(
             &self.arena,
             &mut workspace,
@@ -281,7 +277,7 @@ impl CaptureSession {
             .workspace
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let staging_root = persistence_staging_root(policy.output_dir());
+        let staging_root = policy.staging_root();
         let mut summary = workspace.recover_recall_staging(&staging_root, policy.output_dir());
         summary.merge(workspace.recover_dumps(policy.output_dir()));
         log_recovery_summary(&summary);
@@ -10334,6 +10330,19 @@ splitWhenOverBytes = 1073741824
         let mut cfg = test_legacy_fake_config();
         cfg.output_dir = std::path::PathBuf::from("/tmp/root/../escape");
         assert!(prepare_legacy_config(cfg).is_err());
+    }
+
+    #[test]
+    fn legacy_reload_preparation_retains_selected_staging_policy() {
+        let mut cfg = test_legacy_fake_config();
+        cfg.export.use_system_temp = true;
+
+        let prepared = prepare_legacy_config(cfg).unwrap();
+
+        assert_eq!(
+            prepared.session_export_policy.staging_root(),
+            PathBuf::from("/tmp/LAMB/staging")
+        );
     }
 
     #[test]

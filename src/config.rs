@@ -78,6 +78,8 @@ pub struct MemoryConfig {
 pub struct ExportConfig {
     pub mode: String,
     pub format: String,
+    #[serde(rename = "useSystemTemp", default)]
+    pub use_system_temp: bool,
     #[serde(rename = "splitWhenOverBytes")]
     pub split_when_over_bytes: u64,
 }
@@ -284,6 +286,7 @@ impl LambConfig {
                 trim_leading_silence: false,
             },
         )
+        .map(|policy| policy.with_system_temp(self.export.use_system_temp))
     }
 }
 

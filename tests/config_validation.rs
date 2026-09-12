@@ -31,6 +31,7 @@ fn valid_config() -> LambConfig {
         export: ExportConfig {
             mode: "per-channel".to_string(),
             format: "wav".to_string(),
+            use_system_temp: false,
             split_when_over_bytes: 3_900_000_000,
         },
     }
@@ -299,4 +300,47 @@ fn legacy_config_resolution_rejects_noncanonical_output_root() {
     cfg.output_dir = PathBuf::from("/tmp/lamb-test/../escape");
 
     assert!(cfg.resolved_session_export_policy().is_err());
+}
+
+#[test]
+fn legacy_system_temp_switch_defaults_false_and_parses_explicit_values() {
+    let default_text = toml::to_string(&valid_config())
+        .unwrap()
+        .replace("useSystemTemp = false\n", "");
+    let false_text = default_text.replace("[export]\n", "[export]\nuseSystemTemp = false\n");
+    let true_text = default_text.replace("[export]\n", "[export]\nuseSystemTemp = true\n");
+    let path = std::path::Path::new("legacy.toml");
+
+    let default = lamb::config::parse_config_text(path, &default_text).unwrap();
+    let explicit_false = lamb::config::parse_config_text(path, &false_text).unwrap();
+    let explicit_true = lamb::config::parse_config_text(path, &true_text).unwrap();
+
+    assert_eq!(
+        default
+            .resolved_session_export_policy()
+            .unwrap()
+            .staging_root(),
+        PathBuf::from("/tmp/tmp")
+    );
+    assert_eq!(
+        explicit_false
+            .resolved_session_export_policy()
+            .unwrap()
+            .staging_root(),
+        PathBuf::from("/tmp/tmp")
+    );
+    assert_eq!(
+        explicit_true
+            .resolved_session_export_policy()
+            .unwrap()
+            .staging_root(),
+        PathBuf::from("/tmp/LAMB/staging")
+    );
+
+    for (config, enabled) in [(explicit_false, false), (explicit_true, true)] {
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains(&format!("useSystemTemp = {enabled}")));
+        let round_tripped = lamb::config::parse_config_text(path, &serialized).unwrap();
+        assert_eq!(round_tripped.export.use_system_temp, enabled);
+    }
 }

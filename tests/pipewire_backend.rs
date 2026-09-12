@@ -810,6 +810,7 @@ fn pipewire_capture_config_is_derived_from_lamb_config() {
         export: ExportConfig {
             mode: "per-channel".to_string(),
             format: "wav".to_string(),
+            use_system_temp: false,
             split_when_over_bytes: 3_900_000_000,
         },
     };

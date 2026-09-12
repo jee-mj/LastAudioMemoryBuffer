@@ -307,6 +307,7 @@ fn resolve_export_policy(
             trim_leading_silence,
         },
     )
+    .map(|policy| policy.with_system_temp(profile.export.use_system_temp))
 }
 
 fn capture_port_export_mode(

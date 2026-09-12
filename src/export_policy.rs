@@ -379,6 +379,7 @@ pub struct ResolvedActivityPolicy {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedExportPolicy {
     output_dir: PathBuf,
+    use_system_temp: bool,
     layout: ResolvedLayout,
     pub activity: ResolvedActivityPolicy,
     patterns: ResolvedPatternSet,
@@ -404,6 +405,7 @@ impl ResolvedExportPolicy {
         let (dump_directory, dump_filename) = patterns_for_layout(&layout, ExportCommand::Dump)?;
         Ok(Self {
             output_dir,
+            use_system_temp: false,
             layout,
             activity,
             patterns: ResolvedPatternSet {
@@ -417,6 +419,22 @@ impl ResolvedExportPolicy {
 
     pub fn output_dir(&self) -> &Path {
         &self.output_dir
+    }
+
+    pub(crate) fn with_system_temp(mut self, use_system_temp: bool) -> Self {
+        self.use_system_temp = use_system_temp;
+        self
+    }
+
+    pub fn staging_root(&self) -> PathBuf {
+        if self.use_system_temp {
+            PathBuf::from("/tmp/LAMB/staging")
+        } else {
+            self.output_dir
+                .parent()
+                .unwrap_or(&self.output_dir)
+                .join("tmp")
+        }
     }
 
     pub fn layout(&self) -> &ResolvedLayout {
