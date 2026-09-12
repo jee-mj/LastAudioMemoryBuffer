@@ -38,12 +38,14 @@ Loss accounting (`retention_lost_frames`, `cleared_frames`, and
 `capture_dropped_frames`) always describes that full consumed range, even when
 some channels are omitted or leading frames are cropped from every WAV.
 
-`recall` prepares its publication through `/tmp/LAMB/staging`, then retains the
-flat, detailed files in the configured output directory by default. `dump`
-instead defaults to one atomically published timestamp directory containing
-simple per-channel files. Both commands use the configured `outputDir`. Ring
-buffer retention can overwrite unhandled old frames; when this wrap loses old
-frames, the command reports the loss.
+Manifest-backed file-set publication stages through the `tmp` directory beside
+the resolved `outputDir` (for example, `~/.cache/lamb/out` uses
+`~/.cache/lamb/tmp`). Atomic-directory publication instead stages in an adjacent
+hidden directory under `outputDir` before the final rename and does not require
+the sibling `tmp` directory. `recall` defaults to flat, detailed files, while
+`dump` defaults to one atomically published timestamp directory containing
+simple per-channel files. Ring buffer retention can overwrite unhandled old
+frames; when this wrap loses old frames, the command reports the loss.
 
 ## Export Activity Policy
 

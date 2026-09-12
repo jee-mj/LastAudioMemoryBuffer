@@ -48,8 +48,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PERSIST_TIMEOUT: Duration = Duration::from_secs(60);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
-const APP_STAGING_ROOT: &str = "/tmp/LAMB/staging";
 static NEXT_CAPTURE_ATTEMPT_ID: AtomicU64 = AtomicU64::new(0);
+
+fn persistence_staging_root(output_dir: &Path) -> PathBuf {
+    output_dir.parent().unwrap_or(output_dir).join("tmp")
+}
 
 fn allocate_capture_attempt_id() -> std::result::Result<CaptureAttemptId, CaptureAttemptError> {
     NEXT_CAPTURE_ATTEMPT_ID
@@ -209,6 +212,7 @@ impl CaptureSession {
             .workspace
             .lock()
             .map_err(|_| LambError::Control("persistence workspace lock poisoned".to_string()))?;
+        let staging_root = persistence_staging_root(policy.output_dir());
         self.coordinator.persist_policy_with_delivery(
             &self.arena,
             &mut workspace,
@@ -216,7 +220,7 @@ impl CaptureSession {
                 command,
                 policy: &policy,
                 profile: &self.profile_name,
-                staging_root: Path::new(APP_STAGING_ROOT),
+                staging_root: &staging_root,
                 timestamp,
             },
             PERSIST_TIMEOUT,
@@ -236,6 +240,7 @@ impl CaptureSession {
             .workspace
             .lock()
             .map_err(|_| LambError::Control("persistence workspace lock poisoned".to_string()))?;
+        let staging_root = persistence_staging_root(policy.output_dir());
         self.coordinator.persist_policy(
             &self.arena,
             &mut workspace,
@@ -243,7 +248,7 @@ impl CaptureSession {
                 command,
                 policy: &policy,
                 profile: &self.profile_name,
-                staging_root: Path::new(APP_STAGING_ROOT),
+                staging_root: &staging_root,
                 timestamp,
             },
             PERSIST_TIMEOUT,
@@ -267,7 +272,7 @@ impl CaptureSession {
     /// using the reserved manifest arenas of this session's workspace, and
     /// logs a summary plus an operator-visible warning for every failed or
     /// indeterminate recovery.
-    fn recover_startup(&self, staging_root: &Path) -> crate::recovery::RecoveryScanSummary {
+    fn recover_startup(&self) -> crate::recovery::RecoveryScanSummary {
         let policy = self
             .policy
             .lock()
@@ -276,7 +281,8 @@ impl CaptureSession {
             .workspace
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut summary = workspace.recover_recall_staging(staging_root, policy.output_dir());
+        let staging_root = persistence_staging_root(policy.output_dir());
+        let mut summary = workspace.recover_recall_staging(&staging_root, policy.output_dir());
         summary.merge(workspace.recover_dumps(policy.output_dir()));
         log_recovery_summary(&summary);
         summary
@@ -1278,7 +1284,7 @@ struct RealLegacyStartupRecovery;
 
 impl LegacyStartupRecovery for RealLegacyStartupRecovery {
     fn failed_count(&self, session: &CaptureSession) -> Result<usize> {
-        Ok(session.recover_startup(Path::new(APP_STAGING_ROOT)).failed)
+        Ok(session.recover_startup().failed)
     }
 }
 
@@ -14633,6 +14639,60 @@ splitWhenOverBytes = 1073741824
         assert!(!runtime.test_capture_attached);
         drop(runtime);
         assert_eq!(*order.lock().unwrap(), vec!["backend", "session"]);
+    }
+
+    #[test]
+    fn production_recall_uses_tmp_beside_the_resolved_output_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("home/.cache/lamb/out");
+        let sibling_tmp = temp.path().join("home/.cache/lamb/tmp");
+        let ctx = test_app_context(
+            temp.path(),
+            output_dir,
+            crate::export_policy::ResolvedLayout::FlatDetailed,
+            &[0.25, -0.5],
+        );
+
+        let response = handle_app_recall(&ctx);
+
+        assert!(
+            response.ok,
+            "production recall failed: {}",
+            response.message
+        );
+        assert!(sibling_tmp.is_dir());
+        assert_eq!(fs::read_dir(sibling_tmp).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn production_startup_recovery_scans_tmp_beside_the_resolved_output_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("home/.cache/lamb/out");
+        let transaction = temp.path().join("home/.cache/lamb/tmp/interrupted");
+        fs::create_dir_all(&transaction).unwrap();
+        fs::write(
+            transaction.join(crate::recovery::RECALL_MANIFEST_NAME),
+            b"not a transaction manifest",
+        )
+        .unwrap();
+        let ctx = test_app_context(
+            temp.path(),
+            output_dir,
+            crate::export_policy::ResolvedLayout::FlatDetailed,
+            &[],
+        );
+        let session = ctx
+            .runtime
+            .lock()
+            .unwrap()
+            .session
+            .as_ref()
+            .unwrap()
+            .clone();
+
+        let failed = RealLegacyStartupRecovery.failed_count(&session).unwrap();
+
+        assert_eq!(failed, 1);
     }
 
     #[test]

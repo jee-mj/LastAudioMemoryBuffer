@@ -128,7 +128,24 @@ struct SyncTrace {
 }
 
 trait TestPublicationHook: PreparedPublicationHook {
+    fn setup_before_prepare(&mut self, _output: &Path, _staging: &Path) {}
+
     fn setup(&mut self, _output: &Path) {}
+}
+
+#[derive(Default)]
+struct BlockUnrelatedStagingRoot;
+
+impl PreparedPublicationHook for BlockUnrelatedStagingRoot {
+    fn sync_directory(&mut self, path: &Path) -> lamb::error::Result<()> {
+        lamb::recovery::sync_directory(path)
+    }
+}
+
+impl TestPublicationHook for BlockUnrelatedStagingRoot {
+    fn setup_before_prepare(&mut self, _output: &Path, staging: &Path) {
+        fs::write(staging, b"must remain an unrelated regular file").unwrap();
+    }
 }
 
 impl TestPublicationHook for SyncTrace {
@@ -371,6 +388,7 @@ fn with_real_capture(
         .unwrap();
     let policy = real_policy(&output, layout);
     let mut decision = FrozenExportDecision::new(&plan).unwrap();
+    hook.setup_before_prepare(&output, &staging);
     let prepared = workspace
         .prepare(
             &frozen,
@@ -413,6 +431,42 @@ fn assert_export_error(error: LambError, expected: &str) {
 }
 
 #[test]
+fn recall_atomic_directory_neither_creates_nor_requires_fileset_staging_root() {
+    let mut hook = BlockUnrelatedStagingRoot;
+    with_real_capture(
+        ExportCommand::Recall,
+        ResolvedLayout::TimestampDirectory,
+        &mut hook,
+        |_, _, _, output, staging, _, result| {
+            assert!(matches!(result, PreparedPublication::Published));
+            assert!(output.join(TIMESTAMP).join("mic.wav").is_file());
+            assert_eq!(
+                fs::read(staging).unwrap(),
+                b"must remain an unrelated regular file"
+            );
+        },
+    );
+}
+
+#[test]
+fn dump_atomic_directory_neither_creates_nor_requires_fileset_staging_root() {
+    let mut hook = BlockUnrelatedStagingRoot;
+    with_real_capture(
+        ExportCommand::Dump,
+        ResolvedLayout::TimestampDirectory,
+        &mut hook,
+        |_, _, _, output, staging, _, result| {
+            assert!(matches!(result, PreparedPublication::Published));
+            assert!(output.join(TIMESTAMP).join("mic.wav").is_file());
+            assert_eq!(
+                fs::read(staging).unwrap(),
+                b"must remain an unrelated regular file"
+            );
+        },
+    );
+}
+
+#[test]
 fn recall_timestamp_directory_uses_atomic_publication_on_real_capture() {
     let mut trace = SyncTrace::default();
     with_real_capture(
@@ -429,7 +483,7 @@ fn recall_timestamp_directory_uses_atomic_publication_on_real_capture() {
                 .filter(|path| path.is_dir())
                 .collect();
             assert_eq!(visible_directories, vec![final_dir.clone()]);
-            assert!(fs::read_dir(staging).unwrap().next().is_none());
+            assert!(!staging.exists());
             let mut files = Vec::new();
             collect_files(output, &mut files);
             assert!(files
@@ -464,7 +518,7 @@ fn dump_timestamp_directory_uses_atomic_publication_on_real_capture() {
                 .filter(|path| path.is_dir())
                 .collect();
             assert_eq!(visible_directories, vec![final_dir.clone()]);
-            assert!(fs::read_dir(staging).unwrap().next().is_none());
+            assert!(!staging.exists());
         },
     );
     assert!(trace

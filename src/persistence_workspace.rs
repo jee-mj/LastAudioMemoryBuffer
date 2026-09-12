@@ -1310,10 +1310,6 @@ impl PersistenceWorkspace {
                     self.reset_slots();
                     return Err(error);
                 }
-                if kind == PersistenceKind::Dump {
-                    fs::create_dir_all(staging_root)
-                        .map_err(|source| io_error(staging_root, source))?;
-                }
                 return self.finish_policy_prepare(
                     frozen,
                     decision.export_range(),
